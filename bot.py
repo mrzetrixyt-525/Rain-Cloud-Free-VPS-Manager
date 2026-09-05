@@ -52,7 +52,29 @@ def env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-TOKEN = os.getenv("TOKEN", "").strip()
+def normalize_bot_token(raw: str | None) -> str:
+    """Return a clean Discord bot token without exposing it in logs."""
+    token = str(raw or "").strip()
+    if not token:
+        return ""
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
+        token = token[1:-1].strip()
+    if token.lower().startswith("bot "):
+        token = token[4:].strip()
+    token = token.replace("\r", "").replace("\n", "").strip()
+    return token
+
+
+def load_discord_token() -> tuple[str, str]:
+    """Return (token, source), supporting common environment variable names."""
+    for name in ("TOKEN", "DISCORD_TOKEN", "BOT_TOKEN"):
+        token = normalize_bot_token(os.getenv(name))
+        if token:
+            return token, name
+    return "", "none"
+
+
+TOKEN, TOKEN_SOURCE = load_discord_token()
 ADMIN_ID = env_int("ADMIN_ID", 0, 0)
 DATABASE_FILE = os.getenv("DATABASE_FILE", "vps_bot.db").strip() or "vps_bot.db"
 LOG_FILE = os.getenv("LOG_FILE", "vps_bot.log").strip() or "vps_bot.log"
@@ -3252,17 +3274,60 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 async def main() -> None:
-    if not TOKEN: raise SystemExit("TOKEN is not set. Add TOKEN=... to .env.")
-    if ADMIN_ID <= 0: logger.warning("ADMIN_ID is not configured; admin commands will be unavailable.")
-    logger.info("RGNODES starting | quota=%s fallback=%s location=%s | locations=SG,IN", ENABLE_HARD_DISK_QUOTA, QUOTA_FALLBACK, DEFAULT_LOCATION)
+    if not TOKEN:
+        raise SystemExit(
+            "Discord bot token is missing. Set TOKEN=YOUR_BOT_TOKEN in .env "
+            "(or DISCORD_TOKEN/BOT_TOKEN) and restart the bot."
+        )
+
+    if ADMIN_ID <= 0:
+        logger.warning("ADMIN_ID is not configured; admin commands will be unavailable.")
+
+    logger.info(
+        "RGNODES starting | token_source=%s | quota=%s fallback=%s location=%s | locations=SG,IN",
+        TOKEN_SOURCE, ENABLE_HARD_DISK_QUOTA, QUOTA_FALLBACK, DEFAULT_LOCATION,
+    )
+
     try:
         await bot.start(TOKEN, reconnect=True)
+
+    except discord.LoginFailure:
+        logger.error("Discord rejected the bot token (HTTP 401 / invalid credentials).")
+        logger.error(
+            "Check that %s contains the current token for the correct Discord bot, "
+            "and that it is not an old/revoked token.", TOKEN_SOURCE
+        )
+        logger.error("The value should be the raw bot token, without a leading 'Bot '.")
+        logger.error("If the token was regenerated in the Discord Developer Portal, update .env/container secrets and restart.")
+        raise SystemExit(1) from None
+
+    except discord.HTTPException as exc:
+        logger.error(
+            "Discord HTTP error during startup: status=%s code=%s message=%s",
+            getattr(exc, "status", "unknown"),
+            getattr(exc, "code", "unknown"),
+            safe_log(str(exc)),
+        )
+        raise SystemExit(1) from None
+
+    except discord.GatewayNotFound as exc:
+        logger.error("Discord Gateway could not be reached: %s", safe_log(exc))
+        raise SystemExit(1) from None
+
+    except discord.ClientException as exc:
+        logger.error("Discord client startup failed: %s", safe_log(exc))
+        raise SystemExit(1) from None
+
     finally:
         for loop in (sync_statuses, update_presence, supervise_all_ports_loop, refresh_network_identity):
-            if loop.is_running(): loop.cancel()
-        await bot.close()
+            if loop.is_running():
+                loop.cancel()
+        with contextlib.suppress(Exception):
+            await bot.close()
 
 
 if __name__ == "__main__":
-    try: asyncio.run(main())
-    except KeyboardInterrupt: pass
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("RGNODES stopped by user.")
