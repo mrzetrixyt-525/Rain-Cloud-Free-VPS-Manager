@@ -1,4 +1,4 @@
-git clone https://github.com/hopingboyz/vps-deploy
+git clone https://github.com/mrzetrixyt-525/Rain-Cloud-Free-VPS-Manager
 
 cd vps-deploy
 
