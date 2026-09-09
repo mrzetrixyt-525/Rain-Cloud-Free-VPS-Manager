@@ -2,7 +2,8 @@ git clone https://github.com/mrzetrixyt-525/Rain-Cloud-Free-VPS-Manager
 
 cd vps-deploy
 
-cp test.env .env
+cp Rain-Cloud-Free-VPS-Manager vm.py
+
 
 apt install python3-pip -y
 
