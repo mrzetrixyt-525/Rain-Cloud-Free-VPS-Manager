@@ -1,8 +1,8 @@
 git clone https://github.com/mrzetrixyt-525/Rain-Cloud-Free-VPS-Manager
 
-cd vps-deploy
+cd vms
 
-cp Rain-Cloud-Free-VPS-Manager vm.py
+cp Rain-Cloud-Free-VPS-Manager vms
 
 
 apt install python3-pip -y
@@ -13,16 +13,16 @@ pip install -r requirements.txt
 
 bash scripts/run-forever.sh
 
-sudo nano /etc/systemd/system/unixbot.service
+sudo nano /etc/systemd/system/rgbot.service
 
 [Unit]
-Description=UnixBot Discord Bot
+Description=rgBot Discord Bot
 After=network.target
 
 [Service]
 User=root
 WorkingDirectory=/root
-ExecStart=/usr/bin/python3 /root/bot.py
+ExecStart=/usr/bin/python3 /root/vm.py
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
