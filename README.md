@@ -10,6 +10,8 @@ mkdir -p ~/.config/pip && echo -e "[global]\nbreak-system-packages = true" > ~/.
 
 pip install -r requirements.txt
 
+bash scripts/run-forever.sh
+
 sudo nano /etc/systemd/system/unixbot.service
 
 [Unit]
