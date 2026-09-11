@@ -1,348 +1,648 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
-import hashlib
-import hmac
-import html
-import ipaddress
-import json
 import logging
 import os
 import re
-import secrets
-import shlex
 import signal
+import shutil
 import socket
+import ipaddress
 import sqlite3
-import ssl
-import subprocess
 import sys
+import json
 import time
-import uuid
-from dataclasses import dataclass
-from datetime import datetime, timezone
+import aiohttp
+import secrets
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
+import string
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Iterable
-from urllib.parse import quote
+from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit, urlunsplit, quote
 
-try:
-    import aiohttp
-    from aiohttp import web
-except ImportError:  # pragma: no cover
-    aiohttp = None
-    web = None
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
 
-try:
-    import discord
-    from discord import app_commands
-    from discord.ext import commands
-except ImportError:  # pragma: no cover
-    discord = None
-    app_commands = None
-    commands = None
-
-try:
-    from dotenv import load_dotenv
-except ImportError:  # pragma: no cover
-    def load_dotenv() -> None:
-        return None
+# ================================================================
+# RGNODES™ VPS Management Bot — hardened/stable build
+# UI/command names are intentionally kept compatible with the build
+# supplied by the user.
+# ================================================================
 
 load_dotenv()
 
-# ============================================================================
-# RGNODES™ VM Manager — hardened KVM/QEMU + Docker/Pterodactyl compatible build
-# ============================================================================
-# Notes:
-# - KVM/libvirt is preferred when available. QEMU without KVM is supported as a
-#   safe fallback, but is much slower.
-# - The Python service itself is cross-platform. The KVM backend requires a
-#   Linux host with libvirt/virsh, qemu-img, and suitable QEMU binaries.
-# - Guest OS images are intentionally supplied by the operator via local paths.
-#   This avoids silently downloading or trusting arbitrary disk images.
-# - Dashboard listens on WEB_PORT (default 3399) and requires authentication.
-# - No web endpoint executes arbitrary host shell commands.
 
-APP_NAME = "RGNODES™ VM Manager"
-BUILD = "2026.09.10-kvm-dashboard-deepfix"
-PREFIX = os.getenv("PREFIX", "-").strip() or "-"
-DATABASE_FILE = os.getenv("DATABASE_FILE", "rgnodes_vm.db").strip() or "rgnodes_vm.db"
-LOG_FILE = os.getenv("LOG_FILE", "rgnodes_vm.log").strip() or "rgnodes_vm.log"
+def env_int(name: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+    try:
+        value = int(os.getenv(name, str(default)).strip())
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def normalize_bot_token(raw: str | None) -> str:
+    """Return a clean Discord bot token without exposing it in logs."""
+    token = str(raw or "").strip()
+    if not token:
+        return ""
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
+        token = token[1:-1].strip()
+    if token.lower().startswith("bot "):
+        token = token[4:].strip()
+    token = token.replace("\r", "").replace("\n", "").strip()
+    return token
+
+
+def load_discord_token() -> tuple[str, str]:
+    """Return (token, source), supporting common environment variable names."""
+    for name in ("TOKEN", "DISCORD_TOKEN", "BOT_TOKEN"):
+        token = normalize_bot_token(os.getenv(name))
+        if token:
+            return token, name
+    return "", "none"
+
+
+TOKEN, TOKEN_SOURCE = load_discord_token()
+# Native-Docker guest bootstrap settings.
+# Kept near the top because function default arguments are evaluated when the
+# function is defined, not when it is called.
+GUEST_SYSTEMD_ENABLED = env_bool("GUEST_SYSTEMD_ENABLED", True)
+GUEST_NESTED_DOCKER = env_bool("GUEST_NESTED_DOCKER", True)
+GUEST_SYSTEMD_PRIVILEGED = env_bool("GUEST_SYSTEMD_PRIVILEGED", True)
+GUEST_CGROUPNS_HOST = env_bool("GUEST_CGROUPNS_HOST", True)
+GUEST_KVM_ENABLED = env_bool("GUEST_KVM_ENABLED", True)
+GUEST_INSTALL_WINGS = env_bool("GUEST_INSTALL_WINGS", True)
+GUEST_INSTALL_WEB_STACK = env_bool("GUEST_INSTALL_WEB_STACK", True)
+GUEST_INSTALL_DATABASE_STACK = env_bool("GUEST_INSTALL_DATABASE_STACK", True)
+GUEST_BOOTSTRAP_TIMEOUT = env_int("GUEST_BOOTSTRAP_TIMEOUT", 1200, 120, 1800)
+GUEST_DOCKER_PACKAGE = os.getenv("GUEST_DOCKER_PACKAGE", "docker.io").strip() or "docker.io"
+GUEST_PERSISTENT_DATA = env_bool("GUEST_PERSISTENT_DATA", True)
+
+ADMIN_ID = env_int("ADMIN_ID", 0, 0)
+DATABASE_FILE = os.getenv("DATABASE_FILE", "vps_bot.db").strip() or "vps_bot.db"
+LOG_FILE = os.getenv("LOG_FILE", "vps_bot.log").strip() or "vps_bot.log"
+BOT_STATUS_NAME = os.getenv("BOT_STATUS_NAME", "RGNODES™ VPS Management").strip() or "RGNODES™ VPS Management"
+PREFIX = (os.getenv("PREFIX") or "-").strip() or "-"
+VPS_HOSTNAME_PREFIX = os.getenv("VPS_HOSTNAME_PREFIX", "rgnodes").strip() or "rgnodes"
+DEFAULT_RAM = os.getenv("DEFAULT_RAM", "4G").strip() or "4G".strip() or "2g"
+DEFAULT_CPU = os.getenv("DEFAULT_CPU", "1").strip() or "1".strip() or "1"
+DEFAULT_DISK = os.getenv("DEFAULT_DISK", "10G").strip() or "10G".strip() or "10g"
+DEFAULT_LOCATION = os.getenv("DEFAULT_LOCATION", "SG").strip().upper() or "SG"
+if DEFAULT_LOCATION not in {"SG", "IN"}:
+    DEFAULT_LOCATION = "SG"
+SERVER_LIMIT = env_int("SERVER_LIMIT", 1, 1, 100)
+TOTAL_RUNNING_LIMIT = env_int("TOTAL_RUNNING_LIMIT", 50, 1, 10_000)
+ADMIN_BYPASS_LIMITS = env_bool("ADMIN_BYPASS_LIMITS", True)
+STATUS_INTERVAL = env_int("STATUS_INTERVAL", 45, 15, 300)
+DOCKER_TIMEOUT = env_int("DOCKER_TIMEOUT", 120, 30, 900)
+ACCESS_TIMEOUT = env_int("ACCESS_TIMEOUT", 120, 30, 300)
+DEPLOY_TIMEOUT = env_int("DEPLOY_TIMEOUT", 600, 120, 840)
+IMAGE_PULL_TIMEOUT = env_int("IMAGE_PULL_TIMEOUT", 300, 60, 600)
+INTERACTION_LOG_UNKNOWN_AS_DEBUG = env_bool("INTERACTION_LOG_UNKNOWN_AS_DEBUG", True)
+ENABLE_HARD_DISK_QUOTA = env_bool("ENABLE_HARD_DISK_QUOTA", False)
+QUOTA_FALLBACK = env_bool("QUOTA_FALLBACK", True)
+DOCKER_FEATURE_FALLBACK = env_bool("DOCKER_FEATURE_FALLBACK", True)
+DOCKER_RETRIES = env_int("DOCKER_RETRIES", 2, 0, 5)
+STATUS_CONCURRENCY = env_int("STATUS_CONCURRENCY", 5, 1, 25)
+MEMORY_RESERVATION_PERCENT = env_int("MEMORY_RESERVATION_PERCENT", 75, 0, 100)
+DISABLE_CONTAINER_SWAP = env_bool("DISABLE_CONTAINER_SWAP", True)
+# Never start/reconfigure a host Docker daemon implicitly. This is especially
+# important when RGNODES itself runs under Pterodactyl/Wings or another supervisor.
+MANAGE_DOCKER_DAEMON = env_bool("MANAGE_DOCKER_DAEMON", False)
+DISCORD_API_TIMEOUT = env_int("DISCORD_API_TIMEOUT", 10, 3, 30)
+PROGRESS_UPDATE_TIMEOUT = env_int("PROGRESS_UPDATE_TIMEOUT", 5, 2, 20)
+SSHX_TOTAL_TIMEOUT = env_int("SSHX_TOTAL_TIMEOUT", 100, 30, 240)
+SSHX_START_TIMEOUT = env_int("SSHX_START_TIMEOUT", 45, 15, 120)
+SSHX_POLL_SECONDS = env_int("SSHX_POLL_SECONDS", 30, 5, 90)
+HOST_TOTAL_RAM = os.getenv("HOST_TOTAL_RAM", "64G").strip() or "64G"
+HOST_TOTAL_CPU = env_int("HOST_TOTAL_CPU", 10, 1, 256)
+HOST_TOTAL_DISK = os.getenv("HOST_TOTAL_DISK", "10T").strip() or "10T"
+MAX_PORTS_PER_VPS = env_int("MAX_PORTS_PER_VPS", 10, 1, 50)
+PORT_RANGE_START = env_int("PORT_RANGE_START", 20000, 1024, 65534)
+PORT_RANGE_END = env_int("PORT_RANGE_END", 40000, 1025, 65535)
+PORT_SUPERVISOR_INTERVAL = env_int("PORT_SUPERVISOR_INTERVAL", 20, 5, 120)
+PUBLIC_IP_REFRESH = env_int("PUBLIC_IP_REFRESH", 300, 60, 3600)
+REAL_LOCATION_REFRESH = env_int("REAL_LOCATION_REFRESH", 900, 120, 7200)
+IPV4_MODE = os.getenv("IPV4_MODE", "shared").strip().lower() or "shared"
+if IPV4_MODE not in {"shared"}:
+    IPV4_MODE = "shared"
+REQUIRE_REAL_PUBLIC_IPV4 = env_bool("REQUIRE_REAL_PUBLIC_IPV4", True)
+IPV4_REFRESH = env_int("IPV4_REFRESH", 300, 30, 3600)
+
+# Discord startup/network resilience. A failed HTTPS handshake should not
+# terminate the whole service; the health endpoint and worker remain alive
+# while Discord login is retried with exponential backoff.
+DISCORD_LOGIN_RETRY_BASE = env_int("DISCORD_LOGIN_RETRY_BASE", 5, 1, 60)
+DISCORD_LOGIN_RETRY_MAX = env_int("DISCORD_LOGIN_RETRY_MAX", 120, 10, 600)
+DISCORD_LOGIN_MAX_ATTEMPTS = env_int("DISCORD_LOGIN_MAX_ATTEMPTS", 0, 0, 1000)
+
+# Hosting-platform health/keep-alive HTTP listener. Most platforms (Render,
+# Railway, etc.) provide PORT automatically; locally it falls back to 247.
 WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0").strip() or "0.0.0.0"
-WEB_PORT = max(1, min(65535, int(os.getenv("WEB_PORT", "3399"))))
-WEB_PUBLIC_URL = os.getenv("WEB_PUBLIC_URL", "").strip().rstrip("/")
-SESSION_TTL = max(300, int(os.getenv("SESSION_TTL", "28800")))
-LOGIN_WINDOW = max(30, int(os.getenv("LOGIN_WINDOW", "300")))
-LOGIN_MAX_FAILURES = max(3, int(os.getenv("LOGIN_MAX_FAILURES", "8")))
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "0").strip().lower() in {"1", "true", "yes", "on"}
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN") or os.getenv("BOT_TOKEN") or "").strip().strip('"\'')
-DISCORD_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
+# Never let the bot health server occupy Pterodactyl Wings/SFTP ports on a VM.
+# Hosting platforms can opt into their injected PORT explicitly.
+USE_PLATFORM_PORT = env_bool("USE_PLATFORM_PORT", False)
+WEB_RESERVED_PORTS = {2022, 8080, 8443}
+_requested_web_port = env_int("PORT", 247, 1, 65535) if USE_PLATFORM_PORT else env_int("WEB_PORT", 247, 1, 65535)
+WEB_PORT = 247 if _requested_web_port in WEB_RESERVED_PORTS else _requested_web_port
+WEB_PATH = os.getenv("WEB_PATH", "/").strip() or "/"
 
-BACKEND = os.getenv("VPS_BACKEND", "auto").strip().lower() or "auto"
-if BACKEND not in {"auto", "kvm", "qemu", "docker", "pterodactyl"}:
-    BACKEND = "auto"
-KVM_STORAGE = Path(os.getenv("KVM_STORAGE", "/var/lib/rgnodes/vms")).expanduser()
-KVM_NETWORK = os.getenv("KVM_NETWORK", "default").strip() or "default"
-KVM_BRIDGE = os.getenv("KVM_BRIDGE", "").strip()
-KVM_ARCH = os.getenv("KVM_ARCH", "x86_64").strip() or "x86_64"
-KVM_MACHINE = os.getenv("KVM_MACHINE", "q35").strip() or "q35"
-KVM_FIRMWARE = os.getenv("KVM_FIRMWARE", "bios").strip().lower() or "bios"
-KVM_DISK_FORMAT = os.getenv("KVM_DISK_FORMAT", "qcow2").strip().lower() or "qcow2"
-KVM_VCPUS_MAX = max(1, min(256, int(os.getenv("KVM_VCPUS_MAX", "64"))))
-KVM_RAM_MAX_GB = max(1, min(1024, int(os.getenv("KVM_RAM_MAX_GB", "256"))))
-KVM_DISK_MAX_GB = max(1, min(10000, int(os.getenv("KVM_DISK_MAX_GB", "1000"))))
-KVM_AUTOSTART = os.getenv("KVM_AUTOSTART", "1").strip().lower() in {"1", "true", "yes", "on"}
-KVM_REQUIRE_KVM = os.getenv("KVM_REQUIRE_KVM", "0").strip().lower() in {"1", "true", "yes", "on"}
-GUEST_BOOTSTRAP = os.getenv("GUEST_BOOTSTRAP", "1").strip().lower() in {"1", "true", "yes", "on"}
-GUEST_BOOTSTRAP_TIMEOUT = max(60, min(1800, int(os.getenv("GUEST_BOOTSTRAP_TIMEOUT", "900"))))
-GUEST_INSTALL_KVM_TOOLS = os.getenv("GUEST_INSTALL_KVM_TOOLS", "1").strip().lower() in {"1", "true", "yes", "on"}
-GUEST_INSTALL_SSHX = os.getenv("GUEST_INSTALL_SSHX", "1").strip().lower() in {"1", "true", "yes", "on"}
-GUEST_INSTALL_PHP_STACK = os.getenv("GUEST_INSTALL_PHP_STACK", "1").strip().lower() in {"1", "true", "yes", "on"}
-GUEST_RUN_FULL_UPGRADE = os.getenv("GUEST_RUN_FULL_UPGRADE", "1").strip().lower() in {"1", "true", "yes", "on"}
-
-DEFAULT_RAM = os.getenv("DEFAULT_RAM", "4G").strip() or "4G"
-DEFAULT_CPU = os.getenv("DEFAULT_CPU", "2").strip() or "2"
-DEFAULT_DISK = os.getenv("DEFAULT_DISK", "20G").strip() or "20G"
-SERVER_LIMIT = max(1, min(100, int(os.getenv("SERVER_LIMIT", "2"))))
-TOTAL_RUNNING_LIMIT = max(1, min(10000, int(os.getenv("TOTAL_RUNNING_LIMIT", "50"))))
-
-# Abuse guard. It is deliberately conservative: a single weak signal only
-# quarantines; repeated/high-confidence signals can delete automatically.
-ABUSE_ENABLED = os.getenv("ABUSE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
-ABUSE_AUTO_SUSPEND = os.getenv("ABUSE_AUTO_SUSPEND", "1").strip().lower() in {"1", "true", "yes", "on"}
-ABUSE_AUTO_DELETE = os.getenv("ABUSE_AUTO_DELETE", "1").strip().lower() in {"1", "true", "yes", "on"}
-ABUSE_SCAN_INTERVAL = max(15, min(600, int(os.getenv("ABUSE_SCAN_INTERVAL", "30"))))
-ABUSE_CONN_THRESHOLD = max(20, min(100000, int(os.getenv("ABUSE_CONN_THRESHOLD", "800"))))
-ABUSE_DEST_THRESHOLD = max(10, min(10000, int(os.getenv("ABUSE_DEST_THRESHOLD", "120"))))
-ABUSE_CONFIRMATIONS_TO_DELETE = max(2, min(10, int(os.getenv("ABUSE_CONFIRMATIONS_TO_DELETE", "3"))))
-ABUSE_TERMS = tuple(
-    x.strip().lower()
-    for x in os.getenv(
-        "ABUSE_TERMS",
-        "xmrig,minerd,masscan,zmap,hydra,medusa,sqlmap,nikto,msfconsole,metasploit,cobaltstrike,sliver",
-    ).split(",")
-    if x.strip()
-)
+# VPS backend selection:
+#   docker        -> native Docker backend (default, works without Pterodactyl)
+#   pterodactyl   -> create/control servers through Pterodactyl Application API
+# VM creation is always local. Pterodactyl support means the guest is
+# provisioned so Panel/Wings can be installed INSIDE the guest; the bot never
+# redirects VM creation through the Pterodactyl Application API.
+VPS_BACKEND = "docker"
 
 PTERO_URL = os.getenv("PTERO_URL", "").strip().rstrip("/")
 PTERO_API_KEY = (os.getenv("PTERO_API_KEY") or os.getenv("PTERODACTYL_APPLICATION_API_KEY") or "").strip()
 PTERO_CLIENT_API_KEY = (os.getenv("PTERO_CLIENT_API_KEY") or os.getenv("PTERODACTYL_CLIENT_API_KEY") or "").strip()
-PTERO_NODE_ID = int(os.getenv("PTERO_NODE_ID", "0"))
-PTERO_NEST_ID = int(os.getenv("PTERO_NEST_ID", "0"))
-PTERO_EGG_ID = int(os.getenv("PTERO_EGG_ID", "0"))
-PTERO_ALLOCATION_ID = int(os.getenv("PTERO_ALLOCATION_ID", "0"))
-PTERO_DEFAULT_USER_ID = int(os.getenv("PTERO_DEFAULT_USER_ID", "0"))
-
-WEB_ADMIN_USER = os.getenv("WEB_ADMIN_USER", "admin").strip() or "admin"
-WEB_ADMIN_PASSWORD = os.getenv("WEB_ADMIN_PASSWORD", "").strip()
-WEB_ADMIN_PASSWORD_HASH = os.getenv("WEB_ADMIN_PASSWORD_HASH", "").strip()
-
-# Optional guest image mapping. Example:
-# KVM_BASE_IMAGES_JSON='{"ubuntu-24.04":"/var/lib/rgnodes/images/ubuntu-24.04.qcow2"}'
+PTERO_PANEL_PUBLIC_URL = os.getenv("PTERO_PANEL_PUBLIC_URL", PTERO_URL).strip().rstrip("/")
+PTERO_NODE_ID = env_int("PTERO_NODE_ID", 0, 0)
+PTERO_NEST_ID = env_int("PTERO_NEST_ID", 0, 0)
+PTERO_EGG_ID = env_int("PTERO_EGG_ID", 0, 0)
+PTERO_ALLOCATION_ID = env_int("PTERO_ALLOCATION_ID", 0, 0)
+PTERO_DEFAULT_USER_ID = env_int("PTERO_DEFAULT_USER_ID", 0, 0)
+PTERO_AUTO_CREATE_USERS = env_bool("PTERO_AUTO_CREATE_USERS", True)
+PTERO_MEMORY_SWAP = env_int("PTERO_MEMORY_SWAP", 0)
+PTERO_IO = env_int("PTERO_IO", 500, 10, 1000)
+PTERO_DATABASES = env_int("PTERO_DATABASES", 0, 0, 100)
+PTERO_ALLOCATIONS = env_int("PTERO_ALLOCATIONS", 1, 1, 100)
+PTERO_BACKUPS = env_int("PTERO_BACKUPS", 5, 0, 100)
+PTERO_DOCKER_IMAGE = os.getenv("PTERO_DOCKER_IMAGE", "").strip()
+PTERO_STARTUP = os.getenv("PTERO_STARTUP", "").strip()
+PTERO_SKIP_SCRIPTS = env_bool("PTERO_SKIP_SCRIPTS", False)
+PTERO_ENVIRONMENT_JSON = os.getenv("PTERO_ENVIRONMENT_JSON", "{}").strip() or "{}"
 try:
-    KVM_BASE_IMAGES: dict[str, str] = json.loads(os.getenv("KVM_BASE_IMAGES_JSON", "{}"))
-    if not isinstance(KVM_BASE_IMAGES, dict):
-        KVM_BASE_IMAGES = {}
-except json.JSONDecodeError:
-    KVM_BASE_IMAGES = {}
+    PTERO_ENVIRONMENT = json.loads(PTERO_ENVIRONMENT_JSON)
+    if not isinstance(PTERO_ENVIRONMENT, dict):
+        PTERO_ENVIRONMENT = {}
+except (TypeError, ValueError, json.JSONDecodeError):
+    PTERO_ENVIRONMENT = {}
+
+def ptero_application_configured() -> bool:
+    return bool(
+        PTERO_URL and PTERO_API_KEY and PTERO_DEFAULT_USER_ID
+        and PTERO_NODE_ID and PTERO_NEST_ID and PTERO_EGG_ID
+        and PTERO_ALLOCATION_ID
+    )
+
+
+def ptero_client_configured() -> bool:
+    return bool(PTERO_URL and PTERO_CLIENT_API_KEY)
+
+
+def ptero_configured() -> bool:
+    return ptero_application_configured() and ptero_client_configured()
+
+def active_backend() -> str:
+    # The bot creates the guest locally. Pterodactyl support means the guest
+    # is provisioned with Panel/Wings prerequisites; it must not silently
+    # switch a VM creation request into a Pterodactyl API server.
+    return "docker"
+
+if not WEB_PATH.startswith("/"):
+    WEB_PATH = "/" + WEB_PATH
+
+LOCATION_CONFIG = {
+    "SG": {"label": "Singapore 🇸🇬", "short": "SG"},
+    "IN": {"label": "India 🇮🇳", "short": "IN"},
+}
+
+OS_CONFIG = {
+    "ubuntu-26.04": {"label": "Ubuntu 26.04 LTS", "image": "ubuntu:26.04"},
+    "ubuntu-24.04": {"label": "Ubuntu 24.04 LTS", "image": "ubuntu:24.04"},
+    "ubuntu-22.04": {"label": "Ubuntu 22.04 LTS", "image": "ubuntu:22.04"},
+    "debian-12": {"label": "Debian 12", "image": "debian:12"},
+    "debian-11": {"label": "Debian 11", "image": "debian:11"},
+}
+
+LOCATION_ALIASES = {
+    "sg": "SG",
+    "singapore": "SG",
+    "in": "IN",
+    "india": "IN",
+}
 
 OS_ALIASES = {
-    "ubuntu": "ubuntu-24.04",
-    "ubuntu24": "ubuntu-24.04",
-    "ubuntu24.04": "ubuntu-24.04",
-    "ubuntu22": "ubuntu-22.04",
-    "ubuntu22.04": "ubuntu-22.04",
-    "debian": "debian-12",
-    "debian12": "debian-12",
-    "debian11": "debian-11",
-    "rocky": "rocky-9",
-    "rocky9": "rocky-9",
-    "alma": "alma-9",
-    "alma9": "alma-9",
-    "windows": "windows",
-    "windows11": "windows-11",
-    "windows-11": "windows-11",
-}
-OS_LABELS = {
-    "ubuntu-24.04": "Ubuntu 24.04 LTS",
-    "ubuntu-22.04": "Ubuntu 22.04 LTS",
-    "debian-12": "Debian 12",
-    "debian-11": "Debian 11",
-    "rocky-9": "Rocky Linux 9",
-    "alma-9": "AlmaLinux 9",
-    "windows-11": "Windows 11",
-    "windows": "Windows (configured image)",
+    "ubuntu": "ubuntu-24.04", "ubuntu26": "ubuntu-26.04", "ubuntu26.04": "ubuntu-26.04", "ubuntu-26.04": "ubuntu-26.04",
+    "ubuntu24": "ubuntu-24.04", "ubuntu24.04": "ubuntu-24.04", "ubuntu-24.04": "ubuntu-24.04",
+    "ubuntu22": "ubuntu-22.04", "ubuntu22.04": "ubuntu-22.04", "ubuntu-22.04": "ubuntu-22.04",
+    "debian": "debian-12", "debian12": "debian-12", "debian-12": "debian-12",
+    "debian11": "debian-11", "debian-11": "debian-11",
 }
 
-logger = logging.getLogger("rgnodes")
+ACCESS_URL_RE = re.compile(r"https://sshx\.io/s/[A-Za-z0-9_-]+(?:#[A-Za-z0-9_=-]+)?", re.IGNORECASE)
 Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
 )
+logger = logging.getLogger("rgnodes")
 
-# ============================================================================
-# Generic helpers
-# ============================================================================
+# Prevent multiple copies of the same bot from connecting with the same token.
+# Two gateway sessions will both receive the same message and cause duplicate
+# replies. This lock is held for the complete process lifetime.
+SINGLETON_LOCK_FILE = Path(os.getenv("SINGLETON_LOCK_FILE", "/tmp/rgnodes-vm.lock")).expanduser()
+_SINGLETON_HANDLE = None
 
-def now_iso() -> str:
+def _same_script_process(pid: int) -> bool:
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return False
+    return str(Path(__file__).resolve()) in raw
+
+def acquire_singleton() -> None:
+    """Acquire a process-wide lock and refuse a second bot instance.
+
+    Never terminate another process from inside the application. A restart
+    supervisor/systemd/pm2 should own process lifecycle; killing a peer here
+    can create a short overlap where both gateway sessions receive events.
+    """
+    global _SINGLETON_HANDLE
+    SINGLETON_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handle = SINGLETON_LOCK_FILE.open("a+")
+    if fcntl is None:
+        handle.close()
+        raise SystemExit("fcntl is unavailable; refusing to start without duplicate-process protection.")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise SystemExit("Another RGNODES bot process is already running. Stop the existing copy before starting a new one.")
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    _SINGLETON_HANDLE = handle
+    logger.info("RGNODES singleton lock acquired (pid=%s).", os.getpid())
+
+def release_singleton() -> None:
+    global _SINGLETON_HANDLE
+    handle = _SINGLETON_HANDLE
+    _SINGLETON_HANDLE = None
+    if handle is None:
+        return
+    with contextlib.suppress(Exception):
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with contextlib.suppress(Exception):
+        handle.close()
+
+
+# ================================================================
+# Lightweight 24/7 HTTP health/landing server
+# ================================================================
+# This server intentionally uses only Python's asyncio standard library so the
+# existing dependency set does not need Flask/FastAPI/aiohttp. It runs in the
+# same event loop as discord.py and therefore stays alive for the full process
+# lifetime. Hosting platforms can probe the assigned PORT and receive HTTP 200.
+WEB_SERVER: asyncio.AbstractServer | None = None
+WEB_SERVER_TASK: asyncio.Task[None] | None = None
+WEB_STARTED_AT = datetime.now(timezone.utc)
+
+
+def _html_escape(value: Any) -> str:
+    text = str(value)
+    return (text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace('"', "&quot;")
+                .replace("'", "&#39;"))
+
+
+def _health_html() -> bytes:
+    discord_online = bool(bot.is_ready()) if "bot" in globals() else False
+    bot_name = str(bot.user) if discord_online and getattr(bot, "user", None) else "Starting…"
+    state = "Online" if discord_online else "Starting"
+    started = WEB_STARTED_AT.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    body = f"""<!doctype html>
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+<meta http-equiv=\"refresh\" content=\"30\">
+<title>RGNODES™ • Bot Status</title>
+<style>
+body{{margin:0;min-height:100vh;background:#111318;color:#f5f7fa;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;display:grid;place-items:center}}
+.card{{width:min(680px,calc(100% - 40px));padding:34px;border:1px solid #2a2e38;border-radius:20px;background:#181b22;box-shadow:0 20px 70px rgba(0,0,0,.35)}}
+.badge{{display:inline-flex;align-items:center;gap:8px;padding:7px 12px;border-radius:999px;background:#20252e;font-size:14px}}
+.dot{{width:9px;height:9px;border-radius:50%;background:#48d597;box-shadow:0 0 14px #48d597}}
+h1{{margin:18px 0 10px;font-size:34px}}
+p{{color:#aeb6c4;line-height:1.6}}
+.row{{display:flex;justify-content:space-between;gap:18px;margin-top:22px;padding-top:18px;border-top:1px solid #2a2e38}}
+code{{color:#dfe5ee}}
+</style>
+</head>
+<body>
+<main class=\"card\">
+<div class=\"badge\"><span class=\"dot\"></span>Bot is <strong>{_html_escape(state)}</strong></div>
+<h1>RGNODES™ Bot is online…</h1>
+<p>The 24/7 health endpoint is running and ready for hosting-platform health checks. Opening or pinging this port confirms the process is serving HTTP.</p>
+<div class=\"row\"><span>Status</span><strong>{_html_escape(state)}</strong></div>
+<div class=\"row\"><span>Discord</span><strong>{_html_escape(bot_name)}</strong></div>
+<div class=\"row\"><span>Started</span><code>{_html_escape(started)}</code></div>
+</main>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+async def _http_health_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    peer = writer.get_extra_info("peername")
+    try:
+        # Read only the request headers, with a hard cap to avoid oversized or
+        # slowloris-style requests taking resources from the Discord bot.
+        try:
+            request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError):
+            return
+        if len(request) > 16 * 1024:
+            return
+
+        first_line = request.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+        parts = first_line.split()
+        method = parts[0].upper() if parts else ""
+        target = parts[1] if len(parts) >= 2 else "/"
+        path = target.split("?", 1)[0].split("#", 1)[0]
+
+        if method not in {"GET", "HEAD"}:
+            payload = b"Method Not Allowed\n"
+            headers = (
+                b"HTTP/1.1 405 Method Not Allowed\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n"
+                + f"Content-Length: {len(payload)}\r\n".encode()
+                + b"Connection: close\r\n\r\n"
+            )
+        elif path in {"/", WEB_PATH, "/health", "/healthz", "/ping"}:
+            if path in {"/health", "/healthz"}:
+                discord_online = bool(bot.is_ready())
+                payload = (
+                    ("{\"status\":\"online\",\"discord_ready\":" + ("true" if discord_online else "false") + "}")
+                    .encode("utf-8")
+                )
+                content_type = b"application/json; charset=utf-8"
+            else:
+                payload = _health_html()
+                content_type = b"text/html; charset=utf-8"
+            headers = (
+                b"HTTP/1.1 200 OK\r\n"
+                + b"Content-Type: " + content_type + b"\r\n"
+                + f"Content-Length: {len(payload)}\r\n".encode()
+                + b"Cache-Control: no-store, no-cache, must-revalidate\r\n"
+                + b"Connection: close\r\n\r\n"
+            )
+        else:
+            payload = b"Not Found\n"
+            headers = (
+                b"HTTP/1.1 404 Not Found\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n"
+                + f"Content-Length: {len(payload)}\r\n".encode()
+                + b"Connection: close\r\n\r\n"
+            )
+
+        writer.write(headers)
+        if method != "HEAD":
+            writer.write(payload)
+        await writer.drain()
+    except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+        pass
+    except Exception as exc:
+        logger.debug("Health client error from %s: %s", peer, safe_log(exc))
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+
+
+async def start_health_server() -> asyncio.AbstractServer | None:
+    global WEB_SERVER, WEB_SERVER_TASK
+    if WEB_SERVER is not None:
+        return WEB_SERVER
+    try:
+        last_error = None
+        candidates: list[int] = []
+        for candidate in [WEB_PORT, *range(WEB_PORT + 1, min(WEB_PORT + 11, 65536))]:
+            if candidate in WEB_RESERVED_PORTS or candidate in candidates:
+                continue
+            candidates.append(candidate)
+        for candidate in candidates:
+            try:
+                WEB_SERVER = await asyncio.start_server(
+                    _http_health_client,
+                    host=WEB_HOST,
+                    port=candidate,
+                    limit=16 * 1024,
+                    reuse_address=True,
+                )
+                if candidate != WEB_PORT:
+                    logger.warning("Health port %s is busy; using fallback port %s.", WEB_PORT, candidate)
+                break
+            except OSError as exc:
+                last_error = exc
+        if WEB_SERVER is None:
+            raise last_error or OSError("No health port available")
+        WEB_SERVER_TASK = asyncio.create_task(
+            WEB_SERVER.serve_forever(),
+            name="rgnodes-http-health",
+        )
+        sockets = WEB_SERVER.sockets or []
+        bound = ", ".join(str(sock.getsockname()) for sock in sockets) or f"{WEB_HOST}:{WEB_PORT}"
+        logger.info("24/7 HTTP health server online at %s | GET / or /health", bound)
+        return WEB_SERVER
+    except (OSError, asyncio.CancelledError) as exc:
+        WEB_SERVER = None
+        WEB_SERVER_TASK = None
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        logger.error("Could not start HTTP health server on %s:%s: %s", WEB_HOST, WEB_PORT, safe_log(exc))
+        return None
+
+
+async def stop_health_server() -> None:
+    global WEB_SERVER, WEB_SERVER_TASK
+    server, task = WEB_SERVER, WEB_SERVER_TASK
+    WEB_SERVER = None
+    WEB_SERVER_TASK = None
+    if server is not None:
+        server.close()
+        with contextlib.suppress(Exception):
+            await server.wait_closed()
+    if task is not None:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+def safe_log(value: Any, limit: int = 1800) -> str:
+    text = str(value)
+    # Preserve the useful SSHx session ID while redacting only the browser-side
+    # E2E key fragment. Logging the full fragment would expose the private console.
+    text = re.sub(
+        r"(https://sshx\.io/s/[A-Za-z0-9_-]+)#([^\s<>\]\[\"']+)",
+        r"\1#<e2e-key-redacted>",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"Bearer\s+\S+", "Bearer <redacted>", text, flags=re.I)
+    text = re.sub(r"ssh\s+\S+@\S+", "ssh <redacted>", text, flags=re.I)
+    return text[:max(1, int(limit))]
+
+
+def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def clean(value: Any, limit: int = 500) -> str:
-    return str(value if value is not None else "").replace("`", "'").replace("\x00", "")[:limit]
-
-
-def env_secret_hash(password: str) -> str:
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310_000)
-    return "pbkdf2$sha256$310000$%s$%s" % (
-        base64.urlsafe_b64encode(salt).decode().rstrip("="),
-        base64.urlsafe_b64encode(digest).decode().rstrip("="),
-    )
-
-
-def verify_password(password: str, encoded: str) -> bool:
-    try:
-        scheme, algo, iterations, salt_b64, digest_b64 = encoded.split("$", 4)
-        if scheme != "pbkdf2" or algo != "sha256":
-            return False
-        salt = base64.urlsafe_b64decode(salt_b64 + "===")
-        expected = base64.urlsafe_b64decode(digest_b64 + "===")
-        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, int(iterations))
-        return hmac.compare_digest(actual, expected)
-    except (ValueError, TypeError):
-        return False
-
-
-def password_configured() -> bool:
-    return bool(WEB_ADMIN_PASSWORD_HASH or WEB_ADMIN_PASSWORD)
-
-
-def verify_web_credentials(username: str, password: str) -> bool:
-    if not hmac.compare_digest(username, WEB_ADMIN_USER):
-        return False
-    if WEB_ADMIN_PASSWORD_HASH:
-        return verify_password(password, WEB_ADMIN_PASSWORD_HASH)
-    if WEB_ADMIN_PASSWORD:
-        return hmac.compare_digest(password, WEB_ADMIN_PASSWORD)
-    return False
-
-
 def normalize_os(value: str | None) -> str | None:
-    raw = (value or "").strip().lower()
-    return OS_ALIASES.get(raw, raw if raw in OS_LABELS else None)
+    return OS_ALIASES.get((value or "").strip().lower())
 
 
 def os_label(value: str | None) -> str:
-    key = normalize_os(value) or (value or "Unknown")
-    return OS_LABELS.get(key, key)
+    normalized = normalize_os(value) or (value or "Unknown")
+    return OS_CONFIG.get(normalized, {"label": normalized})["label"]
 
 
-def parse_size_bytes(value: str | int | float) -> int:
-    text = str(value).strip().lower().replace(" ", "")
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)(b|kb|kib|mb|mib|gb|gib|tb|tib|k|m|g|t)?", text)
-    if not m:
-        raise ValueError(f"Invalid size: {value}")
-    amount = float(m.group(1))
-    unit = m.group(2) or "g"
-    factors = {
-        "b": 1,
-        "k": 1024,
-        "kb": 1000,
-        "kib": 1024,
-        "m": 1024**2,
-        "mb": 1000**2,
-        "mib": 1024**2,
-        "g": 1024**3,
-        "gb": 1000**3,
-        "gib": 1024**3,
-        "t": 1024**4,
-        "tb": 1000**4,
-        "tib": 1024**4,
-    }
-    return int(amount * factors[unit])
+def normalize_location(value: str | None) -> str | None:
+    raw = (value or "").strip().lower()
+    if raw in LOCATION_ALIASES:
+        return LOCATION_ALIASES[raw]
+    key = raw.upper()
+    return key if key in LOCATION_CONFIG else None
 
 
-def format_bytes(value: int | float | None) -> str:
+def location_label(value: str | None) -> str:
+    return LOCATION_CONFIG[(normalize_location(value) or DEFAULT_LOCATION)]["label"]
+
+
+def clean(value: Any, limit: int = 1024) -> str:
+    return str(value if value is not None else "N/A").replace("`", "'")[:limit]
+
+
+def parse_size_bytes(value: str) -> int:
+    text = str(value or "").strip().lower().replace(" ", "")
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)(b|kb|k|mb|m|gb|g|tb|t)?", text)
+    if not match:
+        raise ValueError(f"Invalid resource value: {value}")
+    amount = float(match.group(1))
+    unit = match.group(2) or "g"
+    multiplier = {"b": 1, "k": 1024, "kb": 1024, "m": 1024**2, "mb": 1024**2, "g": 1024**3, "gb": 1024**3, "t": 1024**4, "tb": 1024**4}[unit]
+    return int(amount * multiplier)
+
+
+def format_bytes(value: int) -> str:
+    """Human-readable binary byte formatting for Discord dashboard values."""
     try:
-        n = max(0, int(value or 0))
-    except (ValueError, TypeError):
+        value = max(0, int(value))
+    except (TypeError, ValueError):
         return "N/A"
-    units = ("B", "KB", "MB", "GB", "TB", "PB")
-    v = float(n)
-    for unit in units:
-        if v < 1024 or unit == units[-1]:
-            return f"{v:.1f}{unit}" if unit != "B" else f"{int(v)}B"
-        v /= 1024
-    return "N/A"
+    if value < 1024:
+        return f"{value} B"
+    if value < 1024**2:
+        return f"{value / 1024:.0f}KB"
+    if value < 1024**3:
+        return f"{value / 1024**2:.1f}MB"
+    if value < 1024**4:
+        return f"{value / 1024**3:.2f}GB"
+    return f"{value / 1024**4:.2f}TB"
 
 
-def validate_resources(ram: str, cpu: str, disk: str) -> tuple[str, int, str, int]:
-    ram_b = parse_size_bytes(ram)
-    disk_b = parse_size_bytes(disk)
-    cpu_n = int(float(cpu))
-    if not 256 * 1024**2 <= ram_b <= KVM_RAM_MAX_GB * 1024**3:
-        raise ValueError(f"RAM must be between 256MB and {KVM_RAM_MAX_GB}GB.")
-    if not 1 * 1024**3 <= disk_b <= KVM_DISK_MAX_GB * 1024**3:
-        raise ValueError(f"Disk must be between 1GB and {KVM_DISK_MAX_GB}GB.")
-    if cpu_n < 1 or cpu_n > KVM_VCPUS_MAX:
-        raise ValueError(f"CPU must be between 1 and {KVM_VCPUS_MAX} vCPU(s).")
-    return str(ram).strip(), cpu_n, str(disk).strip(), disk_b
+def normalize_dashboard_memory(raw: str | None) -> str:
+    """Normalize Docker/cgroup memory text to a stable Discord-friendly form."""
+    text = str(raw or "").strip()
+    if not text:
+        return "N/A"
+    if "/" not in text:
+        return text
+
+    left, right = (part.strip() for part in text.split("/", 1))
+
+    def to_bytes(part: str) -> int | None:
+        m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgtpe]i?b)?", part, re.I)
+        if not m:
+            return None
+        try:
+            amount = float(m.group(1))
+            unit = (m.group(2) or "b").lower()
+            factors = {
+                "b": 1, "kb": 1000, "kib": 1024,
+                "mb": 1000**2, "mib": 1024**2,
+                "gb": 1000**3, "gib": 1024**3,
+                "tb": 1000**4, "tib": 1024**4,
+                "pb": 1000**5, "pib": 1024**5,
+                "eb": 1000**6, "eib": 1024**6,
+            }
+            return int(amount * factors[unit])
+        except (KeyError, ValueError, OverflowError):
+            return None
+
+    used = to_bytes(left)
+    limit = to_bytes(right)
+    if used is not None and limit is not None:
+        return f"{format_bytes(used)} / {format_bytes(limit)}"
+    return text
 
 
-def safe_name(value: str, fallback: str = "vm") -> str:
-    value = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
-    value = value.strip(".-_")[:56]
-    return value or fallback
+def normalize_network_stats(raw: str | None) -> str:
+    """Render Docker NetIO as download/upload without changing the measured values."""
+    text = str(raw or "").strip()
+    if not text:
+        return "N/A"
+    if " / " in text:
+        left, right = text.split(" / ", 1)
+        return f"{left.strip()} ↓ / {right.strip()} ↑"
+    return text
 
 
-def command_available(name: str) -> bool:
-    from shutil import which
-    return which(name) is not None
+def validate_resources(ram: str, cpu: str, disk: str) -> tuple[str, str, str]:
+    try:
+        ram_bytes = parse_size_bytes(ram)
+        disk_bytes = parse_size_bytes(disk)
+        cpu_value = float(str(cpu).strip())
+    except (TypeError, ValueError):
+        raise ValueError("RAM, CPU, or disk format is invalid. Example: `2g`, `2`, `10g`.")
+    if not 256 * 1024**2 <= ram_bytes <= 256 * 1024**3:
+        raise ValueError("RAM must be between 256MB and 256GB.")
+    if not 1 * 1024**3 <= disk_bytes <= 10 * 1024**4:
+        raise ValueError("Disk must be between 1GB and 10TB.")
+    if not 0 < cpu_value <= 64:
+        raise ValueError("CPU must be greater than 0 and no more than 64 cores.")
+    ram = str(ram).strip().lower()
+    cpu = f"{cpu_value:g}"
+    disk = str(disk).strip().lower()
+    return ram, cpu, disk
 
 
-def detect_kvm() -> bool:
-    return sys.platform.startswith("linux") and os.path.exists("/dev/kvm")
+# ================================================================
+# SQLite — serialized writes + resilient migration
+# ================================================================
 
-
-def qemu_backend_available(prefer_kvm: bool = True) -> tuple[bool, str]:
-    if not sys.platform.startswith("linux"):
-        return False, "QEMU/libvirt backend currently requires a Linux host."
-    missing = [x for x in ("virsh", "qemu-img") if not command_available(x)]
-    if missing:
-        return False, "Missing required binaries: " + ", ".join(missing)
-    if prefer_kvm and KVM_REQUIRE_KVM and not detect_kvm():
-        return False, "/dev/kvm is unavailable and KVM is required by configuration."
-    return True, "KVM" if detect_kvm() and prefer_kvm else "QEMU"
-
-
-def choose_backend(override: str | None = None) -> str:
-    choice = (override or BACKEND).strip().lower()
-    if choice in {"kvm", "qemu"}:
-        return choice
-    if choice == "docker":
-        return "docker"
-    if choice == "pterodactyl":
-        return "pterodactyl"
-    ok, mode = qemu_backend_available(True)
-    if ok:
-        return "kvm" if mode == "KVM" else "qemu"
-    if PTERO_URL and PTERO_API_KEY:
-        return "pterodactyl"
-    if command_available("docker"):
-        return "docker"
-    return "kvm"
-
-
-# ============================================================================
-# Database
-# ============================================================================
-
-DB_LOCK = asyncio.Lock()
+DB_WRITE_LOCK = asyncio.Lock()
 
 
 def db_connect() -> sqlite3.Connection:
@@ -355,2153 +655,5809 @@ def db_connect() -> sqlite3.Connection:
     return conn
 
 
-def db_init() -> None:
+def init_db() -> None:
     conn = db_connect()
     try:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users(
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS vms(
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS vps (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                domain TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL,
+                container_id TEXT UNIQUE NOT NULL,
+                container_name TEXT NOT NULL,
                 os_type TEXT NOT NULL,
-                ram TEXT NOT NULL,
-                vcpu INTEGER NOT NULL,
-                disk TEXT NOT NULL,
-                disk_path TEXT,
-                ip_address TEXT,
+                location TEXT NOT NULL DEFAULT 'SG',
+                hostname TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'stopped',
+                ssh_command TEXT,
+                ram TEXT NOT NULL DEFAULT '2g',
+                cpu TEXT NOT NULL DEFAULT '1',
+                disk TEXT NOT NULL DEFAULT '10g',
                 suspended INTEGER NOT NULL DEFAULT 0,
-                abuse_score INTEGER NOT NULL DEFAULT 0,
-                abuse_reason TEXT,
-                bootstrap_status TEXT NOT NULL DEFAULT 'pending',
-                bootstrap_message TEXT,
+                sshx_url TEXT,
+                sshx_pid TEXT,
+                public_ipv4 TEXT,
+                ipv4_verified_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                deleted_at TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_vms_owner ON vms(owner_id);
-            CREATE INDEX IF NOT EXISTS idx_vms_status ON vms(status);
-            CREATE TABLE IF NOT EXISTS bans(
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS vps_shares (
+                vps_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                shared_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (vps_id, user_id),
+                FOREIGN KEY(vps_id) REFERENCES vps(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bans (
                 user_id INTEGER PRIMARY KEY,
-                reason TEXT NOT NULL DEFAULT 'policy violation',
                 created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS audit_logs(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                actor TEXT NOT NULL,
-                action TEXT NOT NULL,
-                target TEXT,
-                detail TEXT,
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_slots (
+                user_id INTEGER PRIMARY KEY,
+                slots INTEGER NOT NULL DEFAULT 1 CHECK(slots > 0),
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS processed_events (
+                event_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
                 created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sessions(
-                token_hash TEXT PRIMARY KEY,
-                username TEXT NOT NULL,
-                expires_at REAL NOT NULL,
-                csrf TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                last_seen REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS login_failures(
-                source TEXT PRIMARY KEY,
-                failures INTEGER NOT NULL DEFAULT 0,
-                first_seen REAL NOT NULL,
-                blocked_until REAL NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS abuse_events(
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_events_created_at ON processed_events(created_at)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS vps_ports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                vm_id INTEGER NOT NULL,
-                score INTEGER NOT NULL,
-                reason TEXT NOT NULL,
+                vps_id INTEGER NOT NULL,
+                container_port INTEGER NOT NULL,
+                host_port INTEGER NOT NULL UNIQUE,
+                protocol TEXT NOT NULL DEFAULT 'tcp',
+                target_ip TEXT,
+                pid INTEGER,
+                status TEXT NOT NULL DEFAULT 'stopped',
                 created_at TEXT NOT NULL,
-                FOREIGN KEY(vm_id) REFERENCES vms(id) ON DELETE CASCADE
-            );
-            """
-        )
-        cols = {row["name"] for row in conn.execute("PRAGMA table_info(vms)")}
-        if "bootstrap_status" not in cols:
-            conn.execute("ALTER TABLE vms ADD COLUMN bootstrap_status TEXT NOT NULL DEFAULT 'pending'")
-        if "bootstrap_message" not in cols:
-            conn.execute("ALTER TABLE vms ADD COLUMN bootstrap_message TEXT")
+                updated_at TEXT NOT NULL,
+                UNIQUE(vps_id, container_port, protocol),
+                FOREIGN KEY(vps_id) REFERENCES vps(id) ON DELETE CASCADE
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS vps_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vps_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                image_ref TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(vps_id, name),
+                FOREIGN KEY(vps_id) REFERENCES vps(id) ON DELETE CASCADE
+            )
+        """)
+        def cols(table: str) -> set[str]:
+            return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        vps_cols = cols("vps")
+        for name, ddl in {
+            "location": "ALTER TABLE vps ADD COLUMN location TEXT NOT NULL DEFAULT 'SG'",
+            "sshx_url": "ALTER TABLE vps ADD COLUMN sshx_url TEXT",
+            "sshx_pid": "ALTER TABLE vps ADD COLUMN sshx_pid TEXT",
+            "public_ipv4": "ALTER TABLE vps ADD COLUMN public_ipv4 TEXT",
+            "ipv4_verified_at": "ALTER TABLE vps ADD COLUMN ipv4_verified_at TEXT",
+            "backend": "ALTER TABLE vps ADD COLUMN backend TEXT NOT NULL DEFAULT 'docker'",
+            "ptero_server_id": "ALTER TABLE vps ADD COLUMN ptero_server_id INTEGER",
+            "ptero_identifier": "ALTER TABLE vps ADD COLUMN ptero_identifier TEXT",
+            "ptero_user_id": "ALTER TABLE vps ADD COLUMN ptero_user_id INTEGER",
+        }.items():
+            if name not in vps_cols:
+                conn.execute(ddl)
+        # Refresh the schema view after ALTER TABLE operations.
+        vps_cols = cols("vps")
+        required_vps = {
+            "user_id", "container_id", "container_name", "os_type", "location",
+            "hostname", "status", "ram", "cpu", "disk", "sshx_url", "sshx_pid",
+            "public_ipv4", "ipv4_verified_at", "created_at", "updated_at",
+            "backend", "ptero_server_id", "ptero_identifier", "ptero_user_id",
+        }
+        missing_vps = sorted(required_vps - vps_cols)
+        if missing_vps:
+            raise RuntimeError(f"SQLite VPS schema is incomplete; missing columns: {', '.join(missing_vps)}")
+
+        share_cols = cols("vps_shares")
+        if "shared_by" not in share_cols:
+            conn.execute("ALTER TABLE vps_shares ADD COLUMN shared_by INTEGER")
+        if "created_at" not in share_cols:
+            conn.execute("ALTER TABLE vps_shares ADD COLUMN created_at TEXT")
+
+        if "updated_at" not in cols("users"):
+            conn.execute("ALTER TABLE users ADD COLUMN updated_at TEXT")
+        if "created_at" not in cols("bans"):
+            conn.execute("ALTER TABLE bans ADD COLUMN created_at TEXT")
+        now = utc_now()
+        conn.execute("UPDATE users SET updated_at=COALESCE(updated_at,created_at,?)", (now,))
+        conn.execute("UPDATE vps SET location=COALESCE(location,'SG'),updated_at=COALESCE(updated_at,created_at,?)", (now,))
+        conn.execute("UPDATE bans SET created_at=COALESCE(created_at,?)", (now,))
+        conn.execute("UPDATE user_slots SET updated_at=COALESCE(updated_at,?)", (now,))
     finally:
         conn.close()
 
 
-def db_audit(actor: str, action: str, target: str = "", detail: str = "") -> None:
+init_db()
+
+
+def claim_processed_event(event_id: str, kind: str, *, ttl_seconds: int = 900) -> bool:
+    """Atomically claim a Discord event across all bot processes using SQLite.
+
+    This is a second layer of duplicate protection in addition to the OS
+    singleton lock. If two bot processes briefly overlap during restart, only
+    the first process that inserts the event ID is allowed to handle it.
+    """
+    event_id = str(event_id or "").strip()
+    if not event_id:
+        return True
+    now_dt = datetime.now(timezone.utc)
+    cutoff = (now_dt - timedelta(seconds=max(60, int(ttl_seconds)))).isoformat()
+    now = now_dt.isoformat()
     conn = db_connect()
     try:
-        conn.execute(
-            "INSERT INTO audit_logs(actor,action,target,detail,created_at) VALUES(?,?,?,?,?)",
-            (clean(actor, 120), clean(action, 120), clean(target, 200), clean(detail, 1500), now_iso()),
+        conn.execute("DELETE FROM processed_events WHERE created_at < ?", (cutoff,))
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO processed_events(event_id,kind,created_at) VALUES(?,?,?)",
+            (event_id, kind[:32], now),
         )
+        return cur.rowcount == 1
+    except sqlite3.Error as exc:
+        # Fail closed: allowing the event through when the cross-process guard
+        # is unavailable can create the exact duplicate side effect this table
+        # is designed to prevent.
+        logger.error("Event de-duplication check failed; blocking event: %s", safe_log(exc))
+        return False
     finally:
         conn.close()
 
 
 def db_upsert_user(user_id: int, username: str) -> None:
+    now = utc_now()
     conn = db_connect()
     try:
-        now = now_iso()
-        conn.execute(
-            "INSERT INTO users(user_id,username,created_at,updated_at) VALUES(?,?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,updated_at=excluded.updated_at",
-            (int(user_id), clean(username, 200), now, now),
-        )
+        conn.execute("""
+            INSERT INTO users(user_id,username,created_at,updated_at) VALUES(?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,updated_at=excluded.updated_at
+        """, (user_id, username[:200], now, now))
     finally:
         conn.close()
 
 
-def db_is_banned(user_id: int) -> tuple[bool, str]:
+def db_is_banned(user_id: int) -> bool:
     conn = db_connect()
     try:
-        row = conn.execute("SELECT reason FROM bans WHERE user_id=?", (int(user_id),)).fetchone()
-        return (True, str(row[0])) if row else (False, "")
+        return conn.execute("SELECT 1 FROM bans WHERE user_id=?", (user_id,)).fetchone() is not None
     finally:
         conn.close()
 
 
-def db_set_ban(user_id: int, banned: bool, reason: str = "policy violation") -> None:
+def db_set_ban(user_id: int, banned: bool) -> None:
     conn = db_connect()
     try:
         if banned:
-            conn.execute(
-                "INSERT INTO bans(user_id,reason,created_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason",
-                (int(user_id), clean(reason, 500), now_iso()),
-            )
+            conn.execute("INSERT OR IGNORE INTO bans(user_id,created_at) VALUES(?,?)", (user_id, utc_now()))
         else:
-            conn.execute("DELETE FROM bans WHERE user_id=?", (int(user_id),))
+            conn.execute("DELETE FROM bans WHERE user_id=?", (user_id,))
     finally:
         conn.close()
 
 
-def db_insert_vm(**values: Any) -> int:
-    fields = [
-        "owner_id", "name", "backend", "domain", "os_type", "ram", "vcpu",
-        "disk", "disk_path", "ip_address", "status", "suspended", "bootstrap_status", "bootstrap_message", "created_at", "updated_at",
-    ]
-    data = {k: values.get(k) for k in fields}
-    data["created_at"] = data.get("created_at") or now_iso()
-    data["updated_at"] = data.get("updated_at") or now_iso()
-    cols = ",".join(fields)
-    placeholders = ",".join("?" for _ in fields)
+def db_insert_vps(**data: Any) -> int:
+    """Insert a VPS row using generated placeholders to prevent column/value drift.
+
+    Returns the inserted SQLite row id.  The previous implementation used a
+    hand-written VALUES list that was easy to break during schema evolution.
+    """
+    now = utc_now()
+    fields = {
+        "user_id": data["user_id"],
+        "container_id": data["container_id"],
+        "container_name": data["container_name"],
+        "os_type": data["os_type"],
+        "location": data.get("location", DEFAULT_LOCATION),
+        "hostname": data["hostname"],
+        "status": data.get("status", "running"),
+        "ram": data["ram"],
+        "cpu": data["cpu"],
+        "disk": data["disk"],
+        "sshx_url": data.get("sshx_url"),
+        "sshx_pid": data.get("sshx_pid"),
+        "public_ipv4": data.get("public_ipv4"),
+        "ipv4_verified_at": data.get("ipv4_verified_at"),
+        "created_at": data.get("created_at", now),
+        "updated_at": data.get("updated_at", now),
+        "backend": data.get("backend", "docker"),
+        "ptero_server_id": data.get("ptero_server_id"),
+        "ptero_identifier": data.get("ptero_identifier"),
+        "ptero_user_id": data.get("ptero_user_id"),
+    }
+    columns = list(fields.keys())
+    placeholders = ",".join("?" for _ in columns)
+    sql = f"INSERT INTO vps ({','.join(columns)}) VALUES ({placeholders})"
+    conn = db_connect()
+    try:
+        cur = conn.execute(sql, tuple(fields[col] for col in columns))
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def db_get_vps(vps_id: int) -> sqlite3.Row | None:
+    conn = db_connect()
+    try:
+        return conn.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
+    finally:
+        conn.close()
+
+
+def db_get_user_vps(user_id: int) -> list[sqlite3.Row]:
+    conn = db_connect()
+    try:
+        return conn.execute("SELECT * FROM vps WHERE user_id=? ORDER BY id DESC", (user_id,)).fetchall()
+    finally:
+        conn.close()
+
+
+def db_get_all_vps() -> list[sqlite3.Row]:
+    conn = db_connect()
+    try:
+        return conn.execute("SELECT * FROM vps ORDER BY id DESC").fetchall()
+    finally:
+        conn.close()
+
+
+def db_vps_count(user_id: int) -> int:
+    conn = db_connect()
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM vps WHERE user_id=?", (user_id,)).fetchone()[0])
+    finally:
+        conn.close()
+
+
+def db_running_count() -> int:
+    conn = db_connect()
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM vps WHERE status='running' AND suspended=0").fetchone()[0])
+    finally:
+        conn.close()
+
+
+def db_allocated_resources() -> tuple[int, float, int]:
+    """Sum requested resources of all managed VPS records for capacity checks."""
+    conn = db_connect()
+    try:
+        rows = conn.execute("SELECT ram,cpu,disk FROM vps").fetchall()
+    finally:
+        conn.close()
+    ram = cpu = disk = 0.0
+    for row in rows:
+        try:
+            ram += parse_size_bytes(row["ram"])
+            disk += parse_size_bytes(row["disk"])
+            cpu += float(row["cpu"])
+        except (TypeError, ValueError):
+            logger.warning("Ignoring malformed resource allocation while checking host capacity")
+    return int(ram), cpu, int(disk)
+
+
+def resource_capacity_error(ram: str, cpu: str, disk: str) -> str | None:
+    try:
+        request_ram = parse_size_bytes(ram)
+        request_cpu = float(cpu)
+        request_disk = parse_size_bytes(disk)
+        total_ram = parse_size_bytes(HOST_TOTAL_RAM)
+        total_disk = parse_size_bytes(HOST_TOTAL_DISK)
+    except (TypeError, ValueError):
+        return "Host resource capacity configuration is invalid."
+    used_ram, used_cpu, used_disk = db_allocated_resources()
+    if used_ram + request_ram > total_ram:
+        return f"RAM capacity exceeded: requested `{ram}`, allocated `{format_bytes(used_ram)}`, host capacity `{format_bytes(total_ram)}`."
+    if used_cpu + request_cpu > HOST_TOTAL_CPU:
+        return f"CPU capacity exceeded: requested `{cpu}` core(s), allocated `{used_cpu:g}`, host capacity `{HOST_TOTAL_CPU}`."
+    if used_disk + request_disk > total_disk:
+        return f"Disk allocation exceeded: requested `{disk}`, allocated `{format_bytes(used_disk)}`, allocation capacity `{format_bytes(total_disk)}`."
+    return None
+
+
+def db_effective_slots(user_id: int) -> int:
+    conn = db_connect()
+    try:
+        row = conn.execute("SELECT slots FROM user_slots WHERE user_id=?", (int(user_id),)).fetchone()
+        return max(1, int(row[0])) if row else max(1, SERVER_LIMIT)
+    finally:
+        conn.close()
+
+
+def db_add_slots(user_id: int, amount: int) -> int:
+    if amount <= 0:
+        raise ValueError("Slot amount must be positive.")
+    now = utc_now()
+    conn = db_connect()
+    try:
+        row = conn.execute("SELECT slots FROM user_slots WHERE user_id=?", (int(user_id),)).fetchone()
+        current = int(row[0]) if row else max(1, SERVER_LIMIT)
+        new_total = current + int(amount)
+        conn.execute("INSERT INTO user_slots(user_id,slots,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET slots=excluded.slots,updated_at=excluded.updated_at", (int(user_id), new_total, now))
+        return new_total
+    finally:
+        conn.close()
+
+
+def db_list_ports(vps_id: int) -> list[sqlite3.Row]:
+    conn = db_connect()
+    try:
+        return conn.execute("SELECT * FROM vps_ports WHERE vps_id=? ORDER BY host_port", (int(vps_id),)).fetchall()
+    finally:
+        conn.close()
+
+
+def db_get_port(port_id: int) -> sqlite3.Row | None:
+    conn = db_connect()
+    try:
+        return conn.execute("SELECT * FROM vps_ports WHERE id=?", (int(port_id),)).fetchone()
+    finally:
+        conn.close()
+
+
+def db_find_port(vps_id: int, container_port: int, protocol: str = "tcp") -> sqlite3.Row | None:
+    conn = db_connect()
+    try:
+        return conn.execute("SELECT * FROM vps_ports WHERE vps_id=? AND container_port=? AND protocol=?", (int(vps_id), int(container_port), protocol.lower())).fetchone()
+    finally:
+        conn.close()
+
+
+def db_insert_port(vps_id: int, container_port: int, host_port: int, protocol: str = "tcp") -> int:
+    now = utc_now()
+    conn = db_connect()
+    try:
+        cur = conn.execute("INSERT INTO vps_ports(vps_id,container_port,host_port,protocol,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (int(vps_id), int(container_port), int(host_port), protocol.lower(), "stopped", now, now))
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def db_update_port(port_id: int, **fields: Any) -> None:
+    allowed = {"target_ip", "pid", "status"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return
+    assignments = ", ".join(f"{k}=?" for k in updates)
+    values = list(updates.values()) + [utc_now(), int(port_id)]
+    conn = db_connect()
+    try:
+        conn.execute(f"UPDATE vps_ports SET {assignments},updated_at=? WHERE id=?", values)
+    finally:
+        conn.close()
+
+
+def db_delete_port(port_id: int) -> None:
+    conn = db_connect()
+    try:
+        conn.execute("DELETE FROM vps_ports WHERE id=?", (int(port_id),))
+    finally:
+        conn.close()
+
+
+def db_delete_all_vps() -> None:
+    conn = db_connect()
+    try:
+        conn.execute("DELETE FROM vps")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name='vps'")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name='vps_ports'")
+    finally:
+        conn.close()
+
+
+def db_find_vps(user_id: int, identifier: str | None, admin: bool = False) -> sqlite3.Row | None:
+    rows = db_get_all_vps() if admin else db_get_user_vps(user_id)
+    needle = (identifier or "").strip().lower()
+    if not needle:
+        return rows[0] if rows else None
+    exact = [r for r in rows if needle in {str(r["id"]).lower(), str(r["container_id"]).lower(), str(r["container_name"]).lower()}]
+    if exact:
+        return exact[0]
+    partial = [r for r in rows if needle in str(r["container_id"]).lower() or needle in str(r["container_name"]).lower()]
+    return partial[0] if len(partial) == 1 else None
+
+
+def db_share_vps(vps_id: int, user_id: int, shared_by: int) -> tuple[bool, str]:
+    if int(user_id) == int(shared_by):
+        return False, "You cannot share a VPS with yourself."
+    conn = db_connect()
+    try:
+        if conn.execute("SELECT 1 FROM vps WHERE id=?", (vps_id,)).fetchone() is None:
+            return False, "VPS not found."
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO vps_shares(vps_id,user_id,shared_by,created_at) VALUES(?,?,?,?)",
+            (vps_id, user_id, shared_by, utc_now()),
+        )
+        if cur.rowcount == 0:
+            return False, "That user already has access to this VPS."
+        return True, "VPS access granted."
+    finally:
+        conn.close()
+
+
+def db_unshare_vps(vps_id: int, user_id: int) -> tuple[bool, str]:
+    conn = db_connect()
+    try:
+        cur = conn.execute("DELETE FROM vps_shares WHERE vps_id=? AND user_id=?", (vps_id, user_id))
+        return (cur.rowcount > 0, "VPS access removed." if cur.rowcount else "That user does not have shared access.")
+    finally:
+        conn.close()
+
+
+def db_find_accessible_vps(user_id: int, identifier: str | None) -> sqlite3.Row | None:
+    owner = db_find_vps(user_id, identifier, admin=False)
+    if owner:
+        return owner
+    needle = (identifier or "").strip().lower()
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT v.* FROM vps v INNER JOIN vps_shares s ON s.vps_id=v.id WHERE s.user_id=? ORDER BY v.id DESC",
+            (user_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not needle:
+        return rows[0] if rows else None
+    exact = [r for r in rows if needle in {str(r["id"]).lower(), str(r["container_id"]).lower(), str(r["container_name"]).lower()}]
+    if exact:
+        return exact[0]
+    partial = [r for r in rows if needle in str(r["container_id"]).lower() or needle in str(r["container_name"]).lower()]
+    return partial[0] if len(partial) == 1 else None
+
+
+def db_is_owner_or_admin(user_id: int, vps: sqlite3.Row) -> bool:
+    return int(user_id) == int(vps["user_id"]) or (ADMIN_ID > 0 and int(user_id) == int(ADMIN_ID))
+
+
+def db_update_vps(container_id: str, **fields: Any) -> None:
+    allowed = {"status", "suspended", "ssh_command", "sshx_url", "sshx_pid", "os_type", "location", "hostname", "public_ipv4", "ipv4_verified_at", "backend", "ptero_server_id", "ptero_identifier", "ptero_user_id"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return
+    assignments = ", ".join(f"{k}=?" for k in updates)
+    values = list(updates.values()) + [utc_now(), container_id]
+    conn = db_connect()
+    try:
+        conn.execute(f"UPDATE vps SET {assignments},updated_at=? WHERE container_id=?", values)
+    finally:
+        conn.close()
+
+
+def db_set_vps_ipv4(container_id: str, ipv4: str | None) -> None:
+    if ipv4 is not None and not valid_public_ipv4(ipv4):
+        raise ValueError("Refusing to store a non-public IPv4 address.")
+    db_update_vps(container_id, public_ipv4=ipv4, ipv4_verified_at=utc_now() if ipv4 else None)
+
+
+
+def db_list_shared(vps_id: int) -> list[sqlite3.Row]:
+    conn = db_connect()
+    try:
+        return conn.execute(
+            """SELECT s.vps_id, s.user_id, s.shared_by, s.created_at,
+                      COALESCE(u.username, CAST(s.user_id AS TEXT)) AS username
+               FROM vps_shares s LEFT JOIN users u ON u.user_id=s.user_id
+               WHERE s.vps_id=? ORDER BY s.created_at""",
+            (int(vps_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def db_find_vps_by_ptero_identifier(identifier: str) -> sqlite3.Row | None:
+    conn = db_connect()
+    try:
+        return conn.execute(
+            "SELECT * FROM vps WHERE ptero_identifier=? OR container_id=? LIMIT 1",
+            (identifier, identifier),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def db_insert_snapshot(vps_id: int, name: str, image_ref: str) -> int:
     conn = db_connect()
     try:
         cur = conn.execute(
-            f"INSERT INTO vms({cols}) VALUES({placeholders})",
-            tuple(data[x] for x in fields),
+            "INSERT INTO vps_snapshots(vps_id,name,image_ref,created_at) VALUES(?,?,?,?)",
+            (int(vps_id), name, image_ref, utc_now()),
         )
         return int(cur.lastrowid)
     finally:
         conn.close()
 
 
-def db_get_vm(vm_id: int) -> sqlite3.Row | None:
+def db_list_snapshots(vps_id: int) -> list[sqlite3.Row]:
     conn = db_connect()
     try:
-        return conn.execute("SELECT * FROM vms WHERE id=? AND deleted_at IS NULL", (int(vm_id),)).fetchone()
+        return conn.execute(
+            "SELECT * FROM vps_snapshots WHERE vps_id=? ORDER BY id DESC",
+            (int(vps_id),),
+        ).fetchall()
     finally:
         conn.close()
 
 
-def db_get_vms(owner_id: int | None = None) -> list[sqlite3.Row]:
+def db_get_snapshot(vps_id: int, name: str) -> sqlite3.Row | None:
     conn = db_connect()
     try:
-        if owner_id is None:
-            return conn.execute("SELECT * FROM vms WHERE deleted_at IS NULL ORDER BY id DESC").fetchall()
-        return conn.execute("SELECT * FROM vms WHERE owner_id=? AND deleted_at IS NULL ORDER BY id DESC", (int(owner_id),)).fetchall()
+        return conn.execute(
+            "SELECT * FROM vps_snapshots WHERE vps_id=? AND lower(name)=lower(?)",
+            (int(vps_id), name),
+        ).fetchone()
     finally:
         conn.close()
 
 
-def db_update_vm(vm_id: int, **fields: Any) -> None:
-    allowed = {
-        "name", "status", "suspended", "abuse_score", "abuse_reason", "ip_address",
-        "backend", "disk_path", "bootstrap_status", "bootstrap_message", "updated_at", "deleted_at",
-    }
-    updates = {k: v for k, v in fields.items() if k in allowed}
-    if not updates:
-        return
-    updates["updated_at"] = now_iso()
-    assignments = ",".join(f"{k}=?" for k in updates)
+def db_delete_snapshot(vps_id: int, name: str) -> None:
     conn = db_connect()
     try:
-        conn.execute(f"UPDATE vms SET {assignments} WHERE id=?", (*updates.values(), int(vm_id)))
+        conn.execute("DELETE FROM vps_snapshots WHERE vps_id=? AND lower(name)=lower(?)", (int(vps_id), name))
     finally:
         conn.close()
 
 
-def db_find_vm(identifier: str, owner_id: int | None = None) -> sqlite3.Row | None:
-    needle = (identifier or "").strip().lower()
-    rows = db_get_vms(owner_id)
-    if not rows:
-        return None
-    if not needle:
-        return rows[0]
-    exact = [
-        r for r in rows
-        if needle in {str(r["id"]).lower(), str(r["domain"]).lower(), str(r["name"]).lower()}
-    ]
-    if exact:
-        return exact[0]
-    partial = [r for r in rows if needle in str(r["domain"]).lower() or needle in str(r["name"]).lower()]
-    return partial[0] if len(partial) == 1 else None
-
-
-def db_running_count() -> int:
+def db_delete_vps(container_id: str) -> None:
     conn = db_connect()
     try:
-        return int(conn.execute("SELECT COUNT(*) FROM vms WHERE status='running' AND suspended=0").fetchone()[0])
+        conn.execute("DELETE FROM vps WHERE container_id=?", (container_id,))
     finally:
         conn.close()
 
 
-def db_log_abuse(vm_id: int, score: int, reason: str) -> None:
-    conn = db_connect()
+# ================================================================
+# Process/Docker execution
+# ================================================================
+
+async def run_process(*args: str, timeout: float = 60, stdin: bytes | None = None) -> tuple[int, bytes, bytes]:
     try:
-        conn.execute(
-            "INSERT INTO abuse_events(vm_id,score,reason,created_at) VALUES(?,?,?,?)",
-            (int(vm_id), int(score), clean(reason, 1000), now_iso()),
-        )
-    finally:
-        conn.close()
-
-
-# ============================================================================
-# Safe process execution
-# ============================================================================
-
-async def run_process(*args: str, timeout: float = 60.0, env: dict[str, str] | None = None) -> tuple[int, str, str]:
-    try:
-        proc = await asyncio.create_subprocess_exec(
+        process = await asyncio.create_subprocess_exec(
             *args,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
-            env=env,
         )
     except FileNotFoundError as exc:
-        return 127, "", str(exc)
+        return 127, b"", str(exc).encode()
     except OSError as exc:
-        return 126, "", str(exc)
+        return 126, b"", str(exc).encode()
+
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        return proc.returncode or 0, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+        stdout, stderr = await asyncio.wait_for(process.communicate(stdin), timeout=timeout)
+        return process.returncode if process.returncode is not None else -1, stdout, stderr
     except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(process.pid, signal.SIGKILL)
         with contextlib.suppress(Exception):
-            os.killpg(proc.pid, signal.SIGKILL)
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        return 124, "", "process timeout"
+            await asyncio.wait_for(process.wait(), timeout=5)
+        return -1, b"", b"process timeout"
     except asyncio.CancelledError:
+        # A cancelled Docker operation must not leave a live child process behind.
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(process.pid, signal.SIGKILL)
         with contextlib.suppress(Exception):
-            os.killpg(proc.pid, signal.SIGKILL)
+            await asyncio.wait_for(process.wait(), timeout=5)
         raise
 
 
-async def virsh(*args: str, timeout: float = 60.0) -> tuple[int, str, str]:
-    return await run_process("virsh", *args, timeout=timeout)
+async def docker_cli(*args: str, timeout: float = DOCKER_TIMEOUT, retries: int = 0) -> tuple[int, bytes, bytes]:
+    last: tuple[int, bytes, bytes] = (126, b"", b"docker command failed")
+    for attempt in range(max(0, retries) + 1):
+        last = await run_process("docker", *args, timeout=timeout)
+        if last[0] == 0:
+            return last
+        text = last[2].decode("utf-8", "replace").lower()
+        transient = any(x in text for x in ("connection reset", "temporarily unavailable", "i/o timeout", "context deadline exceeded", "connection refused", "tls handshake timeout", "unexpected eof", "eof"))
+        if not transient or attempt >= retries:
+            break
+        await asyncio.sleep(1.5 * (attempt + 1))
+    return last
 
 
-async def qemu_img(*args: str, timeout: float = 300.0) -> tuple[int, str, str]:
-    return await run_process("qemu-img", *args, timeout=timeout)
+async def spawn_detached(*args: str) -> tuple[int | None, str]:
+    try:
+        proc = await asyncio.create_subprocess_exec(*args, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+        await asyncio.sleep(0.15)
+        if proc.returncode is not None:
+            return None, f"process exited with code {proc.returncode}"
+        return proc.pid, ""
+    except FileNotFoundError:
+        return None, f"{args[0]} is not installed."
+    except OSError as exc:
+        return None, str(exc)
 
 
-# ============================================================================
-# Guest bootstrap via cloud-init
-# ============================================================================
+async def docker_exists(container: str) -> bool:
+    rc, _, _ = await docker_cli("inspect", container, timeout=20, retries=1)
+    return rc == 0
+
+
+async def docker_state(container: str) -> str | None:
+    rc, out, _ = await docker_cli("inspect", "-f", "{{.State.Status}}", container, timeout=20, retries=1)
+    if rc != 0:
+        return None
+    return out.decode("utf-8", "replace").strip().lower() or None
+
+
+async def _wait_for_docker_ready(timeout: float = 30.0) -> tuple[bool, str]:
+    deadline = asyncio.get_running_loop().time() + max(5.0, timeout)
+    last_detail = "Docker daemon is not ready."
+    while asyncio.get_running_loop().time() < deadline:
+        ok, detail = await _probe_docker_info()
+        if ok:
+            return True, detail
+        last_detail = detail
+        await asyncio.sleep(1.0)
+    return False, last_detail
+
+
+async def _start_docker_daemon() -> tuple[bool, str]:
+    """Start an existing Docker daemon without assuming systemd is PID 1."""
+    if not command_available("docker"):
+        return False, "Docker CLI is not installed."
+
+    ok, detail = await _probe_docker_info()
+    if ok:
+        return True, "Docker daemon is already reachable."
+
+    attempts: list[str] = []
+
+    # systemd hosts
+    if command_available("systemctl"):
+        rc, out, err = await system_command("systemctl", "start", "docker.service", timeout=60)
+        attempts.append(f"systemctl start docker.service: {('ok' if rc == 0 else safe_log(err.strip() or out.strip() or 'failed'))}")
+        ok, detail = await _wait_for_docker_ready(15)
+        if ok:
+            if command_available("systemctl"):
+                await system_command("systemctl", "enable", "docker.service", timeout=30)
+            return True, "Docker daemon started with systemd."
+
+    # SysV/service-managed hosts
+    if command_available("service"):
+        rc, out, err = await system_command("service", "docker", "start", timeout=60)
+        attempts.append(f"service docker start: {('ok' if rc == 0 else safe_log(err.strip() or out.strip() or 'failed'))}")
+        ok, detail = await _wait_for_docker_ready(15)
+        if ok:
+            return True, "Docker daemon started with service management."
+
+    # Alpine/OpenRC hosts
+    if command_available("rc-service"):
+        rc, out, err = await system_command("rc-service", "docker", "start", timeout=60)
+        attempts.append(f"rc-service docker start: {('ok' if rc == 0 else safe_log(err.strip() or out.strip() or 'failed'))}")
+        ok, detail = await _wait_for_docker_ready(15)
+        if ok:
+            return True, "Docker daemon started with OpenRC."
+
+    # Last resort for a real Linux host where dockerd exists but no init system
+    # is available (common in minimal rescue images). Only attempt this as root.
+    dockerd = shutil.which("dockerd")
+    if dockerd and hasattr(os, "geteuid") and os.geteuid() == 0:
+        socket_path = "/var/run/docker.sock"
+        Path(socket_path).parent.mkdir(parents=True, exist_ok=True)
+        # Avoid starting a second daemon if another dockerd is already alive.
+        existing = False
+        try:
+            rc, out, _ = await system_command("pgrep", "-x", "dockerd", timeout=10)
+            existing = rc == 0 and bool(out.strip())
+        except Exception:
+            existing = False
+        if not existing:
+            pid, error = await spawn_detached(
+                dockerd,
+                "--host=unix:///var/run/docker.sock",
+                "--host=fd://",
+            )
+            # Some dockerd builds reject fd:// when no socket activation exists;
+            # if that happens, retry with the explicit Unix socket only.
+            if not pid:
+                pid, error = await spawn_detached(dockerd, "--host=unix:///var/run/docker.sock")
+            attempts.append(f"dockerd direct start: {('started' if pid else error or 'failed')}")
+        else:
+            attempts.append("dockerd process already exists")
+        ok, detail = await _wait_for_docker_ready(20)
+        if ok:
+            return True, "Docker daemon started directly."
+
+    return False, (
+        "Docker CLI is installed, but the Docker daemon is not reachable. "
+        + safe_log(detail)
+        + (" Attempts: " + " | ".join(attempts) if attempts else "")
+        + " This host must provide a running Docker daemon/socket."
+    )
+
+
+async def docker_info() -> tuple[bool, str]:
+    """Return Docker readiness without silently changing host service state."""
+    if not command_available("docker"):
+        return False, (
+            "Docker CLI is not installed. Run `/install-system confirm:true` "
+            "as an administrator on a host where Docker is supported."
+        )
+
+    ok, detail = await _probe_docker_info()
+    if ok:
+        return True, detail
+
+    if MANAGE_DOCKER_DAEMON:
+        started, start_detail = await _start_docker_daemon()
+        if started:
+            return True, start_detail
+        return False, start_detail or detail
+
+    return False, (
+        "Docker CLI is installed, but the Docker daemon is not reachable. "
+        "RGNODES will not start/reconfigure the host daemon automatically. "
+        + safe_log(detail)
+    )
+
+
+async def docker_running_count() -> tuple[bool, int]:
+    # Do not depend only on labels: older Docker clients may not advertise --label.
+    # The RGNODES namespace is the canonical container-name prefix as well.
+    rc, out, _ = await docker_cli("ps", "--format", "{{.ID}}\t{{.Names}}", timeout=20, retries=1)
+    if rc != 0:
+        return False, db_running_count()
+    count = 0
+    for line in out.decode("utf-8", "replace").splitlines():
+        parts = line.strip().split("\t", 1)
+        if len(parts) == 2 and re.fullmatch(r"rgnodes-\d+", parts[1].strip(), flags=re.I):
+            count += 1
+    return True, count
+
+
+async def docker_pull(image: str) -> tuple[bool, str]:
+    rc, _, err = await docker_cli("pull", image, timeout=IMAGE_PULL_TIMEOUT, retries=2)
+    if rc == 0:
+        return True, ""
+    return False, safe_log(err.decode("utf-8", "replace").strip() or "Docker image pull failed.")
+
+
+def quota_error(text: str) -> bool:
+    lowered = text.lower()
+    return any(term in lowered for term in ("storage-opt", "disk quota", "quota", "btrfs", "overlay2", "storage driver"))
+
+
+DOCKER_RUN_FEATURES: set[str] | None = None
+DOCKER_FEATURE_LOCK = asyncio.Lock()
+
+
+async def docker_run_features() -> set[str]:
+    global DOCKER_RUN_FEATURES
+    if DOCKER_RUN_FEATURES is not None:
+        return DOCKER_RUN_FEATURES
+    async with DOCKER_FEATURE_LOCK:
+        if DOCKER_RUN_FEATURES is not None:
+            return DOCKER_RUN_FEATURES
+        features: set[str] = set()
+        rc, out, _ = await docker_cli("run", "--help", timeout=20, retries=0)
+        if rc == 0:
+            text = out.decode("utf-8", "replace")
+            for flag in ("--init", "--pids-limit", "--storage-opt", "--cpus", "--memory", "--memory-reservation", "--memory-swap", "--memory-swappiness", "--restart", "--hostname", "--name", "--label", "--log-driver", "--log-opt", "--privileged", "--tmpfs", "--cgroupns", "--stop-signal"):
+                if flag in text:
+                    features.add(flag)
+        DOCKER_RUN_FEATURES = features
+        logger.info("Docker run capabilities detected: %s", ", ".join(sorted(features)) or "basic-only")
+        return features
+
+
+def feature_error(text: str) -> bool:
+    lowered = text.lower()
+    return any(term in lowered for term in (
+        "unknown flag", "unknown option", "invalid option", "not supported",
+        "not supported by this daemon", "no such option", "unrecognized option",
+    ))
+
 
 GUEST_BOOTSTRAP_SCRIPT = r"""#!/bin/bash
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
+# Prevent apt helper calls from trying to control services before PID 1 is
+# systemd. This variable must never be inherited by the final systemd process.
+export SYSTEMD_OFFLINE=1
 
-log() { printf '[RGNODES bootstrap] %s\\n' "$*" | tee -a /var/log/rgnodes-bootstrap.log; }
+MARKER=/var/lib/rgnodes/.system-ready
+BOOTSTRAP_MARKER=/var/lib/rgnodes/.bootstrap-installed
+# Persistent VPS data lives in named Docker volumes. docker rm (without -v)
+# does not delete these volumes, allowing reinstall/recreate to reattach them.
+PERSISTENCE_POLICY=/var/lib/rgnodes/persistence-policy
+mkdir -p /var/lib/rgnodes /etc/ssh /etc/systemd/system
+printf 'named-volumes=enabled\ncontainer-delete=preserve-volumes\n' >"$PERSISTENCE_POLICY"
+
+log() { printf '[RGNODES guest] %s\\n' "$*"; }
+
+# Packages are installed with service auto-start disabled. Services are started
+# later by systemd after PID 1 has actually become systemd.
+install_policy() {
+    cat >/usr/sbin/policy-rc.d <<'EOF'
+#!/bin/sh
+exit 101
+EOF
+    chmod 0755 /usr/sbin/policy-rc.d
+}
+remove_policy() { rm -f /usr/sbin/policy-rc.d; }
+
+apt_install_base() {
+    apt-get update -y
+    apt-get full-upgrade -y
+    apt-get install -y --no-install-recommends \
+        systemd systemd-sysv dbus dbus-user-session init-system-helpers \
+        ca-certificates curl wget gnupg lsb-release software-properties-common \
+        bash coreutils procps psmisc iproute2 iputils-ping iptables nftables \
+        util-linux net-tools netcat-openbsd socat sudo jq git \
+        tar gzip bzip2 unzip xz-utils zip rsync acl openssl \
+        build-essential pkg-config make gcc g++ python3 python3-pip python3-venv \
+        openssh-client openssh-server systemd-container dbus-x11 \
+        systemd-timesyncd systemd-resolved lsof htop tmux screen \
+        bash-completion locales logrotate
+}
+
+install_web_and_database_stack() {
+    [ "__WEB_STACK__" = "1" ] || return 0
+
+    local id codename
+    id="$(. /etc/os-release && printf '%s' "${ID:-}")"
+    codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
+
+    # Pterodactyl Panel currently requires PHP 8.2 or 8.3. Ubuntu 22.04
+    # needs an additional PHP repository; Debian 11/12 use packages.sury.org.
+    if [ "$id" = "ubuntu" ]; then
+        # Pterodactyl 1.12+ requires PHP 8.2 or 8.3. Prefer Ondrej's PHP
+        # packages on Ubuntu so supported PHP versions are available even on
+        # newer Ubuntu releases such as 26.04 when the PPA provides them.
+        LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php || true
+    elif [ "$id" = "debian" ]; then
+        install -m 0755 -d /etc/apt/keyrings
+        if curl -fsSL https://packages.sury.org/php/apt.gpg \
+            -o /etc/apt/keyrings/sury-php.gpg; then
+            chmod 0644 /etc/apt/keyrings/sury-php.gpg
+            printf 'deb [signed-by=/etc/apt/keyrings/sury-php.gpg] https://packages.sury.org/php/ %s main\n' \
+                "$codename" >/etc/apt/sources.list.d/php-sury.list
+        fi
+    fi
+
+    # Redis repository for Debian 11/12; Debian 13 has a suitable distro
+    # package according to the current Pterodactyl dependency guide.
+    if [ "$id" = "debian" ] && { [ "$codename" = "bullseye" ] || [ "$codename" = "bookworm" ]; }; then
+        if curl -fsSL https://packages.redis.io/gpg |
+            gpg --dearmor --yes -o /etc/apt/keyrings/redis-archive-keyring.gpg; then
+            chmod 0644 /etc/apt/keyrings/redis-archive-keyring.gpg
+            printf 'deb [signed-by=/etc/apt/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb %s main\n' \
+                "$codename" >/etc/apt/sources.list.d/redis.list
+        fi
+    fi
+
+    # MariaDB repo for Debian 11/12. If the external setup is unavailable,
+    # keep the distro package as a safe fallback and fail later only if its
+    # resulting version is genuinely incompatible.
+    if [ "$id" = "debian" ] && { [ "$codename" = "bullseye" ] || [ "$codename" = "bookworm" ]; }; then
+        if curl -fsSL https://r.mariadb.com/downloads/mariadb_repo_setup -o /tmp/mariadb_repo_setup; then
+            chmod 0755 /tmp/mariadb_repo_setup
+            /tmp/mariadb_repo_setup --skip-maxscale --skip-tools || true
+            rm -f /tmp/mariadb_repo_setup
+        fi
+    fi
+
+    apt-get update -y
+    apt-get install -y --no-install-recommends \
+        nginx certbot python3-certbot-nginx tar unzip git \
+        mariadb-server mariadb-client redis-server
+
+    if ! apt-get install -y --no-install-recommends \
+        php8.3 php8.3-common php8.3-cli php8.3-gd php8.3-mysql \
+        php8.3-mbstring php8.3-bcmath php8.3-xml php8.3-tokenizer \
+        php8.3-fpm php8.3-curl php8.3-zip; then
+        if ! apt-get install -y --no-install-recommends \
+            php8.2 php8.2-common php8.2-cli php8.2-gd php8.2-mysql \
+            php8.2-mbstring php8.2-bcmath php8.2-xml php8.2-tokenizer \
+            php8.2-fpm php8.2-curl php8.2-zip; then
+            apt-get install -y --no-install-recommends \
+                php php-common php-cli php-gd php-mysql php-mbstring \
+                php-bcmath php-xml php-fpm php-curl php-zip
+        fi
+    fi
+}
+
+install_docker_debian_ubuntu() {
+    local id codename arch repo_url compose_arch
+    id="$(. /etc/os-release && printf '%s' "${ID:-}")"
+    codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
+    ubuntu_codename="$(. /etc/os-release && printf '%s' "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")"
+    arch="$(dpkg --print-architecture)"
+    case "$id" in
+        ubuntu) repo_url='https://download.docker.com/linux/ubuntu' ;;
+        debian) repo_url='https://download.docker.com/linux/debian' ;;
+        *) repo_url='' ;;
+    esac
+
+    # Remove only conflicting package names. Never remove Docker data.
+    apt-get remove -y docker.io docker-compose docker-compose-v2 docker-doc docker-buildx \
+        podman-docker containerd runc >/dev/null 2>&1 || true
+
+    if [ -n "$repo_url" ] && [ -n "$codename" ]; then
+        install -m 0755 -d /etc/apt/keyrings
+        repo_suite="$codename"
+        [ "$id" = "ubuntu" ] && repo_suite="$ubuntu_codename"
+        if curl -fsSL "https://download.docker.com/linux/$id/gpg" \
+            -o /etc/apt/keyrings/docker.asc; then
+            chmod a+r /etc/apt/keyrings/docker.asc
+            cat >/etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: $repo_url
+Suites: $repo_suite
+Components: stable
+Architectures: $arch
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+            if apt-get update -y && apt-get install -y --no-install-recommends \
+                docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
+                return 0
+            fi
+        fi
+        rm -f /etc/apt/sources.list.d/docker.sources
+    fi
+
+    apt-get update -y
+    apt-get install -y --no-install-recommends docker.io containerd runc
+
+    if ! docker compose version >/dev/null 2>&1; then
+        apt-get install -y --no-install-recommends docker-compose-v2 docker-compose-plugin || true
+    fi
+    if ! docker compose version >/dev/null 2>&1; then
+        apt-get install -y --no-install-recommends docker-compose-plugin || true
+    fi
+    if ! docker compose version >/dev/null 2>&1; then
+        install -m 0755 -d /usr/local/lib/docker/cli-plugins
+        compose_arch="$(uname -m)"
+        case "$compose_arch" in
+            x86_64|amd64) compose_arch='x86_64' ;;
+            aarch64|arm64) compose_arch='aarch64' ;;
+            *) compose_arch='' ;;
+        esac
+        if [ -n "$compose_arch" ]; then
+            curl -fsSL \
+                "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${compose_arch}" \
+                -o /usr/local/lib/docker/cli-plugins/docker-compose || true
+            chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose 2>/dev/null || true
+        fi
+    fi
+    docker compose version >/dev/null 2>&1
+}
+
+install_node_pm2_yarn() {
+    local arch node_arch version tarball tmpdir
+    arch="$(dpkg --print-architecture)"
+    install -m 0755 -d /etc/apt/keyrings
+    case "$arch" in
+        amd64) node_arch='x64' ;;
+        arm64) node_arch='arm64' ;;
+        armhf) node_arch='armv7l' ;;
+        ppc64el) node_arch='ppc64le' ;;
+        s390x) node_arch='s390x' ;;
+        *) node_arch='' ;;
+    esac
+
+    if [ -n "$node_arch" ] && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg; then
+        chmod 0644 /etc/apt/keyrings/nodesource.gpg
+        cat >/etc/apt/sources.list.d/nodesource.sources <<EOF
+Types: deb
+URIs: https://deb.nodesource.com/node_20.x
+Suites: nodistro
+Components: main
+Architectures: $arch
+Signed-By: /etc/apt/keyrings/nodesource.gpg
+EOF
+        apt-get update -y || true
+    fi
+
+    if ! apt-get install -y --no-install-recommends nodejs; then
+        true
+    fi
+
+    if ! command -v node >/dev/null 2>&1 || ! node -e 'process.exit(process.versions.node.startsWith("20.") ? 0 : 1)'; then
+        [ -n "$node_arch" ] || { echo "Unsupported Node.js architecture: $arch" >&2; return 1; }
+        version="$(curl -fsSL https://nodejs.org/dist/index.tab | awk -v want='^v20\\.' '$1 ~ want && $0 !~ /-rc|-nightly|-test/ {print $1; exit}')"
+        [ -n "$version" ] || { echo 'Could not resolve a stable Node.js 20 release.' >&2; return 1; }
+        tarball="node-${version}-linux-${node_arch}.tar.xz"
+        tmpdir="/tmp/rgnodes-node20"
+        rm -rf "$tmpdir"
+        mkdir -p "$tmpdir"
+        curl -fsSL "https://nodejs.org/dist/${version}/${tarball}" -o "$tmpdir/$tarball"
+        tar -xJf "$tmpdir/$tarball" -C "$tmpdir"
+        rm -rf /opt/nodejs-20
+        mv "$tmpdir/node-${version}-linux-${node_arch}" /opt/nodejs-20
+        ln -sf /opt/nodejs-20/bin/node /usr/local/bin/node
+        ln -sf /opt/nodejs-20/bin/npm /usr/local/bin/npm
+        ln -sf /opt/nodejs-20/bin/npx /usr/local/bin/npx
+        ln -sf /opt/nodejs-20/bin/corepack /usr/local/bin/corepack 2>/dev/null || true
+        rm -rf "$tmpdir"
+    fi
+
+    node -e 'process.exit(process.versions.node.startsWith("20.") ? 0 : 1)'
+    npm --version >/dev/null 2>&1
+    npm install -g --no-audit --no-fund yarn@1.22.22 pm2
+    command -v yarn >/dev/null 2>&1
+    command -v pm2 >/dev/null 2>&1
+}
+
+
+
+install_composer() {
+    local installer="/tmp/composer-setup.php" expected actual
+    expected="$(curl -fsSL https://composer.github.io/installer.sig)"
+    curl -fsSL https://getcomposer.org/installer -o "$installer"
+    actual="$(php -r "echo hash_file('sha384', '$installer');")"
+    [ -n "$expected" ] && [ "$actual" = "$expected" ] || {
+        rm -f "$installer"
+        echo 'Composer installer checksum verification failed.' >&2
+        return 1
+    }
+    php "$installer" --install-dir=/usr/local/bin --filename=composer
+    rm -f "$installer"
+    chmod 0755 /usr/local/bin/composer
+    composer --version --no-ansi | grep -Eq 'Composer version 2\.'
+}
+
+install_kvm_stack() {
+    [ "__KVM_ENABLED__" = "1" ] || return 0
+    log 'Installing KVM/QEMU/libvirt userspace support'
+    local arch
+    arch="$(dpkg --print-architecture)"
+    apt-get install -y --no-install-recommends \
+        qemu-utils qemu-system-common libvirt-daemon-system \
+        libvirt-clients cpu-checker bridge-utils cloud-image-utils \
+        swtpm swtpm-tools
+    if [ "$arch" = "amd64" ] || [ "$arch" = "i386" ]; then
+        apt-get install -y --no-install-recommends qemu-kvm qemu-system-x86 ovmf
+    elif [ "$arch" = "arm64" ]; then
+        apt-get install -y --no-install-recommends qemu-system-arm ovmf || true
+    fi
+    modprobe kvm >/dev/null 2>&1 || true
+    modprobe kvm_intel >/dev/null 2>&1 || modprobe kvm_amd >/dev/null 2>&1 || true
+}
+
+install_wings() {
+    [ "__INSTALL_WINGS__" = "1" ] || return 0
+    local arch suffix url
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64|amd64) suffix='amd64' ;;
+        aarch64|arm64) suffix='arm64' ;;
+        *) log "Wings binary skipped: unsupported architecture $arch"; return 0 ;;
+    esac
+    mkdir -p /etc/pterodactyl /var/lib/pterodactyl /var/log/pterodactyl
+    url="https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${suffix}"
+    if curl -fsSL "$url" -o /usr/local/bin/wings; then
+        chmod 0755 /usr/local/bin/wings
+        cat >/etc/systemd/system/wings.service <<'EOF'
+[Unit]
+Description=Pterodactyl Wings Daemon
+Documentation=https://pterodactyl.io/wings/
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+User=root
+WorkingDirectory=/etc/pterodactyl
+LimitNOFILE=4096
+PIDFile=/var/run/wings/daemon.pid
+ExecStart=/usr/local/bin/wings
+Restart=on-failure
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        # Do not start Wings until a real Panel-generated config.yml exists.
+        systemctl disable wings.service >/dev/null 2>&1 || true
+    else
+        log 'Wings download failed; keeping the guest otherwise healthy'
+    fi
+}
+
+repair_ssh() {
+    mkdir -p /etc/ssh /var/run/sshd
+    touch /etc/ssh/sshd_config
+    chmod 0644 /etc/ssh/sshd_config
+    grep -Eq '^[[:space:]]*Port[[:space:]]+' /etc/ssh/sshd_config \
+        || printf '\nPort 22\n' >>/etc/ssh/sshd_config
+    grep -Eq '^[[:space:]]*PermitRootLogin[[:space:]]+' /etc/ssh/sshd_config \
+        || printf 'PermitRootLogin yes\n' >>/etc/ssh/sshd_config
+    grep -Eq '^[[:space:]]*PasswordAuthentication[[:space:]]+' /etc/ssh/sshd_config \
+        || printf 'PasswordAuthentication yes\n' >>/etc/ssh/sshd_config
+    ssh-keygen -A >/dev/null 2>&1 || true
+    sshd -t
+}
+
+install_firstboot_unit() {
+    cat >/usr/local/sbin/rgnodes-firstboot-verify <<'EOF'
+#!/bin/bash
+set -Eeuo pipefail
+READY=/var/lib/rgnodes/.system-ready
+rm -f "$READY"
+systemctl daemon-reload
+
+wait_active() {
+    local unit="$1" tries="${2:-30}" i
+    for ((i=1; i<=tries; i++)); do
+        if systemctl is-active --quiet "$unit"; then return 0; fi
+        systemctl start "$unit" >/dev/null 2>&1 || true
+        sleep 1
+    done
+    systemctl status "$unit" --no-pager -l || true
+    return 1
+}
+
+systemctl enable docker.service >/dev/null 2>&1 || true
+systemctl enable ssh.service >/dev/null 2>&1 || systemctl enable sshd.service >/dev/null 2>&1 || true
+wait_active docker.service 60
+if systemctl cat ssh.service >/dev/null 2>&1; then
+    wait_active ssh.service 30
+elif systemctl cat sshd.service >/dev/null 2>&1; then
+    wait_active sshd.service 30
+else
+    echo 'OpenSSH service unit not found.' >&2
+    exit 25
+fi
+
+for unit in nginx.service redis-server.service mariadb.service; do
+    if systemctl cat "$unit" >/dev/null 2>&1; then
+        systemctl enable "$unit" >/dev/null 2>&1 || true
+        wait_active "$unit" 45 || true
+    fi
+done
+
+command -v systemctl >/dev/null
+command -v docker >/dev/null
+docker info >/dev/null 2>&1
+docker compose version >/dev/null 2>&1
+command -v node >/dev/null
+command -v npm >/dev/null
+command -v yarn >/dev/null
+command -v pm2 >/dev/null
+pm2 -v >/dev/null
+sshd -t
+command -v composer >/dev/null
+composer --version --no-ansi | grep -Eq 'Composer version 2\.'
+command -v php >/dev/null
+php -r 'exit(version_compare(PHP_VERSION, "8.2", ">=") ? 0 : 1);'
+for ext in curl dom fileinfo gd mbstring openssl pdo pdo_mysql tokenizer xml zip bcmath; do
+    php -m | grep -iq "^$ext$" || { echo "missing PHP extension: $ext" >&2; exit 26; }
+done
+if systemctl list-unit-files 'php*-fpm.service' 2>/dev/null | grep -q 'php.*-fpm.service'; then
+    php_unit="$(systemctl list-unit-files 'php*-fpm.service' --no-legend 2>/dev/null | awk 'NR==1{print $1}')"
+    [ -n "$php_unit" ] && wait_active "$php_unit" 45 || true
+fi
+
+if command -v wings >/dev/null 2>&1; then
+    wings --version >/dev/null 2>&1 || true
+fi
+
+# KVM userspace may be installed even when the provider does not expose /dev/kvm.
+# Never fake KVM availability: expose the real capability in the marker only.
+if [ -e /dev/kvm ]; then
+    printf 'kvm=available\n' >/var/lib/rgnodes/kvm-status
+    if systemctl list-unit-files 'libvirtd.service' >/dev/null 2>&1; then
+        systemctl enable --now libvirtd.service || true
+    fi
+    if systemctl list-unit-files 'virtqemud.socket' >/dev/null 2>&1; then
+        systemctl enable --now virtqemud.socket || true
+    fi
+else
+    printf 'kvm=unavailable\n' >/var/lib/rgnodes/kvm-status
+fi
+command -v qemu-system-x86_64 >/dev/null 2>&1 || command -v qemu-system-aarch64 >/dev/null 2>&1 || {
+    echo 'No QEMU system emulator was installed.' >&2
+    exit 27
+}
+
+printf 'ready=1\n' >"$READY"
+EOF
+    chmod 0755 /usr/local/sbin/rgnodes-firstboot-verify
+
+    cat >/etc/systemd/system/rgnodes-firstboot.service <<'EOF'
+[Unit]
+Description=RGNODES Guest First Boot Verification
+Wants=docker.service ssh.service network-online.target
+After=docker.service ssh.service network-online.target
+ConditionPathExists=!/var/lib/rgnodes/.system-ready
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rgnodes-firstboot-verify
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    ln -sf ../rgnodes-firstboot.service \
+        /etc/systemd/system/multi-user.target.wants/rgnodes-firstboot.service
+}
 
 if command -v apt-get >/dev/null 2>&1; then
-  log "Refreshing APT metadata"
-  apt-get update -y
-  if [ "__FULL_UPGRADE__" = "1" ]; then
-    log "Running full system upgrade"
-    apt-get full-upgrade -y
-  fi
-  log "Installing requested base packages"
-  apt-get install -y software-properties-common ca-certificates curl apt-transport-https gnupg tar unzip git mariadb-server redis-server nginx certbot python3-certbot-nginx cloud-init qemu-guest-agent systemd systemd-sysv dbus
-
-  if [ "__PHP_STACK__" = "1" ]; then
-    if apt-cache show php8.3 >/dev/null 2>&1; then
-      apt-get install -y php8.3 php8.3-common php8.3-cli php8.3-gd php8.3-mysql php8.3-mbstring php8.3-bcmath php8.3-xml php8.3-fpm php8.3-curl php8.3-zip || true
+    if [ ! -f "$BOOTSTRAP_MARKER" ]; then
+        install_policy
+        trap remove_policy EXIT
+        log 'Installing base Linux/systemd/SSH dependencies'
+        apt_install_base
+        install_docker_debian_ubuntu
+        install_node_pm2_yarn
+        install_web_and_database_stack
+        install_composer
+        install_kvm_stack
+        repair_ssh
+        install_wings
+        install_firstboot_unit
+        touch "$BOOTSTRAP_MARKER"
+        remove_policy
+        trap - EXIT
     else
-      log "php8.3 unavailable; installing distribution PHP packages"
-      apt-get install -y php php-common php-cli php-gd php-mysql php-mbstring php-bcmath php-xml php-fpm php-curl php-zip || true
+        repair_ssh
+        install_firstboot_unit
     fi
-  fi
-
-  log "Installing Docker"
-  if ! command -v docker >/dev/null 2>&1; then
-    curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-    sh /tmp/get-docker.sh
-  fi
-  systemctl enable --now docker 2>/dev/null || true
-
-  log "Installing Docker Compose"
-  docker compose version >/dev/null 2>&1 || apt-get install -y docker-compose-plugin || apt-get install -y docker-compose-v2 || true
-
-  log "Installing Node.js 20"
-  if ! command -v node >/dev/null 2>&1 || ! node -v | grep -q '^v20\\.'; then
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-    apt-get install -y nodejs
-  fi
-
-  log "Installing npm and Yarn"
-  npm install -g npm@10 || true
-  corepack enable || true
-  corepack prepare yarn@stable --activate || npm install -g yarn || true
-
-  log "Installing PM2"
-  npm install -g pm2 || true
-
-  if [ "__SSHX__" = "1" ]; then
-    log "Installing SSHx"
-    command -v sshx >/dev/null 2>&1 || curl -sSf https://sshx.io/get | sh || true
-  fi
-
-  if [ "__KVM_TOOLS__" = "1" ]; then
-    log "Installing QEMU/KVM/libvirt tooling"
-    apt-get install -y qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients virtinst bridge-utils ovmf || true
-    systemctl enable --now libvirtd 2>/dev/null || systemctl enable --now libvirt-daemon 2>/dev/null || true
-    if [ -e /dev/kvm ]; then log "Nested KVM is available"; else log "Nested KVM is not exposed; QEMU software mode remains available"; fi
-  fi
-
-  log "Enabling requested services"
-  for unit in mariadb redis-server nginx ssh sshd qemu-guest-agent php8.3-fpm; do
-    systemctl enable --now "$unit" 2>/dev/null || true
-  done
-  mkdir -p /var/lib/rgnodes
-  touch /var/lib/rgnodes/.bootstrap-complete
-  log "Bootstrap complete"
-  exit 0
+elif command -v apk >/dev/null 2>&1; then
+    # The selectable bot OSes are Debian/Ubuntu. This branch remains safe for
+    # an externally supplied Alpine image without pretending systemd is native.
+    apk add --no-cache bash curl wget ca-certificates coreutils procps iproute2 \
+        iputils iptables nftables util-linux net-tools tar gzip unzip xz socat \
+        sudo jq git openssh openssh-client openrc
+    if [ "__NESTED_DOCKER__" = "1" ]; then
+        apk add --no-cache docker docker-cli-compose || true
+    fi
+    repair_ssh
+else
+    echo 'Unsupported guest package manager; cannot bootstrap Linux services.' >&2
+    exit 40
 fi
 
-if command -v dnf >/dev/null 2>&1; then
-  log "Detected RPM-based Linux"
-  dnf -y update || true
-  dnf -y install curl ca-certificates git tar unzip nginx mariadb-server redis openssh-server nodejs npm qemu-guest-agent cloud-init || true
-  if [ "__KVM_TOOLS__" = "1" ]; then dnf -y install qemu-kvm qemu-img libvirt virt-install edk2-ovmf || true; fi
-  npm install -g pm2 yarn || true
-  systemctl enable --now docker 2>/dev/null || true
-  systemctl enable --now libvirtd 2>/dev/null || true
-  systemctl enable --now sshd 2>/dev/null || true
-  systemctl enable --now qemu-guest-agent 2>/dev/null || true
-  mkdir -p /var/lib/rgnodes
-  touch /var/lib/rgnodes/.bootstrap-complete
-  exit 0
+# Keep the final runtime process as systemd. The first-boot unit will run on the
+# actual systemd boot and only then publish .system-ready. SYSTEMD_OFFLINE must
+# not leak into PID 1, otherwise later `systemctl` calls may operate offline.
+unset SYSTEMD_OFFLINE 2>/dev/null || true
+if [ -x /sbin/init ]; then
+    exec /sbin/init
+fi
+if [ -x /lib/systemd/systemd ]; then
+    exec /lib/systemd/systemd
+fi
+if [ -x /usr/lib/systemd/systemd ]; then
+    exec /usr/lib/systemd/systemd
 fi
 
-log "Unsupported package manager; bootstrap skipped"
-exit 0
+echo 'systemd binary was not installed correctly.' >&2
+exit 41
 """
 
-def render_bootstrap(os_type: str) -> str:
-    text=GUEST_BOOTSTRAP_SCRIPT
-    text=text.replace('__FULL_UPGRADE__','1' if GUEST_RUN_FULL_UPGRADE else '0')
-    text=text.replace('__PHP_STACK__','1' if GUEST_INSTALL_PHP_STACK else '0')
-    text=text.replace('__KVM_TOOLS__','1' if GUEST_INSTALL_KVM_TOOLS else '0')
-    text=text.replace('__SSHX__','1' if GUEST_INSTALL_SSHX else '0')
-    return text
+async def docker_run(*, image: str, hostname: str, ram: str, cpu: str, disk: str, container_name: str, location: str, persistent_key: str | None = None) -> tuple[str | None, str]:
+    # Build the command from the flags this particular Docker CLI actually
+    # advertises. This avoids noisy failed variants on older/lightweight Docker
+    # clients where --init and --pids-limit are unavailable.
+    features = await docker_run_features()
+    command = ["run", "--detach"]
 
-async def build_cloud_init_iso(vm_id: int, os_type: str) -> Path | None:
-    if not GUEST_BOOTSTRAP or not sys.platform.startswith('linux'):
-        return None
-    d = KVM_STORAGE / f"rgnodes-vm-{int(vm_id)}"
-    d.mkdir(parents=True, exist_ok=True)
-    ud = d / 'user-data'
-    md = d / 'meta-data'
-    seed = d / 'cloud-init.iso'
-    content = "#cloud-config\\nwrite_files:\\n  - path: /usr/local/sbin/rgnodes-bootstrap.sh\\n    permissions: '0755'\\n    content: |\\n" + "\\n".join("      " + line for line in render_bootstrap(os_type).splitlines()) + "\\nruncmd:\\n  - /usr/local/sbin/rgnodes-bootstrap.sh\\n"
-    ud.write_text(content, encoding='utf-8')
-    md.write_text(f"instance-id: rgnodes-{vm_id}\\nlocal-hostname: rgnodes-vm-{vm_id}\\n", encoding='utf-8')
-    if command_available('cloud-localds'):
-        rc, _, _ = await run_process('cloud-localds', str(seed), str(ud), str(md), timeout=90)
-        if rc == 0 and seed.exists(): return seed
-    if command_available('xorriso'):
-        rc, _, _ = await run_process('xorriso', '-as', 'mkisofs', '-output', str(seed), '-volid', 'cidata', '-joliet', '-rock', str(ud), str(md), timeout=90)
-        if rc == 0 and seed.exists(): return seed
-    if command_available('genisoimage'):
-        rc, _, _ = await run_process('genisoimage', '-output', str(seed), '-volid', 'cidata', '-joliet', '-rock', str(ud), str(md), timeout=90)
-        if rc == 0 and seed.exists(): return seed
-    return None
-
-# ============================================================================
-# KVM/QEMU backend
-# ============================================================================
-
-class KVMBackend:
-    def __init__(self, use_kvm: bool = True) -> None:
-        self.use_kvm = use_kvm
-        self.locks: dict[int, asyncio.Lock] = {}
-
-    def lock(self, vm_id: int) -> asyncio.Lock:
-        return self.locks.setdefault(int(vm_id), asyncio.Lock())
-
-    async def preflight(self) -> tuple[bool, str]:
-        ok, detail = qemu_backend_available(self.use_kvm)
-        if not ok:
-            return False, detail
-        if self.use_kvm and detect_kvm():
-            return True, "KVM/libvirt ready."
-        if self.use_kvm and KVM_REQUIRE_KVM:
-            return False, "/dev/kvm is required but unavailable."
-        return True, "QEMU/libvirt ready (software emulation)."
-
-    def domain_name(self, vm_id: int) -> str:
-        return f"rgnodes-vm-{int(vm_id)}"
-
-    def vm_dir(self, vm_id: int) -> Path:
-        return KVM_STORAGE / self.domain_name(vm_id)
-
-    def disk_path(self, vm_id: int) -> Path:
-        return self.vm_dir(vm_id) / f"{self.domain_name(vm_id)}.{KVM_DISK_FORMAT}"
-
-    async def ensure_dirs(self, vm_id: int) -> None:
-        if hasattr(os, "geteuid") and os.geteuid() != 0:
-            raise PermissionError("KVM storage setup normally requires root on the host.")
-        self.vm_dir(vm_id).mkdir(parents=True, exist_ok=True)
-        os.chmod(self.vm_dir(vm_id), 0o750)
-
-    def base_image(self, os_type: str) -> Path:
-        key = normalize_os(os_type) or os_type
-        raw = KVM_BASE_IMAGES.get(key) or KVM_BASE_IMAGES.get("default")
-        if not raw:
-            env_key = "KVM_BASE_IMAGE_" + re.sub(r"[^A-Za-z0-9]", "_", key).upper()
-            raw = os.getenv(env_key, "").strip()
-        if not raw:
-            raise FileNotFoundError(
-                f"No trusted base image is configured for {key}. Set {env_key} or KVM_BASE_IMAGES_JSON."
-            )
-        path = Path(raw).expanduser().resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"Base image does not exist: {path}")
-        return path
-
-    async def create(self, vm_id: int, os_type: str, ram: str, vcpu: int, disk: str, name: str) -> tuple[bool, str, str | None]:
-        ok, detail = await self.preflight()
-        if not ok:
-            return False, detail, None
-        await self.ensure_dirs(vm_id)
-        base = self.base_image(os_type)
-        target = self.disk_path(vm_id)
-        if target.exists():
-            return False, "Target disk already exists; refusing to overwrite it.", None
-        disk_gb = max(1, int(parse_size_bytes(disk) / 1024**3))
-        rc_info, out_info, _ = await qemu_img("info", "--output=json", str(base), timeout=60)
-        base_format = KVM_DISK_FORMAT
-        base_virtual_size = 0
-        if rc_info == 0:
-            with contextlib.suppress(ValueError, TypeError, KeyError):
-                info = json.loads(out_info)
-                detected = str(info.get("format") or "").strip().lower()
-                if detected:
-                    base_format = detected
-                base_virtual_size = int(info.get("virtual-size") or 0)
-        if base_virtual_size and parse_size_bytes(disk) < base_virtual_size:
-            return False, f"Requested disk {disk} is smaller than the trusted base image virtual size ({format_bytes(base_virtual_size)}).", None
-        rc, _, err = await qemu_img("create", "-f", KVM_DISK_FORMAT, "-F", base_format, "-b", str(base), str(target), str(disk_gb) + "G")
-        if rc != 0:
-            # Some source formats are not qcow2. Fall back to a standalone copy.
-            rc, _, err = await qemu_img("convert", "-p", "-O", KVM_DISK_FORMAT, str(base), str(target), timeout=900)
-            if rc != 0:
-                return False, f"qemu-img failed: {clean(err, 1200)}", None
-            rc, _, err = await qemu_img("resize", str(target), str(disk_gb) + "G")
-            if rc != 0:
-                target.unlink(missing_ok=True)
-                return False, f"qemu-img resize failed: {clean(err, 1000)}", None
-        seed = await build_cloud_init_iso(vm_id, os_type)
-        xml = self.domain_xml(vm_id, name, ram, vcpu, target, os_type, seed)
-        xml_path = self.vm_dir(vm_id) / "domain.xml"
-        xml_path.write_text(xml, encoding="utf-8")
-        rc, _, err = await virsh("define", str(xml_path), timeout=60)
-        if rc != 0:
-            target.unlink(missing_ok=True)
-            return False, f"libvirt define failed: {clean(err, 1500)}", None
-        if KVM_AUTOSTART:
-            await virsh("autostart", self.domain_name(vm_id), timeout=30)
-        return True, f"{('KVM' if self.use_kvm and detect_kvm() else 'QEMU')} VM created.", str(target)
-
-    def domain_xml(self, vm_id: int, name: str, ram: str, vcpu: int, disk: Path, os_type: str, seed: Path | None = None) -> str:
-        memory_kib = int(parse_size_bytes(ram) / 1024)
-        domain_type = "kvm" if self.use_kvm and detect_kvm() else "qemu"
-        uuid_value = str(uuid.uuid4())
-        boot = "<boot dev='hd'/>"
-        firmware = ""
-        if KVM_FIRMWARE == "uefi":
-            firmware = "<loader readonly='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE.fd</loader>"
-        net = (
-            f"<interface type='bridge'><source bridge='{html.escape(KVM_BRIDGE)}'/><model type='virtio'/></interface>"
-            if KVM_BRIDGE
-            else f"<interface type='network'><source network='{html.escape(KVM_NETWORK)}'/><model type='virtio'/></interface>"
-        )
-        graphics = "<graphics type='spice' autoport='yes'><listen type='address' address='127.0.0.1'/></graphics>"
-        channel = "<channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>"
-        return f"""<domain type='{domain_type}'>
-  <name>{html.escape(self.domain_name(vm_id))}</name>
-  <uuid>{uuid_value}</uuid>
-  <memory unit='KiB'>{memory_kib}</memory>
-  <currentMemory unit='KiB'>{memory_kib}</currentMemory>
-  <vcpu placement='static'>{int(vcpu)}</vcpu>
-  <os>{firmware}<type arch='{html.escape(KVM_ARCH)}' machine='{html.escape(KVM_MACHINE)}'>hvm</type>{boot}</os>
-  <features><acpi/><apic/></features>
-  <cpu mode='host-model'/>
-  <clock offset='utc'/>
-  <on_poweroff>destroy</on_poweroff>
-  <on_reboot>restart</on_reboot>
-  <on_crash>restart</on_crash>
-  <devices>
-    <disk type='file' device='disk'>
-      <driver name='qemu' type='{html.escape(KVM_DISK_FORMAT)}' cache='none' discard='unmap'/>
-      <source file='{html.escape(str(disk))}'/>
-      <target dev='vda' bus='virtio'/>
-    </disk>
-    {((f"<disk type='file' device='cdrom'><driver name='qemu' type='raw'/><source file='{html.escape(str(seed))}'/><target dev='sdb' bus='sata'/><readonly/></disk>") if seed else '')}
-    {net}
-    <serial type='pty'/>
-    <console type='pty'/>
-    {graphics}
-    {channel}
-    <memballoon model='virtio'/>
-  </devices>
-</domain>"""
-
-    async def state(self, vm_id: int) -> str:
-        rc, out, _ = await virsh("domstate", self.domain_name(vm_id), timeout=20)
-        return out.strip().lower() if rc == 0 else "missing"
-
-    async def start(self, vm_id: int) -> tuple[bool, str]:
-        async with self.lock(vm_id):
-            state = await self.state(vm_id)
-            if state == "running":
-                return True, "VM is already running."
-            rc, _, err = await virsh("start", self.domain_name(vm_id), timeout=90)
-            return rc == 0, "VM started." if rc == 0 else clean(err, 1200)
-
-    async def stop(self, vm_id: int) -> tuple[bool, str]:
-        async with self.lock(vm_id):
-            state = await self.state(vm_id)
-            if state in {"shut off", "missing"}:
-                return True, "VM is already stopped."
-            rc, _, err = await virsh("shutdown", self.domain_name(vm_id), timeout=60)
-            if rc != 0:
-                return False, clean(err, 1200)
-            for _ in range(20):
-                if await self.state(vm_id) == "shut off":
-                    return True, "VM stopped gracefully."
-                await asyncio.sleep(1)
-            rc, _, err = await virsh("destroy", self.domain_name(vm_id), timeout=30)
-            return rc == 0, "VM force-stopped." if rc == 0 else clean(err, 1200)
-
-    async def restart(self, vm_id: int) -> tuple[bool, str]:
-        async with self.lock(vm_id):
-            state = await self.state(vm_id)
-            if state == "missing":
-                return False, "VM domain is missing."
-            rc, _, err = await virsh("reboot", self.domain_name(vm_id), timeout=60)
-            if rc == 0:
-                return True, "VM reboot requested."
-            rc, _, err = await virsh("destroy", self.domain_name(vm_id), timeout=30)
-            if rc != 0:
-                return False, clean(err, 1200)
-            rc, _, err = await virsh("start", self.domain_name(vm_id), timeout=90)
-            return rc == 0, "VM restarted." if rc == 0 else clean(err, 1200)
-
-    async def delete(self, vm_id: int) -> tuple[bool, str]:
-        async with self.lock(vm_id):
-            domain = self.domain_name(vm_id)
-            state = await self.state(vm_id)
-            if state not in {"shut off", "missing"}:
-                rc, _, err = await virsh("shutdown", domain, timeout=60)
-                if rc != 0:
-                    rc, _, err = await virsh("destroy", domain, timeout=30)
-                    if rc != 0:
-                        return False, clean(err, 1200)
-                else:
-                    for _ in range(20):
-                        if await self.state(vm_id) == "shut off":
-                            break
-                        await asyncio.sleep(1)
-                    else:
-                        rc, _, err = await virsh("destroy", domain, timeout=30)
-                        if rc != 0:
-                            return False, clean(err, 1200)
-            await virsh("undefine", domain, "--remove-all-storage", timeout=120)
-            # --remove-all-storage can be unavailable or the disk may be a backing chain.
-            path = self.vm_dir(vm_id)
-            if path.exists():
-                for child in sorted(path.rglob("*"), reverse=True):
-                    if child.is_file() or child.is_symlink():
-                        child.unlink(missing_ok=True)
-                with contextlib.suppress(OSError):
-                    path.rmdir()
-            return True, "VM deleted."
-
-    async def snapshot(self, vm_id: int, name: str) -> tuple[bool, str]:
-        name = safe_name(name, "snapshot")
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
-            return False, "Invalid snapshot name."
-        async with self.lock(vm_id):
-            if await self.state(vm_id) == "missing":
-                return False, "VM domain is missing."
-            rc, _, err = await virsh("snapshot-create-as", self.domain_name(vm_id), name, "--atomic", timeout=300)
-            return rc == 0, "Snapshot created." if rc == 0 else clean(err, 1200)
-
-    async def snapshot_list(self, vm_id: int) -> list[str]:
-        rc, out, _ = await virsh("snapshot-list", self.domain_name(vm_id), "--name", timeout=60)
-        if rc != 0:
-            return []
-        return [line.strip() for line in out.splitlines() if line.strip()]
-
-    async def snapshot_restore(self, vm_id: int, name: str) -> tuple[bool, str]:
-        name = safe_name(name, "snapshot")
-        async with self.lock(vm_id):
-            state = await self.state(vm_id)
-            was_running = state == "running"
-            if was_running:
-                rc, _, err = await virsh("shutdown", self.domain_name(vm_id), timeout=60)
-                if rc != 0:
-                    return False, clean(err, 1200)
-                for _ in range(30):
-                    if await self.state(vm_id) == "shut off": break
-                    await asyncio.sleep(1)
-                else:
-                    return False, "VM did not stop before snapshot restore."
-            revert_args = ["snapshot-revert", self.domain_name(vm_id), name]
-            if was_running:
-                revert_args.append("--running")
-            rc, _, err = await virsh(*revert_args, timeout=180)
-            if rc != 0:
-                return False, clean(err, 1200)
-            return True, f"Snapshot `{name}` restored."
-
-    async def ip(self, vm_id: int) -> str | None:
-        domain = self.domain_name(vm_id)
-        for source in ("lease", "arp", "agent"):
-            rc, out, _ = await virsh("domifaddr", domain, "--source", source, timeout=15)
-            if rc != 0:
-                continue
-            for line in out.splitlines():
-                match = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})/\d+\b", line)
-                if match:
-                    try:
-                        addr = ipaddress.ip_address(match.group(1))
-                        if isinstance(addr, ipaddress.IPv4Address) and not addr.is_loopback:
-                            return str(addr)
-                    except ValueError:
-                        continue
-        return None
-
-    async def guest_bootstrap_complete(self, vm_id: int) -> bool:
-        domain = self.domain_name(vm_id)
-        cmd = json.dumps({"execute": "guest-exec", "arguments": {"path": "/bin/sh", "arg": ["-lc", "test -f /var/lib/rgnodes/.bootstrap-complete && echo READY"], "capture-output": True}})
-        rc, out, _ = await virsh("qemu-agent-command", domain, cmd, timeout=20)
-        if rc != 0 or not out.strip():
-            return False
+    if "--restart" in features:
+        command += ["--restart", "unless-stopped"]
+    if "--memory" in features:
+        command += ["--memory", ram]
         try:
-            pid = json.loads(out).get("return", {}).get("pid")
-            if pid is None: return False
-            await asyncio.sleep(0.2)
-            status_cmd = json.dumps({"execute": "guest-exec-status", "arguments": {"pid": pid, "capture-output": True}})
-            rc2, out2, _ = await virsh("qemu-agent-command", domain, status_cmd, timeout=20)
-            if rc2 != 0: return False
-            encoded = json.loads(out2).get("return", {}).get("out-data")
-            if not encoded: return False
-            return "READY" in base64.b64decode(encoded).decode("utf-8", "replace")
-        except (ValueError, TypeError, KeyError):
-            return False
+            ram_bytes = parse_size_bytes(ram)
+            if "--memory-reservation" in features and MEMORY_RESERVATION_PERCENT:
+                reservation_bytes = max(6 * 1024**2, int(ram_bytes * MEMORY_RESERVATION_PERCENT / 100))
+                command += ["--memory-reservation", str(reservation_bytes)]
+            if DISABLE_CONTAINER_SWAP and "--memory-swap" in features:
+                command += ["--memory-swap", ram]
+            if DISABLE_CONTAINER_SWAP and "--memory-swappiness" in features:
+                command += ["--memory-swappiness", "0"]
+        except ValueError:
+            pass
+    if "--cpus" in features:
+        command += ["--cpus", cpu]
+    if "--hostname" in features:
+        command += ["--hostname", hostname]
+    if "--name" in features:
+        command += ["--name", container_name]
+    if "--label" in features:
+        command += ["--label", "com.rgnodes.managed=true", "--label", f"com.rgnodes.location={location}"]
+    if "--log-driver" in features and "--log-opt" in features:
+        command += ["--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3"]
 
-    async def stats(self, vm_id: int) -> dict[str, str]:
-        domain = self.domain_name(vm_id)
-        state = await self.state(vm_id)
-        rc, out, _ = await virsh("domstats", domain, "--balloon", "--vcpu", "--state", timeout=30)
-        data: dict[str, str] = {"state": state}
+    if "--init" in features and not GUEST_SYSTEMD_ENABLED:
+        command.append("--init")
+    if "--pids-limit" in features and not GUEST_SYSTEMD_ENABLED:
+        command += ["--pids-limit", "1024"]
+
+    if GUEST_PERSISTENT_DATA and "--mount" in features:
+        volume_key = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(persistent_key or container_name)).strip("-._") or "vps"
+        volume_key = volume_key[:48]
+        persistent_mounts = {
+            "root": "/root",
+            "home": "/home",
+            "srv": "/srv",
+            "www": "/var/www",
+            "nginx": "/etc/nginx",
+            "ssh": "/etc/ssh",
+            "ptero": "/etc/pterodactyl",
+            "ptero-data": "/var/lib/pterodactyl",
+            "mysql": "/var/lib/mysql",
+            "redis": "/var/lib/redis",
+            "docker": "/var/lib/docker",
+            "containerd": "/var/lib/containerd",
+            "docker-etc": "/etc/docker",
+            "rgnodes": "/var/lib/rgnodes",
+        }
+        for suffix, target in persistent_mounts.items():
+            volume_name = f"rgnodes-{volume_key}-{suffix}"[:120]
+            command += ["--mount", f"type=volume,src={volume_name},dst={target}"]
+
+    guest_command = [image, "tail", "-f", "/dev/null"]
+    if GUEST_SYSTEMD_ENABLED:
+        if GUEST_SYSTEMD_PRIVILEGED:
+            if "--privileged" not in features:
+                return None, "This Docker daemon does not support --privileged; a systemd VPS cannot be created safely."
+            command.append("--privileged")
+        if GUEST_CGROUPNS_HOST and "--cgroupns" in features:
+            command += ["--cgroupns", "host"]
+        # KVM userspace can be installed in the guest, but actual acceleration
+        # exists only when the Docker host exposes /dev/kvm. Never claim KVM if
+        # the underlying provider does not expose it.
+        if GUEST_KVM_ENABLED and Path("/dev/kvm").exists() and "--device" in features:
+            command += ["--device", "/dev/kvm:/dev/kvm"]
+        if "--tmpfs" in features:
+            command += ["--tmpfs", "/run", "--tmpfs", "/run/lock"]
+        if "--stop-signal" in features:
+            command += ["--stop-signal", "SIGRTMIN+3"]
+        if "--security-opt" in features:
+            command += ["--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined"]
+        bootstrap = GUEST_BOOTSTRAP_SCRIPT.replace("__NESTED_DOCKER__", "1" if GUEST_NESTED_DOCKER else "0")
+        bootstrap = bootstrap.replace("__DOCKER_PACKAGE__", GUEST_DOCKER_PACKAGE)
+        bootstrap = bootstrap.replace("__KVM_ENABLED__", "1" if GUEST_KVM_ENABLED else "0")
+        bootstrap = bootstrap.replace("__INSTALL_WINGS__", "1" if GUEST_INSTALL_WINGS else "0")
+        bootstrap = bootstrap.replace("__WEB_STACK__", "1" if GUEST_INSTALL_WEB_STACK else "0")
+        bootstrap = bootstrap.replace("__DB_STACK__", "1" if GUEST_INSTALL_DATABASE_STACK else "0")
+        guest_command = [image, "/bin/bash", "-lc", bootstrap]
+
+    # Docker syntax requires IMAGE after all options. Never execute an
+    # options-only `docker run`, because Docker rejects that with:
+    # "docker run requires at least 1 argument".
+    image = str(image or "").strip()
+    if not image:
+        return None, "Docker image is empty; deployment configuration is invalid."
+
+    run_command = command + guest_command
+    if len(run_command) < 3 or not run_command[2]:
+        return None, "Docker run command construction failed before execution."
+
+    quota_requested = ENABLE_HARD_DISK_QUOTA and "--storage-opt" in features
+    quota_attempt = (
+        command + ["--storage-opt", f"size={disk}"] + guest_command
+        if quota_requested
+        else run_command
+    )
+    attempts = [quota_attempt]
+    if quota_requested and QUOTA_FALLBACK:
+        attempts.append(run_command)
+
+    last_error = "Docker container creation failed."
+    for index, attempt in enumerate(attempts):
+        if len(attempt) < 3 or not attempt[2]:
+            last_error = "Docker run command was incomplete; refusing to execute it."
+            continue
+        attempt_timeout = GUEST_BOOTSTRAP_TIMEOUT if GUEST_SYSTEMD_ENABLED else 120
+        rc, out, err = await docker_cli(*attempt, timeout=attempt_timeout, retries=0)
         if rc == 0:
-            for line in out.splitlines():
-                if "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                data[key.strip()] = value.strip()
-        data["ip"] = (await self.ip(vm_id)) or "N/A"
-        return data
-
-    async def logs(self, vm_id: int, lines: int = 80) -> str:
-        path = self.vm_dir(vm_id) / "domain.xml"
-        if path.exists():
-            text = path.read_text(encoding="utf-8", errors="replace")
-            return "Domain XML:\n" + text[-min(3800, max(500, lines * 120)):]
-        return "No local VM metadata found."
-
-    async def guest_process_text(self, vm_id: int) -> str | None:
-        # Uses the QEMU guest agent when available. No arbitrary host command is
-        # accepted here; only a fixed read-only `ps` query is requested.
-        domain = self.domain_name(vm_id)
-        cmd = json.dumps({
-            "execute": "guest-exec",
-            "arguments": {
-                "path": "/usr/bin/ps",
-                "arg": ["-eo", "comm,args"],
-                "capture-output": True,
-            },
-        })
-        rc, out, _ = await virsh("qemu-agent-command", domain, cmd, timeout=20)
-        if rc != 0 or not out.strip():
-            return None
-        try:
-            payload = json.loads(out)
-            pid = payload.get("return", {}).get("pid")
-            if pid is None:
-                return None
-            await asyncio.sleep(0.25)
-            read_cmd = json.dumps({
-                "execute": "guest-exec-status",
-                "arguments": {"pid": pid, "capture-output": True},
-            })
-            rc2, out2, _ = await virsh("qemu-agent-command", domain, read_cmd, timeout=20)
-            if rc2 != 0:
-                return None
-            status = json.loads(out2).get("return", {})
-            encoded = status.get("out-data")
-            if encoded:
-                return base64.b64decode(encoded).decode("utf-8", "replace")
-        except (ValueError, KeyError, TypeError, UnicodeError):
-            return None
-        return None
+            container_id = out.decode("utf-8", "replace").strip().splitlines()[0] if out else ""
+            if container_id:
+                return container_id, ""
+            last_error = "Docker returned no container ID."
+            continue
+        last_error = safe_log(err.decode("utf-8", "replace").strip() or "unknown Docker error")
+        if index + 1 < len(attempts) and (quota_error(last_error) or feature_error(last_error)):
+            logger.warning("Docker hard-quota create failed; retrying without storage quota: %s", last_error)
+            continue
+        break
+    return None, last_error
 
 
-KVM = KVMBackend(use_kvm=True)
-QEMU = KVMBackend(use_kvm=False)
+async def docker_start(container: str) -> tuple[bool, str]:
+    rc, _, err = await docker_cli("start", container, timeout=60, retries=1)
+    return rc == 0, safe_log(err.decode("utf-8", "replace").strip())
 
 
-# ============================================================================
-# Docker compatibility backend (kept intentionally non-privileged)
-# ============================================================================
+async def ensure_docker_running(container: str) -> tuple[bool, str]:
+    """Treat docker run --detach as already started and only start when needed."""
+    state = await docker_state(container)
+    if state == "running":
+        return True, ""
+    ok, error = await docker_start(container)
+    if not ok:
+        # A concurrent supervisor may have started it between inspect and start.
+        if await docker_state(container) == "running":
+            return True, ""
+        return False, error or "Container could not be started."
+    return True, ""
 
-async def docker_available() -> bool:
-    rc, _, _ = await run_process("docker", "info", timeout=20)
+
+async def guest_system_ready(container: str) -> tuple[bool, str]:
+    """Verify that a native-Docker guest booted systemd and all core tooling."""
+    if not GUEST_SYSTEMD_ENABLED:
+        return True, "systemd guest mode is disabled."
+    nested = "1" if GUEST_NESTED_DOCKER else "0"
+    kvm = "1" if GUEST_KVM_ENABLED else "0"
+    wings = "1" if GUEST_INSTALL_WINGS else "0"
+    script = f"""
+set -e
+pid1="$(cat /proc/1/comm 2>/dev/null || true)"
+[ "$pid1" = "systemd" ] || exit 11
+[ -f /var/lib/rgnodes/.system-ready ] || exit 12
+command -v systemctl >/dev/null 2>&1 || exit 13
+command -v curl >/dev/null 2>&1 || exit 14
+command -v sshd >/dev/null 2>&1 || exit 15
+sshd -t >/dev/null 2>&1 || exit 16
+command -v node >/dev/null 2>&1 || exit 21
+command -v npm >/dev/null 2>&1 || exit 22
+command -v yarn >/dev/null 2>&1 || exit 23
+command -v pm2 >/dev/null 2>&1 || exit 24
+node -e 'process.exit(process.versions.node.startsWith("20.") ? 0 : 25)'
+if [ "{nested}" = "1" ]; then
+    command -v docker >/dev/null 2>&1 || exit 17
+    docker info >/dev/null 2>&1 || exit 19
+    docker compose version >/dev/null 2>&1 || exit 20
+    systemctl is-active --quiet docker.service || exit 18
+fi
+command -v qemu-img >/dev/null 2>&1 || exit 28
+if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+    qemu-system-x86_64 --version >/dev/null 2>&1 || exit 29
+elif command -v qemu-system-aarch64 >/dev/null 2>&1; then
+    qemu-system-aarch64 --version >/dev/null 2>&1 || exit 29
+else
+    exit 30
+fi
+if [ "{kvm}" = "1" ]; then
+    if [ -e /dev/kvm ]; then
+        printf 'kvm=available\n' >/var/lib/rgnodes/kvm-status
+    else
+        printf 'kvm=unavailable\n' >/var/lib/rgnodes/kvm-status
+    fi
+fi
+if [ "{wings}" = "1" ]; then
+    command -v wings >/dev/null 2>&1 || exit 31
+    wings --version >/dev/null 2>&1 || true
+fi
+"""
+    rc, _, err = await docker_exec_shell(container, script, timeout=40)
+    if rc == 0:
+        return True, "systemd, Docker, Compose, SSH, Node.js, npm, Yarn, PM2, QEMU and guest Pterodactyl prerequisites are ready."
+    detail = err.decode("utf-8", "replace").strip()
+    return False, detail or f"guest readiness check exited with code {rc}"
+
+
+async def wait_for_guest_ready(
+    container: str, timeout: float = GUEST_BOOTSTRAP_TIMEOUT
+) -> tuple[bool, str]:
+    """Wait for first-boot provisioning without blocking forever."""
+    deadline = asyncio.get_running_loop().time() + max(30.0, float(timeout))
+    last = "guest bootstrap is still running"
+    while asyncio.get_running_loop().time() < deadline:
+        if await docker_state(container) != "running":
+            return False, "The guest container stopped during system bootstrap."
+        ok, detail = await guest_system_ready(container)
+        if ok:
+            return True, detail
+        last = detail
+        await asyncio.sleep(2)
+    return False, f"Guest system bootstrap timed out: {last}"
+
+
+async def docker_stop(container: str) -> bool:
+    rc, _, _ = await docker_cli("stop", "--time", "20", container, timeout=40, retries=1)
+    if rc == 0:
+        return True
+    rc, _, _ = await docker_cli("kill", container, timeout=25, retries=1)
     return rc == 0
 
 
-async def docker_state(name: str) -> str:
-    rc, out, _ = await run_process("docker", "inspect", "-f", "{{.State.Status}}", name, timeout=20)
-    return out.strip().lower() if rc == 0 else "missing"
+async def docker_restart(container: str) -> tuple[bool, str]:
+    rc, _, err = await docker_cli("restart", "--time", "20", container, timeout=60, retries=1)
+    return rc == 0, safe_log(err.decode("utf-8", "replace").strip())
 
 
-async def docker_create(vm_id: int, os_type: str, ram: str, cpu: int, disk: str, name: str) -> tuple[bool, str]:
-    if not await docker_available():
-        return False, "Docker daemon is not reachable."
-    image = {
-        "ubuntu-24.04": "ubuntu:24.04",
-        "ubuntu-22.04": "ubuntu:22.04",
-        "debian-12": "debian:12",
-        "debian-11": "debian:11",
-    }.get(normalize_os(os_type) or "", "")
-    if not image:
-        return False, "Docker mode supports only the configured Linux container images. Use KVM for full VM isolation."
-    ram_b = parse_size_bytes(ram)
-    # Disk quota is intentionally not emulated with privileged/storage-driver tricks.
-    cmd = [
-        "docker", "run", "-d", "--name", name,
-        "--hostname", name,
-        "--memory", str(ram_b),
-        "--cpus", str(cpu),
-        "--pids-limit", "1024",
-        "--restart", "unless-stopped",
-        "--security-opt", "no-new-privileges:true",
-        "--cap-drop", "ALL",
-        "--label", "com.rgnodes.managed=true",
-        image,
-        "sh", "-lc", "while :; do sleep 3600; done",
-    ]
-    rc, out, err = await run_process(*cmd, timeout=180)
-    return (True, "Docker container created.") if rc == 0 else (False, clean(err, 1400))
+async def docker_remove(container: str) -> bool:
+    rc, _, _ = await docker_cli("rm", "--force", container, timeout=60, retries=1)
+    if rc == 0:
+        return True
+    return not await docker_exists(container)
 
 
-async def docker_action(name: str, action: str) -> tuple[bool, str]:
-    verb = {"start": "start", "stop": "stop", "restart": "restart", "delete": "rm"}.get(action)
-    if not verb:
-        return False, "Unsupported Docker action."
-    args = ["docker", verb]
-    if action == "delete":
-        args += ["-f"]
-    args.append(name)
-    rc, _, err = await run_process(*args, timeout=90)
-    return rc == 0, ("Done." if rc == 0 else clean(err, 1400))
+async def docker_exec(
+    container: str,
+    *command: str,
+    timeout: float = 120,
+    retries: int = 1,
+) -> tuple[int, bytes, bytes]:
+    return await docker_cli("exec", container, *command, timeout=timeout, retries=max(0, int(retries)))
 
 
-# ============================================================================
-# Pterodactyl minimal compatibility helpers
-# ============================================================================
-
-async def ptero_request(method: str, path: str, payload: dict[str, Any] | None = None, client: bool = False) -> tuple[int, dict[str, Any] | str]:
-    if aiohttp is None:
-        return 503, "aiohttp is not installed."
-    key = PTERO_CLIENT_API_KEY if client else PTERO_API_KEY
-    if not PTERO_URL or not key:
-        return 503, "Pterodactyl is not configured."
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Accept": "Application/vnd.pterodactyl.v1+json",
-        "Content-Type": "application/json",
-        "User-Agent": "RGNODES-VM-Manager/3.0",
-    }
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.request(method.upper(), f"{PTERO_URL}/api/{path.lstrip('/')}", json=payload) as resp:
-                text = await resp.text()
-                try:
-                    body: dict[str, Any] | str = json.loads(text) if text else {}
-                except json.JSONDecodeError:
-                    body = text
-                return resp.status, body
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        return 599, str(exc)
+async def docker_exec_shell(container: str, script: str, timeout: float = ACCESS_TIMEOUT) -> tuple[int, bytes, bytes]:
+    # Shell scripts may have side effects. Never let the generic transient-error
+    # retry mechanism execute the same script a second time.
+    return await docker_exec(container, "sh", "-c", script, timeout=timeout, retries=0)
 
 
-# ============================================================================
-# VM service
-# ============================================================================
-
-@dataclass(slots=True)
-class ActionResult:
-    ok: bool
-    message: str
-    vm: sqlite3.Row | None = None
-
-
-class VMService:
-    def __init__(self) -> None:
-        self.create_lock = asyncio.Lock()
-        self.vm_locks: dict[int, asyncio.Lock] = {}
-
-    def lock(self, vm_id: int) -> asyncio.Lock:
-        return self.vm_locks.setdefault(int(vm_id), asyncio.Lock())
-
-    def backend_for(self, backend: str) -> KVMBackend | None:
-        if backend == "kvm":
-            return KVM
-        if backend == "qemu":
-            return QEMU
-        return None
-
-    async def refresh_state(self, vm: sqlite3.Row) -> sqlite3.Row:
-        backend = str(vm["backend"])
-        state = "unknown"
-        if backend in {"kvm", "qemu"}:
-            state = await self.backend_for(backend).state(int(vm["id"]))  # type: ignore[union-attr]
-            if state == "running":
-                db_update_vm(vm["id"], status="running")
-            elif state in {"shut off", "missing"}:
-                db_update_vm(vm["id"], status="stopped")
-            ip = await self.backend_for(backend).ip(int(vm["id"]))  # type: ignore[union-attr]
-            if ip:
-                db_update_vm(vm["id"], ip_address=ip)
-        elif backend == "docker":
-            state = await docker_state(vm["domain"])
-            db_update_vm(vm["id"], status="running" if state == "running" else "stopped")
-        return db_get_vm(vm["id"]) or vm
-
-    async def create(self, owner_id: int, username: str, os_type: str, ram: str, cpu: str, disk: str, name: str | None = None, backend_override: str | None = None) -> ActionResult:
-        norm_os = normalize_os(os_type)
-        if not norm_os:
-            return ActionResult(False, "Unsupported operating system.")
-        try:
-            ram_text, vcpu, disk_text, _ = validate_resources(ram, cpu, disk)
-        except ValueError as exc:
-            return ActionResult(False, str(exc))
-        banned, reason = db_is_banned(owner_id)
-        if banned:
-            return ActionResult(False, f"Account is blocked from VM creation: {reason}")
-        async with self.create_lock:
-            existing = len(db_get_vms(owner_id))
-            if owner_id != ADMIN_ID and existing >= SERVER_LIMIT:
-                return ActionResult(False, f"VM slot limit reached: {existing}/{SERVER_LIMIT}.")
-            running = db_running_count()
-            if owner_id != ADMIN_ID and running >= TOTAL_RUNNING_LIMIT:
-                return ActionResult(False, f"Global running VM limit reached: {TOTAL_RUNNING_LIMIT}.")
-            backend = choose_backend(backend_override)
-            vm_name = safe_name(name or f"rgnodes-{owner_id}-{secrets.token_hex(3)}")
-            # Domain names are deterministic and immutable after creation.
-            domain = f"rgnodes-vm-{uuid.uuid4().hex[:12]}"
-            db_upsert_user(owner_id, username)
-            vm_id = db_insert_vm(
-                owner_id=owner_id,
-                name=vm_name,
-                backend=backend,
-                domain=domain,
-                os_type=norm_os,
-                ram=ram_text,
-                vcpu=vcpu,
-                disk=disk_text,
-                disk_path=None,
-                status="creating",
-                suspended=0,
-            )
-            db_audit(str(owner_id), "create-start", str(vm_id), f"backend={backend}; os={norm_os}; ram={ram_text}; cpu={vcpu}; disk={disk_text}")
+async def docker_stats(container: str) -> dict[str, str]:
+    """Live CPU/network plus a cache-adjusted working-set estimate. Never hides a live 0.00%% CPU reading."""
+    memory_text = "N/A"
+    cgroup_script = r'''set -u
+if [ -r /sys/fs/cgroup/memory.current ]; then
+  current=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0)
+  inactive=$(awk '$1=="inactive_file"{print $2; found=1} END{if(!found) print 0}' /sys/fs/cgroup/memory.stat 2>/dev/null)
+  max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
+  case "$current" in ''|*[!0-9]*) current=0;; esac
+  case "$inactive" in ''|*[!0-9]*) inactive=0;; esac
+  usage=$(( current > inactive ? current-inactive : 0 ))
+  printf 'v2\t%s\t%s\n' "$usage" "$max"
+  exit 0
+fi
+if [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then
+  current=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo 0)
+  inactive=$(awk '$1=="total_inactive_file"{print $2; found=1} END{if(!found) print 0}' /sys/fs/cgroup/memory/memory.stat 2>/dev/null)
+  limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo 0)
+  case "$current" in ''|*[!0-9]*) current=0;; esac
+  case "$inactive" in ''|*[!0-9]*) inactive=0;; esac
+  case "$limit" in ''|*[!0-9]*) limit=0;; esac
+  usage=$(( current > inactive ? current-inactive : 0 ))
+  printf 'v1\t%s\t%s\n' "$usage" "$limit"
+  exit 0
+fi
+exit 1
+'''
+    rc_mem, out_mem, _ = await docker_exec_shell(container, cgroup_script, timeout=10)
+    if rc_mem == 0:
+        parts = out_mem.decode("utf-8", "replace").strip().split("\t")
+        if len(parts) == 3:
             try:
-                if backend in {"kvm", "qemu"}:
-                    ok, msg, disk_path = await self.backend_for(backend).create(vm_id, norm_os, ram_text, vcpu, disk_text, vm_name)  # type: ignore[union-attr]
-                    if not ok:
-                        db_update_vm(vm_id, status="error", abuse_reason=msg)
-                        db_audit("system", "create-failed", str(vm_id), msg)
-                        return ActionResult(False, msg, db_get_vm(vm_id))
-                    db_update_vm(vm_id, status="stopped", disk_path=disk_path, bootstrap_status="pending", bootstrap_message="Cloud-init bootstrap scheduled.")
-                    if GUEST_BOOTSTRAP:
-                        started, start_msg = await self.backend_for(backend).start(vm_id)
-                        if started:
-                            db_update_vm(vm_id, status="running", bootstrap_status="running", bootstrap_message="Guest provisioning started.")
-                            deadline = asyncio.get_running_loop().time() + GUEST_BOOTSTRAP_TIMEOUT
-                            complete = False
-                            while asyncio.get_running_loop().time() < deadline:
-                                if await self.backend_for(backend).guest_bootstrap_complete(vm_id):
-                                    complete = True
-                                    break
-                                if await self.backend_for(backend).state(vm_id) != "running":
-                                    break
-                                await asyncio.sleep(5)
-                            db_update_vm(vm_id, bootstrap_status="complete" if complete else "timeout", bootstrap_message="Requested software installed." if complete else "Cloud-init did not report completion before timeout.")
-                            if not KVM_AUTOSTART:
-                                await self.backend_for(backend).stop(vm_id)
-                                db_update_vm(vm_id, status="stopped")
-                        else:
-                            db_update_vm(vm_id, bootstrap_status="start-failed", bootstrap_message=start_msg)
-                elif backend == "docker":
-                    ok, msg = await docker_create(vm_id, norm_os, ram_text, vcpu, disk_text, domain)
-                    if not ok:
-                        db_update_vm(vm_id, status="error", abuse_reason=msg)
-                        return ActionResult(False, msg, db_get_vm(vm_id))
-                    db_update_vm(vm_id, status="running")
-                elif backend == "pterodactyl":
-                    return ActionResult(False, "Pterodactyl creation requires the panel-specific Egg/environment configuration; use KVM/QEMU for true VM creation.", db_get_vm(vm_id))
-                else:
-                    return ActionResult(False, f"Unsupported backend: {backend}.", db_get_vm(vm_id))
-                db_audit(str(owner_id), "create", str(vm_id), f"{backend}/{norm_os}")
-                vm = db_get_vm(vm_id)
-                return ActionResult(True, f"VM #{vm_id} created successfully using {backend.upper()}.", vm)
-            except Exception as exc:
-                logger.exception("VM creation failed")
-                db_update_vm(vm_id, status="error", abuse_reason=str(exc))
-                return ActionResult(False, f"VM creation failed safely: {clean(exc, 1200)}", db_get_vm(vm_id))
+                used = int(parts[1])
+                raw_limit = parts[2].strip()
+                if raw_limit.isdigit():
+                    limit = int(raw_limit)
+                    if 0 < limit < (1 << 50):
+                        memory_text = f"{format_bytes(max(0, used))} / {format_bytes(limit)}"
+            except (ValueError, TypeError):
+                pass
 
-    async def action(self, vm: sqlite3.Row, action: str, actor: str = "system") -> ActionResult:
-        vm_id = int(vm["id"])
-        backend = str(vm["backend"])
-        async with self.lock(vm_id):
-            current = db_get_vm(vm_id)
-            if not current:
-                return ActionResult(False, "VM no longer exists.")
-            if int(current["suspended"]):
-                if action == "start":
-                    return ActionResult(False, "VM is suspended by an administrator.", current)
-            if backend in {"kvm", "qemu"}:
-                handler = self.backend_for(backend)
-                if action == "start":
-                    ok, msg = await handler.start(vm_id)  # type: ignore[union-attr]
-                elif action == "stop":
-                    ok, msg = await handler.stop(vm_id)  # type: ignore[union-attr]
-                elif action == "restart":
-                    ok, msg = await handler.restart(vm_id)  # type: ignore[union-attr]
-                elif action == "delete":
-                    ok, msg = await handler.delete(vm_id)  # type: ignore[union-attr]
-                else:
-                    return ActionResult(False, f"Unsupported action: {action}.", current)
-            elif backend == "docker":
-                ok, msg = await docker_action(current["domain"], action)
-            else:
-                return ActionResult(False, "Unsupported backend.", current)
-            if not ok:
-                db_audit(actor, f"{action}-failed", str(vm_id), msg)
-                return ActionResult(False, msg, db_get_vm(vm_id) or current)
-            if action == "delete":
-                db_update_vm(vm_id, status="deleted", deleted_at=now_iso())
-            elif action in {"stop"}:
-                db_update_vm(vm_id, status="stopped")
-            elif action in {"start", "restart"}:
-                db_update_vm(vm_id, status="running")
-            db_audit(actor, action, str(vm_id), msg)
-            return ActionResult(True, msg, db_get_vm(vm_id) or current)
+    rc, out, err = await docker_cli(
+        "stats", "--no-stream", "--format", "{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}",
+        container, timeout=30, retries=1,
+    )
+    if rc == 0:
+        parts = out.decode("utf-8", "replace").strip().split("\t")
+        if len(parts) == 3:
+            cpu = parts[0].strip() or "0.00%"
+            mem = memory_text if memory_text != "N/A" else normalize_dashboard_memory(parts[1].strip())
+            network = normalize_network_stats(parts[2].strip() or "0 B / 0 B")
+            return {"cpu": cpu, "memory": mem or "0 B", "network": network}
+    # Fallback: old/minimal Docker clients can return a plain row. Keep CPU visible instead of N/A when possible.
+    plain = out.decode("utf-8", "replace").strip()
+    if plain:
+        match = re.search(r"(\d+(?:\.\d+)?%)", plain)
+        if match:
+            return {"cpu": match.group(1), "memory": memory_text, "network": "N/A"}
+    logger.debug("docker stats failed for %s: %s", clean(container, 32), safe_log(err.decode("utf-8", "replace")))
+    return {"cpu": "N/A", "memory": memory_text, "network": "N/A"}
 
-    async def suspend(self, vm: sqlite3.Row, actor: str, reason: str) -> ActionResult:
-        result = await self.action(vm, "stop", actor)
-        if not result.ok:
-            return result
-        db_update_vm(vm["id"], suspended=1, abuse_reason=reason)
-        db_audit(actor, "suspend", str(vm["id"]), reason)
-        return ActionResult(True, "VM suspended and stopped.", db_get_vm(vm["id"]))
 
-    async def unsuspend(self, vm: sqlite3.Row, actor: str) -> ActionResult:
-        db_update_vm(vm["id"], suspended=0, abuse_reason=None, abuse_score=0)
-        db_audit(actor, "unsuspend", str(vm["id"]))
-        return ActionResult(True, "VM unsuspended. It remains stopped until started.", db_get_vm(vm["id"]))
+async def docker_uptime(container: str) -> str:
+    rc, out, _ = await docker_cli("inspect", "-f", "{{.State.StartedAt}}", container, timeout=20, retries=1)
+    if rc != 0:
+        return "N/A"
+    raw = out.decode("utf-8", "replace").strip()
+    try:
+        started = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        seconds = max(0, int((datetime.now(timezone.utc) - started).total_seconds()))
+        days, rem = divmod(seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, _ = divmod(rem, 60)
+        return f"{days}d {hours}h {minutes}m"
+    except (ValueError, TypeError):
+        return "N/A"
 
-    async def stats(self, vm: sqlite3.Row) -> dict[str, str]:
-        vm = await self.refresh_state(vm)
-        backend = str(vm["backend"])
-        if backend in {"kvm", "qemu"}:
-            raw = await self.backend_for(backend).stats(int(vm["id"]))  # type: ignore[union-attr]
+
+async def docker_disk_usage(container: str) -> dict[str, str]:
+    """Return container disk usage while always using the VPS allocation as the dashboard limit.
+
+    Hard disk quotas are optional in RGNODES, so Docker may not expose a real per-container
+    quota. In that case we still report the measured writable usage (when available) and
+    let the dashboard use the configured VPS disk allocation as the visible limit.
+    """
+    rc, out, _ = await docker_cli(
+        "inspect", "--size", "-f", "{{.SizeRw}}", container,
+        timeout=25, retries=1,
+    )
+    if rc == 0:
+        raw = out.decode("utf-8", "replace").strip()
+        # Docker normally returns an integer byte count. Treat an empty/<no value> response
+        # as unavailable rather than raising and breaking the dashboard.
+        if raw.isdigit():
+            return {"used": format_bytes(max(0, int(raw))), "total": "configured", "percent": "allocation"}
+
+    # Reliable in-container fallback. Prefer / because it represents the container's root
+    # filesystem rather than the host filesystem path.
+    script = "df -B1 / 2>/dev/null | awk 'NR==2 {print $2, $3, $4, $5}'"
+    rc, out, _ = await docker_exec_shell(container, script, timeout=20)
+    parts = out.decode("utf-8", "replace").strip().split()
+    if rc == 0 and len(parts) >= 4:
+        try:
+            total = int(parts[0])
+            used = int(parts[1])
             return {
-                "state": clean(raw.get("state", vm["status"])),
-                "ip": clean(raw.get("ip", vm["ip_address"] or "N/A")),
-                "cpu_time": clean(raw.get("vcpu.0.state.time", "N/A")),
-                "balloon": clean(raw.get("balloon.current", "N/A")),
-                "vcpu": clean(raw.get("vcpu.current", vm["vcpu"])),
+                "used": format_bytes(max(0, used)),
+                "total": format_bytes(max(0, total)),
+                "percent": parts[3],
             }
-        return {"state": clean(vm["status"]), "ip": clean(vm["ip_address"] or "N/A"), "cpu_time": "N/A", "balloon": "N/A", "vcpu": clean(vm["vcpu"])}
-
-
-SERVICE = VMService()
-
-
-# ============================================================================
-# Abuse / anti-hacking enforcement
-# ============================================================================
-
-async def abuse_connections(ip: str | None) -> tuple[int, int]:
-    if not ip or not command_available("conntrack"):
-        return 0, 0
-    try:
-        rc, out, _ = await run_process("conntrack", "-L", "-f", "ipv4", timeout=12)
-        if rc != 0:
-            return 0, 0
-        total = 0
-        dests: set[str] = set()
-        for line in out.splitlines():
-            if f"src={ip}" not in line:
-                continue
-            total += 1
-            m = re.search(r"dst=([^ ]+)", line)
-            if m:
-                dests.add(m.group(1))
-        return total, len(dests)
-    except Exception:
-        return 0, 0
-
-
-def suspicious_processes(text: str | None) -> list[str]:
-    if not text:
-        return []
-    lowered = text.lower()
-    return sorted({term for term in ABUSE_TERMS if term in lowered})
-
-
-async def enforce_abuse(vm: sqlite3.Row) -> None:
-    if not ABUSE_ENABLED or vm["backend"] not in {"kvm", "qemu"}:
-        return
-    try:
-        vm = await SERVICE.refresh_state(vm)
-    except Exception as exc:
-        logger.debug("Abuse state refresh failed for VM %s: %s", vm["id"], clean(exc))
-    if vm["status"] != "running" or int(vm["suspended"]):
-        return
-    reasons: list[str] = []
-    score = 0
-    ip = vm["ip_address"]
-    total_conn, unique_dest = await abuse_connections(ip)
-    if total_conn >= ABUSE_CONN_THRESHOLD:
-        score += 2
-        reasons.append(f"high connection count={total_conn}")
-    if unique_dest >= ABUSE_DEST_THRESHOLD:
-        score += 2
-        reasons.append(f"high destination diversity={unique_dest}")
-    with contextlib.suppress(Exception):
-        proc_text = await SERVICE.backend_for(vm["backend"]).guest_process_text(int(vm["id"]))  # type: ignore[union-attr]
-        terms = suspicious_processes(proc_text)
-        if terms:
-            score += 3
-            reasons.append("suspicious process indicators=" + ",".join(terms))
-    if score <= 0:
-        return
-    new_score = int(vm["abuse_score"]) + score
-    reason = "; ".join(reasons)
-    db_update_vm(vm["id"], abuse_score=new_score, abuse_reason=reason)
-    db_log_abuse(vm["id"], score, reason)
-    db_audit("abuse-guard", "signal", str(vm["id"]), reason)
-    latest = db_get_vm(vm["id"])
-    if not latest:
-        return
-    suspicious_hit = any("suspicious process indicators=" in item for item in reasons)
-    if ABUSE_AUTO_DELETE and suspicious_hit and score >= 3:
-        # High-confidence guest-side abuse indicators trigger immediate removal.
-        result = await SERVICE.action(latest, "delete", "abuse-guard")
-        if result.ok:
-            db_set_ban(int(vm["owner_id"]), True, "automatic abuse-policy enforcement: " + reason)
-            db_audit("abuse-guard", "auto-delete", str(vm["id"]), reason)
-            db_audit("abuse-guard", "auto-ban", str(vm["owner_id"]), reason)
-        return
-    if ABUSE_AUTO_SUSPEND and new_score >= 2:
-        await SERVICE.suspend(latest, "abuse-guard", reason)
-
-
-async def abuse_loop(stop_event: asyncio.Event) -> None:
-    while not stop_event.is_set():
-        try:
-            for vm in db_get_vms():
-                await enforce_abuse(vm)
-        except Exception:
-            logger.exception("Abuse monitor iteration failed")
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=ABUSE_SCAN_INTERVAL)
-        except asyncio.TimeoutError:
+        except (TypeError, ValueError):
             pass
 
-
-# ============================================================================
-# Web dashboard / authentication
-# ============================================================================
-
-@dataclass(slots=True)
-class WebSession:
-    username: str
-    csrf: str
-    expires_at: float
+    # Do not surface an avoidable N/A for a running VPS: when Docker cannot expose the
+    # writable-layer metric, zero is a safe baseline until the next successful refresh.
+    return {"used": "0 B", "total": "configured", "percent": "allocation"}
 
 
-WEB_SESSIONS: dict[str, WebSession] = {}
-WEB_LOGIN_LOCK = asyncio.Lock()
-WEB_FAIL_LOCK = asyncio.Lock()
+async def docker_logs(container: str, lines: int = 50) -> str:
+    safe_lines = max(1, min(int(lines), 200))
+    rc, out, err = await docker_cli("logs", "--tail", str(safe_lines), container, timeout=30, retries=1)
+    if rc != 0:
+        return "Unable to fetch container logs."
+    text = out.decode("utf-8", "replace") or err.decode("utf-8", "replace")
+    return text.replace("\x00", "")[-3800:] or "No recent logs."
 
 
-def session_hash(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
+# ================================================================
+# SSHx — verified current installer flow, no fragile line continuations
+# ================================================================
+
+SSHX_INSTALL_SCRIPT = r"""
+set +e
+export NO_COLOR=1
+
+D='/tmp/sshx-RGNODES™'
+LOG="$D/sshx-RGNODES™.log"
+PID="$D/sshx-RGNODES™.pid"
+URL="$D/sshx-RGNODES™.url"
+STATE_DIR='/var/lib/rgnodes/sshx'
+
+mkdir -p "$D" "$STATE_DIR" 2>/dev/null || true
+chmod 700 "$D" "$STATE_DIR" 2>/dev/null || true
+
+clean_ansi() {
+    sed -E 's/\x1B\[[0-9;?]*[ -\/]*[@-~]//g'
+}
+
+extract_url() {
+    [ -s "$1" ] || return 1
+    clean_ansi < "$1" \
+      | tr -d '\r' \
+      | grep -Eao 'https://sshx\.io/s/[^[:space:]]+' \
+      | tail -n1
+}
+
+valid_pid() {
+    case "${1:-}" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$1" 2>/dev/null || return 1
+    [ -r "/proc/$1/cmdline" ] || return 1
+    tr '\000' ' ' < "/proc/$1/cmdline" 2>/dev/null \
+        | grep -qi 'sshx' || return 1
+    return 0
+}
+
+save_state() {
+    [ -s "$PID" ] && cp -f "$PID" "$STATE_DIR/sshx.pid" 2>/dev/null || true
+    [ -s "$LOG" ] && cp -f "$LOG" "$STATE_DIR/sshx.log" 2>/dev/null || true
+    [ -s "$URL" ] && cp -f "$URL" "$STATE_DIR/sshx.url" 2>/dev/null || true
+    chmod 600 "$STATE_DIR/sshx.pid" "$STATE_DIR/sshx.url" 2>/dev/null || true
+}
+
+OLD_PID=""
+if [ -s "$PID" ]; then
+    OLD_PID="$(cat "$PID" 2>/dev/null || true)"
+fi
+
+# Never destroy the URL of a healthy existing session.  A second Console
+# request must reuse the same SSHx process whenever possible.
+if valid_pid "$OLD_PID"; then
+    if [ ! -s "$URL" ]; then
+        extract_url "$LOG" > "$URL" 2>/dev/null || true
+    fi
+    save_state
+    printf '%s\n' "[SSHX] Existing session reused • PID $OLD_PID"
+    if [ -s "$URL" ]; then
+        cat "$URL"
+    fi
+    exit 0
+fi
+
+# ---------------------------------------------------------------
+# 1) Exact official SSHx installer command.
+# ---------------------------------------------------------------
+if ! command -v curl >/dev/null 2>&1; then
+    if [ "$(id -u 2>/dev/null)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1 || true
+        apt-get install -y curl ca-certificates bash coreutils procps \
+            >/dev/null 2>&1 || true
+    elif command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update -y >/dev/null 2>&1 || true
+        sudo apt-get install -y curl ca-certificates bash coreutils procps \
+            >/dev/null 2>&1 || true
+    fi
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+    printf '%s\n' '[SSHX] ERROR: curl is unavailable.'
+    exit 20
+fi
+
+cd "$D" 2>/dev/null || exit 21
+
+# Run the exact official installer requested by RGNODES when a local binary
+# is missing.  Keep a log so installer failures remain diagnosable.
+if [ ! -x "$D/sshx" ]; then
+    printf '%s\n' '[RGNODES™ ;D] Downloading sshx...'
+    rm -f "$D/sshx" 2>/dev/null || true
+    curl -sSf https://sshx.io/get | sh >"$D/install.log" 2>&1
+    INSTALL_RC=$?
+
+    # The official installer may have installed into PATH; copy it locally so
+    # every SSHx session uses one deterministic binary inside this VPS.
+    if [ ! -x "$D/sshx" ] && command -v sshx >/dev/null 2>&1; then
+        cp -f "$(command -v sshx)" "$D/sshx" 2>/dev/null || true
+    fi
+
+    # The official installer also documents `download` as the non-running
+    # installation mode; use it as the deterministic local fallback.
+    if [ ! -x "$D/sshx" ]; then
+        (cd "$D" && curl -fsSL https://sshx.io/get | NO_COLOR=1 sh -s download) \
+            >"$D/download.log" 2>&1
+        DOWNLOAD_RC=$?
+        chmod +x "$D/sshx" 2>/dev/null || true
+    else
+        DOWNLOAD_RC=0
+    fi
+
+    chmod +x "$D/sshx" 2>/dev/null || true
+    if [ ! -x "$D/sshx" ]; then
+        printf '%s\n' "[SSHX] ERROR: sshx binary unavailable (installer=$INSTALL_RC download=$DOWNLOAD_RC)"
+        tail -n 50 "$D/install.log" 2>/dev/null || true
+        tail -n 50 "$D/download.log" 2>/dev/null || true
+        exit 22
+    fi
+fi
+
+SSHX_BIN="$D/sshx"
+
+# A stale PID from a dead process must not survive into the new session.
+rm -f "$LOG" "$URL" 2>/dev/null || true
+: > "$LOG"
+
+printf '%s\n' '[RGNODES™ ;D] Starting sshx in background...'
+# Exact requested SSHx launch parameters.
+nohup "$SSHX_BIN" --quiet --name 'RGNODES™ ;D' --shell "${SHELL:-/bin/bash}" \
+    >"$LOG" 2>&1 </dev/null &
+SSHX_PID=$!
+printf '%s\n' "$SSHX_PID" > "$PID"
+
+# Wait only for the SSHx startup output, exactly as requested.  It is bounded
+# to 70 seconds and terminates immediately once a URL is present or the process
+# dies; it never keeps the Discord event handler waiting indefinitely.
+for i in $(seq 1 70); do
+    extract_url "$LOG" > "$URL" 2>/dev/null || true
+    [ -s "$URL" ] && break
+    if ! valid_pid "$SSHX_PID"; then
+        break
+    fi
+    sleep 1
+done
+
+save_state
+
+printf '%s\n' ''
+printf '%s\n' '================ SSHX BY RGNODES™ ;D ================'
+printf '%s\n' "PID: $SSHX_PID"
+printf '%s' 'URL: '
+cat "$URL" 2>/dev/null || true
+printf '%s\n' ''
+printf '%s\n' "LOG: $LOG"
+printf '%s\n' '========================================================'
+
+if [ -s "$URL" ] && valid_pid "$SSHX_PID"; then
+    printf '%s\n' "[SSHX] ONLINE • encrypted URL READY • PID $SSHX_PID"
+    exit 0
+fi
+
+if valid_pid "$SSHX_PID"; then
+    printf '%s\n' '[SSHX] ONLINE • URL not emitted yet.'
+    tail -n 40 "$LOG" 2>/dev/null || true
+    exit 24
+fi
+
+printf '%s\n' '[SSHX] PROCESS EXITED'
+tail -n 80 "$LOG" 2>/dev/null || true
+exit 23
+"""
 
 
-def cleanup_sessions() -> None:
-    now = time.time()
-    conn = db_connect()
-    try:
-        conn.execute("DELETE FROM sessions WHERE expires_at<?", (now,))
-    finally:
-        conn.close()
-    WEB_SESSIONS.clear()
 
-
-def get_client_ip(request: web.Request) -> str:  # type: ignore[union-attr]
-    peer = request.transport.get_extra_info("peername") if request.transport else None
-    return str(peer[0]) if isinstance(peer, tuple) and peer else "unknown"
-
-
-def csrf_valid(request: web.Request, session: WebSession) -> bool:  # type: ignore[union-attr]
-    token = request.headers.get("X-CSRF-Token") or request.query.get("csrf")
-    return bool(token and hmac.compare_digest(token, session.csrf))
-
-
-def get_session(request: web.Request) -> WebSession | None:  # type: ignore[union-attr]
-    token = request.cookies.get("rgnodes_session", "")
-    if not token:
+def normalize_sshx_url(raw: str | None) -> str | None:
+    """Validate an SSHx share URL and preserve its browser key fragment exactly."""
+    text = str(raw or "").replace("\r", " ").replace("\n", " ")
+    # SSHx emits https://sshx.io/s/<session>[#<browser-key>].  Never
+    # percent-decode, quote, or otherwise rewrite the fragment.
+    match = re.search(
+        r"https://sshx\.io/s/[A-Za-z0-9_-]+#[^\s<>\[\]\"']+",
+        text,
+        flags=re.I,
+    )
+    if not match:
         return None
-    hashed = session_hash(token)
-    session = WEB_SESSIONS.get(hashed)
-    if not session or session.expires_at < time.time():
-        return None
-    session.expires_at = time.time() + SESSION_TTL
-    conn = db_connect()
+    url = match.group(0).rstrip(".,;:)]}'\"")
     try:
-        conn.execute("UPDATE sessions SET expires_at=?,last_seen=? WHERE token_hash=?", (session.expires_at, time.time(), hashed))
-    finally:
-        conn.close()
-    return session
-
-
-def html_page(title: str, body: str, script: str = "", authenticated: bool = False) -> str:
-    logout = "<form method='post' action='/logout'><input type='hidden' name='csrf' id='logoutcsrf'><button class='danger'>Logout</button></form>" if authenticated else ""
-    return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>{html.escape(title)}</title><style>
-:root{{color-scheme:dark}}body{{margin:0;background:#0b1020;color:#e8eef7;font-family:Inter,system-ui,Segoe UI,Arial,sans-serif}}
-.wrap{{max-width:1200px;margin:0 auto;padding:28px}}.top{{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:22px}}
-.card{{background:#121a2b;border:1px solid #24304a;border-radius:16px;padding:18px;margin-bottom:18px;box-shadow:0 14px 50px #0005}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}}h1{{margin:0 0 4px;font-size:28px}}h2{{font-size:18px;margin-top:0}}small,.muted{{color:#9eabc0}}label{{display:block;margin:10px 0 6px;color:#b8c3d5}}input,select,button{{width:100%;box-sizing:border-box;border:1px solid #33415e;background:#0f1727;color:#edf3fb;border-radius:10px;padding:10px;font:inherit}}button{{cursor:pointer;background:#25365a}}button:hover{{background:#2e4775}}button.danger{{background:#71363d}}button.good{{background:#285a45}}.row{{display:flex;gap:8px;margin-top:10px}}.row>*{{flex:1}}pre{{white-space:pre-wrap;word-break:break-word;background:#09101d;padding:12px;border-radius:10px;max-height:360px;overflow:auto}}
-.badge{{display:inline-block;border-radius:999px;padding:4px 9px;background:#25314a;font-size:12px}}.running{{background:#1e6548}}.stopped{{background:#5e2930}}.suspended{{background:#684f22}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;padding:10px;border-bottom:1px solid #24304a;font-size:14px}}.mono{{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}}
-</style></head><body><div class='wrap'><div class='top'><div><h1>RGNODES™ VM Manager</h1><div class='muted'>{html.escape(BUILD)} • dashboard :{WEB_PORT}</div></div>{logout}</div>{body}</div><script>{script}</script></body></html>"""
-
-
-async def web_require_auth(request: web.Request) -> WebSession | web.Response:  # type: ignore[union-attr]
-    if not password_configured():
-        return web.Response(status=503, text="Web login is not configured. Set WEB_ADMIN_PASSWORD_HASH or WEB_ADMIN_PASSWORD.")
-    session = get_session(request)
-    if not session:
-        raise web.HTTPFound("/login")
-    return session
-
-
-async def web_login_get(request: web.Request) -> web.Response:  # type: ignore[union-attr]
-    body = """<div class='card' style='max-width:420px;margin:80px auto'><h2>Admin login</h2><p class='muted'>Authenticate to manage RGNODES VMs.</p><form method='post' action='/login'>
-<label>Username</label><input name='username' autocomplete='username' required><label>Password</label><input type='password' name='password' autocomplete='current-password' required>
-<div style='margin-top:14px'><button class='good'>Login</button></div></form></div>"""
-    return web.Response(text=html_page("Login", body), content_type="text/html")
-
-
-async def web_login_post(request: web.Request) -> web.Response:  # type: ignore[union-attr]
-    source = get_client_ip(request)
-    async with WEB_LOGIN_LOCK:
-        conn = db_connect()
-        try:
-            row = conn.execute("SELECT failures,first_seen,blocked_until FROM login_failures WHERE source=?", (source,)).fetchone()
-            now = time.time()
-            if row and row[2] > now:
-                return web.Response(status=429, text="Too many login failures. Try again later.")
-            if row and now - row[1] > LOGIN_WINDOW:
-                conn.execute("DELETE FROM login_failures WHERE source=?", (source,))
-        finally:
-            conn.close()
-    data = await request.post()
-    username = str(data.get("username", ""))[:200]
-    password = str(data.get("password", ""))[:1000]
-    if not verify_web_credentials(username, password):
-        async with WEB_FAIL_LOCK:
-            conn = db_connect()
-            try:
-                row = conn.execute("SELECT failures,first_seen FROM login_failures WHERE source=?", (source,)).fetchone()
-                now = time.time()
-                failures = int(row[0]) + 1 if row else 1
-                first = float(row[1]) if row else now
-                blocked = now + 300 if failures >= LOGIN_MAX_FAILURES else 0
-                conn.execute(
-                    "INSERT INTO login_failures(source,failures,first_seen,blocked_until) VALUES(?,?,?,?) "
-                    "ON CONFLICT(source) DO UPDATE SET failures=excluded.failures,first_seen=excluded.first_seen,blocked_until=excluded.blocked_until",
-                    (source, failures, first, blocked),
-                )
-            finally:
-                conn.close()
-        return web.Response(status=401, text="Invalid credentials.")
-    token = secrets.token_urlsafe(48)
-    csrf = secrets.token_urlsafe(24)
-    expires = time.time() + SESSION_TTL
-    hashed = session_hash(token)
-    WEB_SESSIONS[hashed] = WebSession(username, csrf, expires)
-    conn = db_connect()
-    try:
-        conn.execute("INSERT INTO sessions(token_hash,username,expires_at,csrf,created_at,last_seen) VALUES(?,?,?,?,?,?)", (hashed, username, expires, csrf, now_iso(), time.time()))
-        conn.execute("DELETE FROM login_failures WHERE source=?", (source,))
-    finally:
-        conn.close()
-    db_audit(username, "web-login", source)
-    response = web.HTTPFound("/")
-    response.set_cookie("rgnodes_session", token, max_age=SESSION_TTL, httponly=True, secure=COOKIE_SECURE, samesite="Lax", path="/")
-    return response
-
-
-async def web_logout(request: web.Request) -> web.Response:  # type: ignore[union-attr]
-    session = get_session(request)
-    data = await request.post()
-    if session and not hmac.compare_digest(str(data.get("csrf", "")), session.csrf):
-        return web.Response(status=403, text="CSRF validation failed.")
-    token = request.cookies.get("rgnodes_session", "")
-    if token:
-        hashed = session_hash(token)
-        WEB_SESSIONS.pop(hashed, None)
-        conn = db_connect()
-        try:
-            conn.execute("DELETE FROM sessions WHERE token_hash=?", (hashed,))
-        finally:
-            conn.close()
-    response = web.HTTPFound("/login")
-    response.del_cookie("rgnodes_session", path="/")
-    return response
-
-
-async def web_index(request: web.Request) -> web.Response:  # type: ignore[union-attr]
-    session = await web_require_auth(request)
-    if isinstance(session, web.Response):
-        return session
-    rows = db_get_vms()
-    cards = []
-    for vm in rows:
-        badge = "suspended" if vm["suspended"] else ("running" if vm["status"] == "running" else "stopped")
-        cards.append(
-            f"<div class='card'><div class='top'><div><h2>#{vm['id']} • {html.escape(vm['name'])}</h2><span class='badge {badge}'>{html.escape(vm['status'])}</span> <span class='badge'>{html.escape(vm['backend'].upper())}</span></div><div class='muted mono'>{html.escape(vm['domain'])}</div></div>"
-            f"<div class='grid'><div><div>Owner <b>{vm['owner_id']}</b></div><div>OS <b>{html.escape(os_label(vm['os_type']))}</b></div><div>Bootstrap <b>{html.escape(vm['bootstrap_status'])}</b></div><div>Bootstrap info <b>{html.escape(vm['bootstrap_message'] or '')}</b></div><div>RAM <b>{html.escape(vm['ram'])}</b></div><div>vCPU <b>{vm['vcpu']}</b></div><div>Disk <b>{html.escape(vm['disk'])}</b></div><div>IP <b>{html.escape(vm['ip_address'] or 'N/A')}</b></div><div>Abuse score <b>{vm['abuse_score']}</b></div></div>"
-            f"<div class='row'><button onclick=act({vm['id']},'start')>Start</button><button onclick=act({vm['id']},'stop')>Stop</button><button onclick=act({vm['id']},'restart')>Restart</button><button class='danger' onclick=act({vm['id']},'delete')>Delete</button></div></div>"
-            f"<div class='row'><button onclick=info({vm['id']})>Refresh stats</button><button onclick=logs({vm['id']})>Logs</button><button onclick=files({vm['id']})>Files</button></div><pre id='out-{vm['id']}'>Ready.</pre></div>"
-        )
-    if not cards:
-        cards = ["<div class='card'><div class='muted'>No VMs yet.</div></div>"]
-    body = "<div class='card'><h2>Create VM</h2><div class='grid'><div><label>OS</label><select id='os'><option>ubuntu-24.04</option><option>ubuntu-22.04</option><option>debian-12</option><option>debian-11</option><option>rocky-9</option><option>alma-9</option><option>windows-11</option></select><label>Name</label><input id='name' placeholder='rgnodes-vm'></div><div><label>RAM</label><input id='ram' value='4G'><label>vCPU</label><input id='cpu' value='2'><label>Disk</label><input id='disk' value='20G'></div><div><label>Backend</label><select id='backend'><option value='auto'>Auto</option><option value='kvm'>KVM</option><option value='qemu'>QEMU</option><option value='docker'>Docker</option></select><button class='good' style='margin-top:28px' onclick='createVm()'>Create VM</button></div></div></div>" + "".join(cards)
-    script = f"const CSRF={json.dumps(session.csrf)};async function api(u,o={{}}){{o.headers=Object.assign({{'X-CSRF-Token':CSRF,'Content-Type':'application/json'}},o.headers||{{}});const r=await fetch(u,o);let t=await r.text();try{{t=JSON.parse(t)}}catch{{}};if(!r.ok)throw new Error(typeof t==='string'?t:(t.error||'request failed'));return t}}async function act(id,a){{try{{const x=await api('/api/vm/'+id+'/'+a,{{method:'POST',body:'{{}}'}});document.getElementById('out-'+id).textContent=JSON.stringify(x,null,2);setTimeout(()=>location.reload(),700)}}catch(e){{document.getElementById('out-'+id).textContent=e.message}}}}async function info(id){{try{{const x=await api('/api/vm/'+id+'/stats',{{method:'POST',body:'{{}}'}});document.getElementById('out-'+id).textContent=JSON.stringify(x,null,2)}}catch(e){{document.getElementById('out-'+id).textContent=e.message}}}}async function logs(id){{try{{const x=await api('/api/vm/'+id+'/logs',{{method:'POST',body:'{{}}'}});document.getElementById('out-'+id).textContent=x.logs||JSON.stringify(x,null,2)}}catch(e){{document.getElementById('out-'+id).textContent=e.message}}}}async function files(id){{try{{const x=await api('/api/vm/'+id+'/files',{{method:'POST',body:'{{}}'}});document.getElementById('out-'+id).textContent=JSON.stringify(x,null,2)}}catch(e){{document.getElementById('out-'+id).textContent=e.message}}}}async function createVm(){{const p={{os:document.getElementById('os').value,name:document.getElementById('name').value,ram:document.getElementById('ram').value,cpu:document.getElementById('cpu').value,disk:document.getElementById('disk').value,backend:document.getElementById('backend').value}};try{{alert(JSON.stringify(await api('/api/vm',{{method:'POST',body:JSON.stringify(p)}})));location.reload()}}catch(e){{alert(e.message)}}}}document.getElementById('logoutcsrf')?.setAttribute('value',CSRF);"
-    return web.Response(text=html_page("Dashboard", body, script, True), content_type="text/html")
-
-
-def safe_vm_file_path(vm: sqlite3.Row, requested: str) -> Path:
-    base = (KVM_STORAGE / f"rgnodes-vm-{int(vm['id'])}" / "files").resolve()
-    base.mkdir(parents=True, exist_ok=True)
-    rel = str(requested or "").replace("\\", "/").lstrip("/")
-    target = (base / rel).resolve()
-    if target != base and base not in target.parents:
-        raise ValueError("Unsafe file path")
-    return target
-
-async def web_api_vm_files(request: web.Request) -> web.Response:  # type: ignore[union-attr]
-    session = await web_require_auth(request)
-    if isinstance(session, web.Response):
-        return session
-    if not csrf_valid(request, session):
-        return web.json_response({"error": "CSRF validation failed"}, status=403)
-    vm = db_get_vm(int(request.match_info["id"]))
-    if not vm:
-        return web.json_response({"error": "VM not found"}, status=404)
-    try:
-        base = safe_vm_file_path(vm, "")
-        items = []
-        for child in sorted(base.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
-            items.append({"name": child.name, "directory": child.is_dir(), "size": child.stat().st_size if child.is_file() else 0})
-        return web.json_response({"vm_id": int(vm["id"]), "path": "", "items": items})
-    except OSError as exc:
-        return web.json_response({"error": clean(exc, 500)}, status=500)
-
-async def web_api_vm_file_put(request: web.Request) -> web.Response:  # type: ignore[union-attr]
-    session = await web_require_auth(request)
-    if isinstance(session, web.Response):
-        return session
-    if not csrf_valid(request, session):
-        return web.json_response({"error": "CSRF validation failed"}, status=403)
-    vm = db_get_vm(int(request.match_info["id"]))
-    if not vm:
-        return web.json_response({"error": "VM not found"}, status=404)
-    data = await request.json()
-    name = str(data.get("name", "")).strip()
-    content = str(data.get("content", ""))
-    if not name or len(name) > 180 or len(content.encode("utf-8")) > 512 * 1024:
-        return web.json_response({"error": "Invalid filename or file too large"}, status=400)
-    try:
-        path = safe_vm_file_path(vm, name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists() and not path.is_file():
-            return web.json_response({"error": "Target is not a file"}, status=400)
-        path.write_text(content, encoding="utf-8")
-        db_audit(session.username, "file-write", str(vm["id"]), name)
-        return web.json_response({"ok": True, "path": str(path.relative_to((KVM_STORAGE / f"rgnodes-vm-{vm['id']}" / 'files').resolve()))})
-    except (OSError, ValueError) as exc:
-        return web.json_response({"error": clean(exc, 500)}, status=400)
-
-async def web_api_vm_file_delete(request: web.Request) -> web.Response:  # type: ignore[union-attr]
-    session = await web_require_auth(request)
-    if isinstance(session, web.Response):
-        return session
-    if not csrf_valid(request, session):
-        return web.json_response({"error": "CSRF validation failed"}, status=403)
-    vm = db_get_vm(int(request.match_info["id"]))
-    if not vm:
-        return web.json_response({"error": "VM not found"}, status=404)
-    try:
-        path = safe_vm_file_path(vm, request.query.get("path", ""))
-        base = safe_vm_file_path(vm, "")
-        if path == base:
-            return web.json_response({"error": "Cannot delete file root"}, status=400)
-        if path.is_dir():
-            for child in sorted(path.rglob("*"), reverse=True):
-                if child.is_file() or child.is_symlink(): child.unlink(missing_ok=True)
-            for child in sorted(path.rglob("*"), reverse=True):
-                if child.is_dir(): child.rmdir()
-            path.rmdir()
-        elif path.is_file():
-            path.unlink()
-        else:
-            return web.json_response({"error": "File not found"}, status=404)
-        db_audit(session.username, "file-delete", str(vm["id"]), request.query.get("path", ""))
-        return web.json_response({"ok": True})
-    except (OSError, ValueError) as exc:
-        return web.json_response({"error": clean(exc, 500)}, status=400)
-
-async def web_api_vm_create(request: web.Request) -> web.Response:  # type: ignore[union-attr]
-    session = await web_require_auth(request)
-    if isinstance(session, web.Response):
-        return session
-    if not csrf_valid(request, session):
-        return web.json_response({"error": "CSRF validation failed"}, status=403)
-    data = await request.json()
-    result = await SERVICE.create(ADMIN_ID or 0, session.username, str(data.get("os", "")), str(data.get("ram", DEFAULT_RAM)), str(data.get("cpu", DEFAULT_CPU)), str(data.get("disk", DEFAULT_DISK)), str(data.get("name", "")) or None, str(data.get("backend", "auto")))
-    return web.json_response({"ok": result.ok, "message": result.message, "vm_id": result.vm["id"] if result.vm else None}, status=200 if result.ok else 400)
-
-
-async def web_api_vm_action(request: web.Request) -> web.Response:  # type: ignore[union-attr]
-    session = await web_require_auth(request)
-    if isinstance(session, web.Response):
-        return session
-    if not csrf_valid(request, session):
-        return web.json_response({"error": "CSRF validation failed"}, status=403)
-    vm = db_get_vm(int(request.match_info["id"]))
-    if not vm:
-        return web.json_response({"error": "VM not found"}, status=404)
-    action = request.match_info["action"]
-    if action == "stats":
-        return web.json_response(await SERVICE.stats(vm))
-    if action == "logs":
-        if vm["backend"] in {"kvm", "qemu"}:
-            text = await SERVICE.backend_for(vm["backend"]).logs(int(vm["id"]))  # type: ignore[union-attr]
-        else:
-            text = "Docker logs are intentionally not exposed on the public dashboard in this hardened build."
-        return web.json_response({"logs": text})
-    if action not in {"start", "stop", "restart", "delete"}:
-        return web.json_response({"error": "Unsupported action"}, status=400)
-    result = await SERVICE.action(vm, action, session.username)
-    return web.json_response({"ok": result.ok, "message": result.message}, status=200 if result.ok else 400)
-
-
-async def web_command(request: web.Request) -> web.Response:  # type: ignore[union-attr]
-    session = await web_require_auth(request)
-    if isinstance(session, web.Response):
-        return session
-    if not csrf_valid(request, session):
-        return web.json_response({"error": "CSRF validation failed"}, status=403)
-    data = await request.json()
-    raw = str(data.get("command", "")).strip()
-    if len(raw) > 300:
-        return web.json_response({"error": "Command too long"}, status=400)
-    try:
-        parts = shlex.split(raw)
+        parsed = urlsplit(url)
     except ValueError:
-        return web.json_response({"error": "Invalid command syntax"}, status=400)
-    if not parts:
-        return web.json_response({"error": "Command is empty"}, status=400)
-    cmd = parts[0].lstrip(PREFIX).lower()
-    allowed = {"list", "status", "start", "stop", "restart", "delete", "suspend", "unsuspend"}
-    if cmd not in allowed:
-        return web.json_response({"error": "Only safe VM management commands are allowed."}, status=400)
-    if cmd == "list":
-        return web.json_response({"vms": [dict(r) for r in db_get_vms()]})
-    if len(parts) < 2 or not parts[1].isdigit():
-        return web.json_response({"error": "Usage: command VM_ID"}, status=400)
-    vm = db_get_vm(int(parts[1]))
-    if not vm:
-        return web.json_response({"error": "VM not found"}, status=404)
-    if cmd == "status":
-        return web.json_response(dict(await SERVICE.refresh_state(vm)))
-    if cmd == "suspend":
-        result = await SERVICE.suspend(vm, session.username, "manual dashboard suspension")
-    elif cmd == "unsuspend":
-        result = await SERVICE.unsuspend(vm, session.username)
-    else:
-        result = await SERVICE.action(vm, cmd, session.username)
-    return web.json_response({"ok": result.ok, "message": result.message})
-
-
-async def start_web_server() -> web.AppRunner | None:  # type: ignore[union-attr]
-    if aiohttp is None or web is None:
-        logger.error("aiohttp is not installed; dashboard disabled")
         return None
-    app = web.Application(client_max_size=1024 * 1024)
-    app.router.add_get("/login", web_login_get)
-    app.router.add_post("/login", web_login_post)
-    app.router.add_post("/logout", web_logout)
-    app.router.add_get("/", web_index)
-    app.router.add_post("/api/vm", web_api_vm_create)
-    app.router.add_post("/api/vm/{id:\\d+}/{action}", web_api_vm_action)
-    app.router.add_post("/api/command", web_command)
-    app.router.add_get("/health", lambda request: web.json_response({"status": "online", "build": BUILD}))
-    runner = web.AppRunner(app, access_log=None)
-    await runner.setup()
-    site = web.TCPSite(runner, WEB_HOST, WEB_PORT, reuse_address=True)
-    await site.start()
-    logger.info("RGNODES dashboard online at %s:%s", WEB_HOST, WEB_PORT)
-    return runner
-
-
-# ============================================================================
-# Discord bot
-# ============================================================================
-
-if commands is not None:
-    intents = discord.Intents.default()
-    intents.message_content = True
-
-    class RGNODESBot(commands.Bot):
-        def __init__(self) -> None:
-            super().__init__(command_prefix=PREFIX, intents=intents, help_command=None)
-
-    bot = RGNODESBot()
-else:  # pragma: no cover
-    bot = None
-
-
-def is_admin(user_id: int) -> bool:
-    return ADMIN_ID > 0 and int(user_id) == ADMIN_ID
-
-
-def discord_embed(title: str, description: str = ""):
-    if discord is None:
+    if parsed.scheme.lower() != "https" or parsed.netloc.lower() != "sshx.io":
         return None
-    embed = discord.Embed(title=title, description=description, color=discord.Color.blurple(), timestamp=discord.utils.utcnow())
-    embed.set_footer(text="⚡ RGNODES™ • VM Management")
+    if not re.fullmatch(r"/s/[A-Za-z0-9_-]+", parsed.path):
+        return None
+    # Do not accept the known-broken form without its E2E fragment.
+    if not parsed.fragment or len(parsed.fragment) < 8:
+        return None
+    if any(ord(ch) < 0x21 or ch in ' <>\"\'[]' for ch in parsed.fragment):
+        return None
+    return urlunsplit(("https", "sshx.io", parsed.path, parsed.query, parsed.fragment))
+
+
+
+async def sshx_process_alive(container: str, pid: str | None) -> bool:
+    if not pid or not str(pid).isdigit():
+        return False
+    script = (
+        'PID="' + str(pid) + '"; '
+        'if [ -r "/proc/$PID/cmdline" ]; then '
+        'CMD="$(tr "\\000" " " < "/proc/$PID/cmdline" 2>/dev/null || true)"; '
+        'case "$CMD" in *sshx*) exit 0;; esac; '
+        'fi; '
+        'if command -v ps >/dev/null 2>&1; then '
+        'ps -p "$PID" -o args= 2>/dev/null | grep -qi "sshx" && exit 0; '
+        'fi; exit 1'
+    )
+    rc, _, _ = await docker_exec_shell(container, script, timeout=10)
+    return rc == 0
+
+
+async def _read_sshx_state(container: str) -> tuple[str | None, str | None]:
+    rc, out, _ = await docker_exec_shell(
+        container,
+        "printf '%s\\n' 'URL:'; cat /var/lib/rgnodes/sshx/sshx.url 2>/dev/null || true; printf '%s\\n' 'PID:'; cat /var/lib/rgnodes/sshx/sshx.pid 2>/dev/null || true",
+        timeout=10,
+    )
+    if rc != 0:
+        return None, None
+    lines = out.decode("utf-8", "replace").splitlines()
+    url = None
+    pid = None
+    try:
+        if "URL:" in lines:
+            i = lines.index("URL:") + 1
+            if i < len(lines):
+                url = normalize_sshx_url(lines[i])
+        if "PID:" in lines:
+            i = lines.index("PID:") + 1
+            if i < len(lines):
+                candidate = lines[i].strip()
+                if candidate.isdigit():
+                    pid = candidate
+    except (ValueError, IndexError):
+        pass
+    return url, pid
+
+
+async def install_and_start_sshx(container: str) -> dict[str, str] | None:
+    """Create or reuse one SSHx session for a running Docker VPS.
+
+    The container-side launcher follows the user's exact SSHx commands.  A
+    per-VPS asyncio lock prevents two Discord button presses from racing into
+    two SSHx processes, while durable PID/URL state allows later requests to
+    reuse the same encrypted session.
+    """
+    if await docker_state(container) != "running":
+        logger.warning("SSHx skipped: container %s is not running.", clean(container, 32))
+        return None
+
+    lock = VPS_SSHX_LOCKS.setdefault(str(container), asyncio.Lock())
+    async with lock:
+        if await docker_state(container) != "running":
+            return None
+
+        saved_url, saved_pid = await _read_sshx_state(container)
+        if saved_pid and await sshx_process_alive(container, saved_pid):
+            if saved_url:
+                logger.info("Reusing SSHx session for %s (PID %s).", clean(container, 32), saved_pid)
+                return {"url": saved_url, "pid": saved_pid}
+
+        timeout = max(85.0, min(float(SSHX_TOTAL_TIMEOUT), 130.0))
+        try:
+            rc, out, err = await docker_exec(
+                container,
+                "bash",
+                "-lc",
+                SSHX_INSTALL_SCRIPT,
+                timeout=timeout,
+                retries=0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("SSHx launcher timeout for %s; recovering durable state.", clean(container, 32))
+            saved_url, saved_pid = await _read_sshx_state(container)
+            if saved_pid and await sshx_process_alive(container, saved_pid):
+                return {"url": saved_url or "", "pid": saved_pid}
+            return None
+        except Exception as exc:
+            logger.warning("SSHx launcher error for %s: %s", clean(container, 32), safe_log(exc))
+            return None
+
+        stdout = out.decode("utf-8", "replace")
+        stderr = err.decode("utf-8", "replace")
+        url = normalize_sshx_url(stdout + "\n" + stderr)
+        state_url, state_pid = await _read_sshx_state(container)
+        final_url = state_url or url
+        final_pid = state_pid
+
+        if final_pid and await sshx_process_alive(container, final_pid):
+            if final_url:
+                logger.info("SSHx ready for %s (PID %s).", clean(container, 32), final_pid)
+            else:
+                logger.info("SSHx running for %s (PID %s), but encrypted URL is not ready.", clean(container, 32), final_pid)
+            return {"url": final_url or "", "pid": final_pid}
+
+        detail = safe_log((stderr or stdout).strip() or f"exit={rc}", 2400)
+        logger.warning("SSHx launch failed for %s: %s", clean(container, 32), detail)
+        return None
+
+
+async def stop_sshx(container: str) -> None:
+    script = r"""
+set +e
+PID_FILE=/var/lib/rgnodes/sshx/sshx.pid
+if [ -s "$PID_FILE" ]; then
+  PID="$(cat "$PID_FILE" 2>/dev/null)"
+  case "$PID" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ -r "/proc/$PID/cmdline" ]; then
+        CMD="$(tr '\000' ' ' < "/proc/$PID/cmdline" 2>/dev/null || true)"
+        case "$CMD" in *sshx*) kill "$PID" 2>/dev/null || true; sleep 1; kill -9 "$PID" 2>/dev/null || true;; esac
+      fi
+      ;;
+  esac
+fi
+rm -f /var/lib/rgnodes/sshx/sshx.pid /var/lib/rgnodes/sshx/sshx.url
+"""
+    await docker_exec_shell(container, script, timeout=15)
+
+
+# ================================================================
+# Discord UI helpers — text/layout retained
+# ================================================================
+
+EMBED_COLOR = discord.Color.from_rgb(43, 45, 49)
+FOOTER = "⚡ RGNODES™ • VPS Management"
+RGNODES_BUILD = "2026.09.08-stable-deepfix-sshx-async"
+
+
+def make_embed(title: str, description: str | None = None) -> discord.Embed:
+    embed = discord.Embed(title=title, description=description, color=EMBED_COLOR, timestamp=discord.utils.utcnow())
+    embed.set_footer(text=FOOTER)
     return embed
 
 
-async def send_vm_summary(target: Any, vm: sqlite3.Row) -> None:
-    vm = await SERVICE.refresh_state(vm)
-    stats = await SERVICE.stats(vm)
-    embed = discord_embed(
-        f"🖥️ VM #{vm['id']} • {vm['name']}",
-        f"**{vm['status'].upper()}** • Backend `{vm['backend']}` • OS `{os_label(vm['os_type'])}`",
-    )
-    embed.add_field(name="Resources", value=f"RAM `{vm['ram']}` • vCPU `{vm['vcpu']}` • Disk `{vm['disk']}`", inline=False)
-    embed.add_field(name="Network", value=f"IP `{stats.get('ip','N/A')}`", inline=True)
-    embed.add_field(name="Abuse Guard", value=f"Score `{vm['abuse_score']}` • `{clean(vm['abuse_reason'] or 'clear', 300)}`", inline=True)
-    await target.send(embed=embed)
-
-
-if bot is not None:
-    @bot.event
-    async def on_ready() -> None:
-        try:
-            if DISCORD_GUILD_ID:
-                guild = discord.Object(id=DISCORD_GUILD_ID)
-                bot.tree.copy_global_to(guild=guild)
-                await bot.tree.sync(guild=guild)
-            else:
-                await bot.tree.sync()
-        except Exception:
-            logger.exception("Discord command sync failed")
-        await bot.change_presence(activity=discord.Game(name=f"{PREFIX}manage • VM Dashboard"))
-        logger.info("Discord ready as %s", bot.user)
-
-    @bot.tree.command(name="myvm", description="Open your newest RGNODES VM dashboard.")
-    async def myvm_slash(interaction: discord.Interaction) -> None:
-        await manage_slash(interaction, None)
-
-    @bot.tree.command(name="myvps", description="Compatibility alias for myvm.")
-    async def myvps_slash(interaction: discord.Interaction) -> None:
-        await manage_slash(interaction, None)
-
-    @bot.tree.command(name="vps-info", description="Show VM information.")
-    async def vps_info_slash(interaction: discord.Interaction, vm_identifier: str = "") -> None:
-        await manage_slash(interaction, vm_identifier)
-
-    @bot.tree.command(name="vps-stats", description="Show live VM statistics.")
-    async def vps_stats_slash(interaction: discord.Interaction, vm_identifier: str) -> None:
-        await interaction.response.defer(ephemeral=True)
-        vm = db_find_vm(vm_identifier, None if is_admin(interaction.user.id) else interaction.user.id)
-        if not vm:
-            await interaction.followup.send(embed=discord_embed("❌ VM Not Found"), ephemeral=True); return
-        await interaction.followup.send(embed=discord_embed("📊 VM Stats", json.dumps(await SERVICE.stats(vm), indent=2)), ephemeral=True)
-
-    @bot.tree.command(name="vps-uptime", description="Show VM uptime/status.")
-    async def vps_uptime_slash(interaction: discord.Interaction, vm_identifier: str) -> None:
-        await interaction.response.defer(ephemeral=True)
-        vm = db_find_vm(vm_identifier, None if is_admin(interaction.user.id) else interaction.user.id)
-        if not vm:
-            await interaction.followup.send("VM not found.", ephemeral=True); return
-        fresh = await SERVICE.refresh_state(vm)
-        await interaction.followup.send(embed=discord_embed("⏱️ VM Uptime", f"Status: `{fresh['status']}`"), ephemeral=True)
-
-    @bot.tree.command(name="restart-vps", description="Compatibility alias for restart.")
-    async def restart_vps_slash(interaction: discord.Interaction, vm_identifier: str) -> None:
-        await vm_action_slash(interaction, vm_identifier, "restart")
-
-    @bot.tree.command(name="console", description="Show VM console information.")
-    async def console_slash(interaction: discord.Interaction, vm_identifier: str) -> None:
-        await interaction.response.defer(ephemeral=True)
-        vm = db_find_vm(vm_identifier, None if is_admin(interaction.user.id) else interaction.user.id)
-        if not vm:
-            await interaction.followup.send("VM not found.", ephemeral=True); return
-        if vm['backend'] in {'kvm','qemu'}:
-            await interaction.followup.send(embed=discord_embed("🖥️ VM Console", "Use the authenticated dashboard for console and lifecycle operations. VNC/SPICE remains bound to localhost by design."), ephemeral=True)
-        else:
-            await interaction.followup.send(embed=discord_embed("🖥️ VM Console", "Console access is backend-dependent. Use the dashboard."), ephemeral=True)
-
-    @bot.tree.command(name="logs", description="View recent VM logs.")
-    async def logs_slash(interaction: discord.Interaction, vm_identifier: str) -> None:
-        await interaction.response.defer(ephemeral=True)
-        vm = db_find_vm(vm_identifier, None if is_admin(interaction.user.id) else interaction.user.id)
-        if not vm:
-            await interaction.followup.send("VM not found.", ephemeral=True); return
-        text = await SERVICE.backend_for(vm['backend']).logs(int(vm['id'])) if vm['backend'] in {'kvm','qemu'} else "Docker logs are available only from the local host/operator environment."
-        await interaction.followup.send(embed=discord_embed("📜 VM Logs", f"```text\n{clean(text, 3800)}\n```"), ephemeral=True)
-
-    @bot.tree.command(name="about", description="Show RGNODES VM Manager information.")
-    async def about_slash(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(embed=discord_embed("ℹ️ RGNODES™", f"Build: `{BUILD}`\nDashboard: `:{WEB_PORT}`\nPrimary backend: `{choose_backend()}`"), ephemeral=True)
-
-    @bot.tree.command(name="serverstats", description="Show host statistics.")
-    async def serverstats_slash(interaction: discord.Interaction) -> None:
-        load = os.getloadavg()[0] if hasattr(os, "getloadavg") else 0
-        await interaction.response.send_message(embed=discord_embed("📊 Server Statistics", f"OS: `{sys.platform}`\nCPU: `{os.cpu_count() or 1}`\nLoad: `{load:.2f}`\nRunning VMs: `{db_running_count()}`"), ephemeral=True)
-
-    @bot.tree.command(name="thresholds", description="Show resource/security thresholds.")
-    async def thresholds_slash(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(embed=discord_embed("📋 Thresholds", f"Per-user VMs: `{SERVER_LIMIT}`\nRunning limit: `{TOTAL_RUNNING_LIMIT}`\nAbuse scan: `{ABUSE_SCAN_INTERVAL}s`\nConnection threshold: `{ABUSE_CONN_THRESHOLD}`"), ephemeral=True)
-
-    @bot.tree.command(name="help", description="Show command help.")
-    async def help_slash(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(embed=discord_embed("📚 RGNODES™ Commands", f"`{PREFIX}deploy`, `{PREFIX}manage`, `{PREFIX}start`, `{PREFIX}stop`, `{PREFIX}restart`, `{PREFIX}remove`, `{PREFIX}list`, `{PREFIX}console`, `{PREFIX}vm-command`\nAdmin: `admin-manage`, `admin-ban`, `admin-unban`, `admin-create`, `add-slots`, `remove-all`, `admin-kill-all`"), ephemeral=True)
-
-    @bot.tree.command(name="ports", description="Show VM network/port information.")
-    async def ports_slash(interaction: discord.Interaction, vm_identifier: str) -> None:
-        await interaction.response.send_message(embed=discord_embed("🔌 Ports", "KVM/QEMU networking is managed by the libvirt network configured for this VM. Host port-forwarding is intentionally not exposed from the public dashboard."), ephemeral=True)
-
-    @bot.tree.command(name="port-add", description="Compatibility command for adding a port mapping.")
-    async def port_add_slash(interaction: discord.Interaction, vm_identifier: str, port: int) -> None:
-        await interaction.response.send_message(embed=discord_embed("🔌 Port Mapping", "Direct public port forwarding is disabled by default in the hardened KVM build. Configure a trusted libvirt/NAT or reverse proxy rule on the host."), ephemeral=True)
-
-    @bot.tree.command(name="port-remove", description="Compatibility command for removing a port mapping.")
-    async def port_remove_slash(interaction: discord.Interaction, port_id: int) -> None:
-        await interaction.response.send_message(embed=discord_embed("🔌 Port Mapping", "Port mapping is host-network configuration in this build."), ephemeral=True)
-
-    @bot.tree.command(name="share-user", description="Compatibility VPS sharing command.")
-    async def share_user_slash(interaction: discord.Interaction, vm_identifier: str, target_user: discord.User) -> None:
-        await interaction.response.send_message(embed=discord_embed("👥 Sharing", "Web dashboard accounts are administrator-scoped in this build; per-VM Discord delegation is intentionally not exposed."), ephemeral=True)
-
-    @bot.tree.command(name="unshare-user", description="Compatibility VPS unshare command.")
-    async def unshare_user_slash(interaction: discord.Interaction, vm_identifier: str, target_user: discord.User) -> None:
-        await interaction.response.send_message(embed=discord_embed("👥 Sharing", "No change was made."), ephemeral=True)
-
-    @bot.tree.command(name="share-ruser", description="Compatibility alias for unshare-user.")
-    async def share_ruser_slash(interaction: discord.Interaction, vm_identifier: str, target_user: discord.User) -> None:
-        await unshare_user_slash(interaction, vm_identifier, target_user)
-
-    @bot.tree.command(name="manage-shared", description="Compatibility command for shared VM management.")
-    async def manage_shared_slash(interaction: discord.Interaction, vm_identifier: str) -> None:
-        await interaction.response.send_message(embed=discord_embed("👥 Shared Access", "Shared access is disabled in the hardened build."), ephemeral=True)
-
-    @bot.tree.command(name="snapshot", description="Create a libvirt snapshot for a VM.")
-    async def snapshot_slash(interaction: discord.Interaction, vm_identifier: str, name: str) -> None:
-        await interaction.response.defer(ephemeral=True)
-        vm = db_find_vm(vm_identifier, None if is_admin(interaction.user.id) else interaction.user.id)
-        if not vm or vm['backend'] not in {'kvm','qemu'}:
-            await interaction.followup.send("KVM/QEMU VM not found.", ephemeral=True); return
-        ok, msg = await KVM.snapshot(int(vm['id']), name) if vm['backend']=='kvm' else await QEMU.snapshot(int(vm['id']), name)
-        await interaction.followup.send(embed=discord_embed("✅ Snapshot" if ok else "❌ Snapshot", msg), ephemeral=True)
-
-    @bot.tree.command(name="list-snapshots", description="List VM snapshots.")
-    async def list_snapshots_slash(interaction: discord.Interaction, vm_identifier: str) -> None:
-        await interaction.response.defer(ephemeral=True)
-        vm = db_find_vm(vm_identifier, None if is_admin(interaction.user.id) else interaction.user.id)
-        if not vm or vm['backend'] not in {'kvm','qemu'}:
-            await interaction.followup.send("KVM/QEMU VM not found.", ephemeral=True); return
-        snaps = await (KVM.snapshot_list(int(vm['id'])) if vm['backend']=='kvm' else QEMU.snapshot_list(int(vm['id'])))
-        await interaction.followup.send(embed=discord_embed("📸 Snapshots", "\n".join(snaps) or "No snapshots."), ephemeral=True)
-
-    @bot.tree.command(name="restore-snapshot", description="Restore a VM snapshot.")
-    async def restore_snapshot_slash(interaction: discord.Interaction, vm_identifier: str, name: str) -> None:
-        await interaction.response.defer(ephemeral=True)
-        vm = db_find_vm(vm_identifier, None if is_admin(interaction.user.id) else interaction.user.id)
-        if not vm or vm['backend'] not in {'kvm','qemu'}:
-            await interaction.followup.send("KVM/QEMU VM not found.", ephemeral=True); return
-        handler = KVM if vm['backend']=='kvm' else QEMU
-        ok, msg = await handler.snapshot_restore(int(vm['id']), name)
-        await interaction.followup.send(embed=discord_embed("✅ Snapshot Restored" if ok else "❌ Restore Failed", msg), ephemeral=True)
-
-    @bot.tree.command(name="admin-create", description="Admin: create a VM for another Discord user.")
-    async def admin_create_slash(interaction: discord.Interaction, target_user: discord.User, os_type: str, ram: str = DEFAULT_RAM, cpu: str = DEFAULT_CPU, disk: str = DEFAULT_DISK, backend: str = "auto") -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.", ephemeral=True); return
-        await interaction.response.defer(ephemeral=True)
-        result = await SERVICE.create(target_user.id, str(target_user), os_type, ram, cpu, disk, None, backend)
-        await interaction.followup.send(embed=discord_embed("✅ VM Created" if result.ok else "❌ Creation Failed", result.message), ephemeral=True)
-
-    @bot.tree.command(name="add-slots", description="Compatibility command for per-user slots.")
-    async def add_slots_slash(interaction: discord.Interaction, target_user: discord.User, amount: int = 1) -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.", ephemeral=True); return
-        await interaction.response.send_message(embed=discord_embed("🎟️ Slots", "The current DB uses SERVER_LIMIT as the per-user cap. Adjust SERVER_LIMIT in `.env` for this build."), ephemeral=True)
-
-    @bot.tree.command(name="admin-list", description="Admin: list all VMs.")
-    async def admin_list_slash(interaction: discord.Interaction) -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.", ephemeral=True); return
-        rows=db_get_vms(); text="\n".join(f"#{r['id']} {r['name']} • {r['backend']} • {r['status']}" for r in rows[:50]) or "No VMs."
-        await interaction.response.send_message(embed=discord_embed("🗂️ Admin • All VMs", text), ephemeral=True)
-
-    @bot.tree.command(name="admin-delete-user", description="Admin: delete a VM belonging to a user.")
-    async def admin_delete_user_slash(interaction: discord.Interaction, target_user: discord.User, vm_identifier: str) -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.", ephemeral=True); return
-        await interaction.response.defer(ephemeral=True)
-        vm=db_find_vm(vm_identifier,target_user.id)
-        if not vm:
-            await interaction.followup.send("VM not found.",ephemeral=True); return
-        result=await SERVICE.action(vm,"delete",str(interaction.user.id))
-        await interaction.followup.send(embed=discord_embed("✅ Deleted" if result.ok else "❌ Failed",result.message),ephemeral=True)
-
-    @bot.tree.command(name="admin-list-users", description="Admin: list users and VM counts.")
-    async def admin_list_users_slash(interaction: discord.Interaction) -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.", ephemeral=True); return
-        rows=db_get_vms(); owners={}
-        for r in rows: owners[int(r['owner_id'])]=owners.get(int(r['owner_id']),0)+1
-        text="\n".join(f"<@{uid}> • {count} VM(s)" for uid,count in sorted(owners.items(),key=lambda x:-x[1])) or "No users."
-        await interaction.response.send_message(embed=discord_embed("👥 Admin • Users",text),ephemeral=True)
-
-    @bot.tree.command(name="admin-stats", description="Admin: show VM statistics.")
-    async def admin_stats_slash(interaction: discord.Interaction) -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.", ephemeral=True); return
-        await interaction.response.send_message(embed=discord_embed("📊 Admin • Statistics",f"VMs: `{len(db_get_vms())}`\nRunning: `{db_running_count()}`\nKVM available: `{detect_kvm()}`"),ephemeral=True)
-
-    @bot.tree.command(name="admin-vps-info", description="Admin: inspect one VM.")
-    async def admin_vps_info_slash(interaction: discord.Interaction, vm_id: int) -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.", ephemeral=True); return
-        vm=db_get_vm(vm_id)
-        await interaction.response.send_message(embed=discord_embed("🖥️ Admin VM Info",json.dumps(dict(vm),indent=2) if vm else "VM not found."),ephemeral=True)
-
-    @bot.tree.command(name="admin-logs", description="Admin: inspect VM logs.")
-    async def admin_logs_slash(interaction: discord.Interaction, vm_id: int) -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.", ephemeral=True); return
-        vm=db_get_vm(vm_id)
-        if not vm: await interaction.response.send_message("VM not found.",ephemeral=True); return
-        text=await SERVICE.backend_for(vm['backend']).logs(vm_id) if vm['backend'] in {'kvm','qemu'} else "Not available."
-        await interaction.response.send_message(embed=discord_embed("📜 Admin Logs",f"```text\n{clean(text,3800)}\n```"),ephemeral=True)
-
-    @bot.tree.command(name="admin-kill-all", description="Admin: stop all running VMs.")
-    async def admin_kill_all_slash(interaction: discord.Interaction) -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.",ephemeral=True); return
-        await interaction.response.defer(ephemeral=True)
-        stopped=0
-        for vm in db_get_vms():
-            if vm['status']=='running':
-                r=await SERVICE.action(vm,'stop',str(interaction.user.id)); stopped += int(r.ok)
-        await interaction.followup.send(embed=discord_embed("🛑 Kill All",f"Stopped `{stopped}` VM(s)."),ephemeral=True)
-
-    @bot.tree.command(name="remove-all", description="Admin: delete every managed VM.")
-    async def remove_all_slash(interaction: discord.Interaction, confirm: bool = False) -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.",ephemeral=True); return
-        if not confirm:
-            await interaction.response.send_message("Set `confirm:true` to permanently delete all managed VMs.",ephemeral=True); return
-        await interaction.response.defer(ephemeral=True)
-        removed=0
-        for vm in list(db_get_vms()):
-            r=await SERVICE.action(vm,'delete',str(interaction.user.id)); removed += int(r.ok)
-        await interaction.followup.send(embed=discord_embed("✅ Remove All",f"Removed `{removed}` VM(s)."),ephemeral=True)
-
-    @bot.tree.command(name="set-status", description="Admin: set Discord bot presence.")
-    async def set_status_slash(interaction: discord.Interaction, status_type: str, name: str) -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.",ephemeral=True); return
-        kind=status_type.lower()
-        activity=discord.Game(name=name) if kind=='playing' else discord.Activity(type=getattr(discord.ActivityType,kind,discord.ActivityType.playing),name=name)
-        await bot.change_presence(activity=activity)
-        await interaction.response.send_message(embed=discord_embed("✅ Status Updated",f"`{kind}` • `{name}`"),ephemeral=True)
-
-    @bot.tree.command(name="install-system", description="Admin: install required host virtualization/runtime packages.")
-    async def install_system_slash(interaction: discord.Interaction, confirm: bool = False) -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.",ephemeral=True); return
-        if not confirm:
-            await interaction.response.send_message("Set `confirm:true` to run the host dependency installer.",ephemeral=True); return
-        await interaction.response.defer(ephemeral=True)
-        ok,msg=await install_host_dependencies()
-        await interaction.followup.send(embed=discord_embed("✅ Host Bootstrap" if ok else "⚠️ Host Bootstrap",msg),ephemeral=True)
-
-    @bot.tree.command(name="ping", description="Check bot latency.")
-    async def ping_slash(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(embed=discord_embed("🏓 Pong", f"Latency: `{round(bot.latency*1000)}ms`"), ephemeral=True)
-
-    @bot.tree.command(name="start", description="Start a VM.")
-    async def start_slash(interaction: discord.Interaction, vm_identifier: str) -> None:
-        await vm_action_slash(interaction, vm_identifier, "start")
-
-    @bot.tree.command(name="stop", description="Stop a VM.")
-    async def stop_slash(interaction: discord.Interaction, vm_identifier: str) -> None:
-        await vm_action_slash(interaction, vm_identifier, "stop")
-
-    @bot.tree.command(name="restart", description="Restart a VM.")
-    async def restart_slash(interaction: discord.Interaction, vm_identifier: str) -> None:
-        await vm_action_slash(interaction, vm_identifier, "restart")
-
-    @bot.tree.command(name="remove", description="Delete a VM.")
-    async def remove_slash(interaction: discord.Interaction, vm_identifier: str) -> None:
-        await vm_action_slash(interaction, vm_identifier, "delete")
-
-    @bot.tree.command(name="sshx", description="Compatibility alias for secure console access.")
-    async def sshx_slash(interaction: discord.Interaction, vm_identifier: str) -> None:
-        await console_slash(interaction, vm_identifier)
-
-    @bot.tree.command(name="deploy", description="Create a new RGNODES VM.")
-    @app_commands.describe(os_type="Guest OS", ram="RAM e.g. 4G", cpu="vCPU count", disk="Disk e.g. 20G", backend="auto/kvm/qemu/docker", name="VM name")
-    async def deploy_slash(interaction: discord.Interaction, os_type: str, ram: str = DEFAULT_RAM, cpu: str = DEFAULT_CPU, disk: str = DEFAULT_DISK, backend: str = "auto", name: str = "") -> None:
-        await interaction.response.defer(ephemeral=True)
-        result = await SERVICE.create(interaction.user.id, str(interaction.user), os_type, ram, cpu, disk, name or None, backend)
-        if result.ok and result.vm:
-            await send_vm_summary(interaction.followup, result.vm)
-        else:
-            await interaction.followup.send(embed=discord_embed("❌ VM Creation Failed", result.message), ephemeral=True)
-
-    @bot.tree.command(name="manage", description="Manage one of your VMs.")
-    async def manage_slash(interaction: discord.Interaction, vm_identifier: str = "") -> None:
-        await interaction.response.defer(ephemeral=True)
-        vm = db_find_vm(vm_identifier, None if is_admin(interaction.user.id) else interaction.user.id)
-        if not vm:
-            await interaction.followup.send(embed=discord_embed("❌ VM Not Found", "No matching VM was found."), ephemeral=True)
-            return
-        await send_vm_summary(interaction.followup, vm)
-
-    @bot.tree.command(name="vm-action", description="Start/stop/restart/delete one of your VMs.")
-    @app_commands.choices(action=[app_commands.Choice(name=x.title(), value=x) for x in ("start", "stop", "restart", "delete")])
-    async def vm_action_slash(interaction: discord.Interaction, vm_identifier: str, action: str) -> None:
-        await interaction.response.defer(ephemeral=True)
-        vm = db_find_vm(vm_identifier, None if is_admin(interaction.user.id) else interaction.user.id)
-        if not vm:
-            await interaction.followup.send(embed=discord_embed("❌ VM Not Found"), ephemeral=True)
-            return
-        result = await SERVICE.action(vm, action, str(interaction.user.id))
-        await interaction.followup.send(embed=discord_embed("✅ Done" if result.ok else "❌ Failed", result.message), ephemeral=True)
-
-    @bot.tree.command(name="list", description="List your VMs.")
-    async def list_slash(interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        rows = db_get_vms(None if is_admin(interaction.user.id) else interaction.user.id)
-        embed = discord_embed("📋 RGNODES™ • VMs", "")
-        if not rows:
-            embed.description = "No VMs found."
-        for vm in rows[:25]:
-            embed.add_field(name=f"#{vm['id']} • {vm['name']}", value=f"`{vm['status']}` • `{vm['backend']}` • `{os_label(vm['os_type'])}` • `{vm['ram']}` / `{vm['vcpu']}vCPU` / `{vm['disk']}`", inline=False)
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-    @bot.tree.command(name="admin-ban", description="Admin: block VM creation for a user.")
-    async def admin_ban_slash(interaction: discord.Interaction, target_user: discord.User, reason: str = "policy violation") -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.", ephemeral=True)
-            return
-        db_set_ban(target_user.id, True, reason)
-        db_audit(str(interaction.user.id), "ban", str(target_user.id), reason)
-        await interaction.response.send_message(embed=discord_embed("✅ User Banned", f"<@{target_user.id}> cannot create VMs."), ephemeral=True)
-
-    @bot.tree.command(name="admin-unban", description="Admin: restore VM creation for a user.")
-    async def admin_unban_slash(interaction: discord.Interaction, target_user: discord.User) -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.", ephemeral=True)
-            return
-        db_set_ban(target_user.id, False)
-        db_audit(str(interaction.user.id), "unban", str(target_user.id))
-        await interaction.response.send_message(embed=discord_embed("✅ User Unbanned", f"<@{target_user.id}> may create VMs again."), ephemeral=True)
-
-    @bot.tree.command(name="admin-manage", description="Admin: control any VM.")
-    @app_commands.choices(action=[app_commands.Choice(name=x.title(), value=x) for x in ("start", "stop", "restart", "delete", "suspend", "unsuspend")])
-    async def admin_manage_slash(interaction: discord.Interaction, vm_id: int, action: str) -> None:
-        if not is_admin(interaction.user.id):
-            await interaction.response.send_message("Administrator access is required.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
-        vm = db_get_vm(vm_id)
-        if not vm:
-            await interaction.followup.send("VM not found.", ephemeral=True)
-            return
-        if action == "suspend":
-            result = await SERVICE.suspend(vm, str(interaction.user.id), "admin suspension")
-        elif action == "unsuspend":
-            result = await SERVICE.unsuspend(vm, str(interaction.user.id))
-        else:
-            result = await SERVICE.action(vm, action, str(interaction.user.id))
-        await interaction.followup.send(embed=discord_embed("✅ Done" if result.ok else "❌ Failed", result.message), ephemeral=True)
-
-    @bot.command(name="ping")
-    async def prefix_ping(ctx: commands.Context) -> None:
-        await ctx.send(embed=discord_embed("🏓 Pong", f"Latency: `{round(bot.latency*1000)}ms`"))
-
-    @bot.command(name="about")
-    async def prefix_about(ctx: commands.Context) -> None:
-        await ctx.send(embed=discord_embed("ℹ️ RGNODES™", f"Build: `{BUILD}` • Dashboard `:{WEB_PORT}` • Backend `{choose_backend()}`"))
-
-    @bot.command(name="uptime", aliases=["vps-uptime"])
-    async def prefix_uptime(ctx: commands.Context, vm_identifier: str = "") -> None:
-        vm=db_find_vm(vm_identifier,None if is_admin(ctx.author.id) else ctx.author.id)
-        if not vm: await ctx.send(embed=discord_embed("❌ VM Not Found")); return
-        vm=await SERVICE.refresh_state(vm)
-        await ctx.send(embed=discord_embed("⏱️ VM Status",f"`{vm['status']}` • `{vm['backend']}`"))
-
-    @bot.command(name="vpsinfo", aliases=["vps-info"])
-    async def prefix_vpsinfo(ctx: commands.Context, vm_identifier: str = "") -> None:
-        vm=db_find_vm(vm_identifier,None if is_admin(ctx.author.id) else ctx.author.id)
-        await ctx.send(embed=discord_embed("🖥️ VM Info",json.dumps(dict(vm),indent=2) if vm else "VM not found."))
-
-    @bot.command(name="vps-stats")
-    async def prefix_vps_stats(ctx: commands.Context, vm_identifier: str = "") -> None:
-        vm=db_find_vm(vm_identifier,None if is_admin(ctx.author.id) else ctx.author.id)
-        if not vm: await ctx.send(embed=discord_embed("❌ VM Not Found")); return
-        await ctx.send(embed=discord_embed("📊 VM Stats",json.dumps(await SERVICE.stats(vm),indent=2)))
-
-    @bot.command(name="restart-vps")
-    async def prefix_restart_vps(ctx: commands.Context, vm_identifier: str = "") -> None:
-        await prefix_action(ctx,vm_identifier,"restart")
-
-    @bot.command(name="console")
-    async def prefix_console(ctx: commands.Context, vm_identifier: str = "") -> None:
-        vm=db_find_vm(vm_identifier,None if is_admin(ctx.author.id) else ctx.author.id)
-        await ctx.send(embed=discord_embed("🖥️ VM Console","Use the authenticated dashboard for secure console/lifecycle management." if vm else "VM not found."))
-
-    @bot.command(name="logs")
-    async def prefix_logs(ctx: commands.Context, vm_identifier: str = "") -> None:
-        vm=db_find_vm(vm_identifier,None if is_admin(ctx.author.id) else ctx.author.id)
-        if not vm: await ctx.send(embed=discord_embed("❌ VM Not Found")); return
-        text=await SERVICE.backend_for(vm['backend']).logs(int(vm['id'])) if vm['backend'] in {'kvm','qemu'} else "Logs unavailable."
-        await ctx.send(embed=discord_embed("📜 VM Logs",f"```text\n{clean(text,3800)}\n```"))
-
-    @bot.command(name="help")
-    async def prefix_help(ctx: commands.Context) -> None:
-        await ctx.send(embed=discord_embed("📚 RGNODES™ Commands",f"`{PREFIX}deploy`, `{PREFIX}manage`, `{PREFIX}list`, `{PREFIX}start`, `{PREFIX}stop`, `{PREFIX}restart`, `{PREFIX}remove`, `{PREFIX}console`, `{PREFIX}logs`, `{PREFIX}ports`, `{PREFIX}vm-command`\nAdmin commands remain available."))
-
-    @bot.command(name="snapshot")
-    async def prefix_snapshot(ctx: commands.Context, vm_identifier: str = "", name: str = "snapshot") -> None:
-        vm=db_find_vm(vm_identifier,None if is_admin(ctx.author.id) else ctx.author.id)
-        if not vm or vm['backend'] not in {'kvm','qemu'}:
-            await ctx.send("KVM/QEMU VM not found."); return
-        handler=KVM if vm['backend']=='kvm' else QEMU
-        ok,msg=await handler.snapshot(int(vm['id']),name)
-        await ctx.send(embed=discord_embed("✅ Snapshot" if ok else "❌ Snapshot",msg))
-
-    @bot.command(name="list-snapshots")
-    async def prefix_list_snapshots(ctx: commands.Context, vm_identifier: str = "") -> None:
-        vm=db_find_vm(vm_identifier,None if is_admin(ctx.author.id) else ctx.author.id)
-        if not vm or vm['backend'] not in {'kvm','qemu'}: await ctx.send("KVM/QEMU VM not found."); return
-        handler=KVM if vm['backend']=='kvm' else QEMU
-        snaps=await handler.snapshot_list(int(vm['id']))
-        await ctx.send(embed=discord_embed("📸 Snapshots","\n".join(snaps) or "No snapshots."))
-
-    @bot.command(name="restore-snapshot")
-    async def prefix_restore_snapshot(ctx: commands.Context, vm_identifier: str, name: str) -> None:
-        vm=db_find_vm(vm_identifier,None if is_admin(ctx.author.id) else ctx.author.id)
-        if not vm or vm['backend'] not in {'kvm','qemu'}: await ctx.send("KVM/QEMU VM not found."); return
-        handler=KVM if vm['backend']=='kvm' else QEMU
-        ok,msg=await handler.snapshot_restore(int(vm['id']),name)
-        await ctx.send(embed=discord_embed("✅ Restored" if ok else "❌ Restore Failed",msg))
-
-    @bot.command(name="ports")
-    async def prefix_ports(ctx: commands.Context, vm_identifier: str = "") -> None:
-        await ctx.send(embed=discord_embed("🔌 Ports","Use the libvirt network or reverse proxy configured on the host. Public arbitrary forwarding is disabled by default."))
-
-    @bot.command(name="serverstats")
-    async def prefix_serverstats(ctx: commands.Context) -> None:
-        load=os.getloadavg()[0] if hasattr(os,'getloadavg') else 0
-        await ctx.send(embed=discord_embed("📊 Server Statistics",f"CPU: `{os.cpu_count() or 1}` • Load: `{load:.2f}` • Running: `{db_running_count()}` • KVM: `{detect_kvm()}`"))
-
-    @bot.command(name="thresholds")
-    async def prefix_thresholds(ctx: commands.Context) -> None:
-        await ctx.send(embed=discord_embed("📋 Thresholds",f"Per-user VM limit: `{SERVER_LIMIT}` • Running limit: `{TOTAL_RUNNING_LIMIT}` • Abuse interval: `{ABUSE_SCAN_INTERVAL}s`"))
-
-    @bot.command(name="set-status")
-    async def prefix_set_status(ctx: commands.Context, status_type: str, *, name: str) -> None:
-        if not is_admin(ctx.author.id): await ctx.send("Administrator access is required."); return
-        activity=discord.Game(name=name) if status_type.lower()=='playing' else discord.Activity(type=getattr(discord.ActivityType,status_type.lower(),discord.ActivityType.playing),name=name)
-        await bot.change_presence(activity=activity)
-        await ctx.send(embed=discord_embed("✅ Status Updated",f"`{status_type}` • `{name}`"))
-
-    @bot.command(name="share-user")
-    async def prefix_share_user(ctx: commands.Context, target_user: discord.User, vm_identifier: str) -> None:
-        await ctx.send(embed=discord_embed("👥 Sharing","Shared Discord access is disabled in the hardened build."))
-
-    @bot.command(name="share-ruser", aliases=["unshare-user"])
-    async def prefix_share_ruser(ctx: commands.Context, target_user: discord.User, vm_identifier: str) -> None:
-        await ctx.send(embed=discord_embed("👥 Sharing","No change was made."))
-
-    @bot.command(name="manage-shared")
-    async def prefix_manage_shared(ctx: commands.Context, vm_identifier: str = "") -> None:
-        await ctx.send(embed=discord_embed("👥 Shared Access","Shared access is disabled in the hardened build."))
-
-    @bot.command(name="admin-list")
-    async def prefix_admin_list(ctx: commands.Context) -> None:
-        if not is_admin(ctx.author.id): await ctx.send("Administrator access is required."); return
-        text="\n".join(f"#{v['id']} {v['name']} • {v['backend']} • {v['status']}" for v in db_get_vms()[:50]) or "No VMs."
-        await ctx.send(embed=discord_embed("🗂️ Admin • All VMs",text))
-
-    @bot.command(name="admin-stats")
-    async def prefix_admin_stats(ctx: commands.Context) -> None:
-        if not is_admin(ctx.author.id): await ctx.send("Administrator access is required."); return
-        await ctx.send(embed=discord_embed("📊 Admin • Stats",f"VMs: `{len(db_get_vms())}` • Running: `{db_running_count()}` • KVM: `{detect_kvm()}`"))
-
-    @bot.command(name="admin-ban")
-    async def prefix_admin_ban(ctx: commands.Context, target_user: discord.User, *, reason: str = "policy violation") -> None:
-        if not is_admin(ctx.author.id): await ctx.send("Administrator access is required."); return
-        db_set_ban(target_user.id,True,reason); db_audit(str(ctx.author.id),'ban',str(target_user.id),reason)
-        await ctx.send(embed=discord_embed("✅ User Banned",f"<@{target_user.id}>: `{reason}`"))
-
-    @bot.command(name="admin-unban")
-    async def prefix_admin_unban(ctx: commands.Context, target_user: discord.User) -> None:
-        if not is_admin(ctx.author.id): await ctx.send("Administrator access is required."); return
-        db_set_ban(target_user.id,False); db_audit(str(ctx.author.id),'unban',str(target_user.id))
-        await ctx.send(embed=discord_embed("✅ User Unbanned",f"<@{target_user.id}> may create VMs again."))
-
-    @bot.command(name="deploy")
-    async def prefix_deploy(ctx: commands.Context, os_type: str | None = None, ram: str = DEFAULT_RAM, cpu: str = DEFAULT_CPU, disk: str = DEFAULT_DISK, backend: str = "auto", *, name: str = "") -> None:
-        if not os_type:
-            await ctx.send(embed=discord_embed("🚀 Deploy VM", f"Usage: `{PREFIX}deploy <os> [ram] [cpu] [disk] [backend] [name]`\nExample: `{PREFIX}deploy ubuntu-24.04 4G 2 20G kvm my-vm`"))
-            return
-        msg = await ctx.send(embed=discord_embed("⏳ Creating VM", "Provisioning safely; this may take a little time."))
-        result = await SERVICE.create(ctx.author.id, str(ctx.author), os_type, ram, cpu, disk, name or None, backend)
-        if result.ok and result.vm:
-            await msg.edit(embed=discord_embed("✅ VM Ready", result.message))
-            await send_vm_summary(ctx, result.vm)
-        else:
-            await msg.edit(embed=discord_embed("❌ VM Creation Failed", result.message))
-
-    @bot.command(name="manage", aliases=["myvps", "myvm"])
-    async def prefix_manage(ctx: commands.Context, vm_identifier: str = "") -> None:
-        vm = db_find_vm(vm_identifier, None if is_admin(ctx.author.id) else ctx.author.id)
-        if not vm:
-            await ctx.send(embed=discord_embed("❌ VM Not Found", f"Use `{PREFIX}list` to see your VMs."))
-            return
-        await send_vm_summary(ctx, vm)
-
-    @bot.command(name="list")
-    async def prefix_list(ctx: commands.Context) -> None:
-        rows = db_get_vms(None if is_admin(ctx.author.id) else ctx.author.id)
-        text = "\n".join(f"#{r['id']} • `{r['status']}` • `{r['backend']}` • {r['name']}" for r in rows[:25]) or "No VMs found."
-        await ctx.send(embed=discord_embed("📋 RGNODES™ • VMs", text))
-
-    @bot.command(name="start")
-    async def prefix_start(ctx: commands.Context, vm_identifier: str = "") -> None:
-        await prefix_action(ctx, vm_identifier, "start")
-
-    @bot.command(name="stop")
-    async def prefix_stop(ctx: commands.Context, vm_identifier: str = "") -> None:
-        await prefix_action(ctx, vm_identifier, "stop")
-
-    @bot.command(name="restart")
-    async def prefix_restart(ctx: commands.Context, vm_identifier: str = "") -> None:
-        await prefix_action(ctx, vm_identifier, "restart")
-
-    @bot.command(name="remove")
-    async def prefix_remove(ctx: commands.Context, vm_identifier: str = "") -> None:
-        await prefix_action(ctx, vm_identifier, "delete")
-
-    @bot.command(name="vm-command")
-    async def prefix_vm_command(ctx: commands.Context, *, command_text: str) -> None:
-        if not is_admin(ctx.author.id):
-            await ctx.send(embed=discord_embed("❌ Permission Denied", "Administrator access is required for the VM command console."))
-            return
-        parts = shlex.split(command_text)
-        if not parts:
-            await ctx.send(f"Usage: `{PREFIX}vm-command status <vmid>`")
-            return
-        action = parts[0].lower()
-        if action == "status" and len(parts) >= 2 and parts[1].isdigit():
-            vm = db_get_vm(int(parts[1]))
-            if not vm:
-                await ctx.send("VM not found.")
-                return
-            data = await SERVICE.stats(vm)
-            await ctx.send(f"```json\n{json.dumps(data, indent=2)}\n```")
-            return
-        await ctx.send(embed=discord_embed("❌ Invalid Command", "Only safe management actions are supported. No arbitrary host shell commands are exposed."))
-
-    async def prefix_action(ctx: commands.Context, identifier: str, action: str) -> None:
-        vm = db_find_vm(identifier, None if is_admin(ctx.author.id) else ctx.author.id)
-        if not vm:
-            await ctx.send(embed=discord_embed("❌ VM Not Found"))
-            return
-        result = await SERVICE.action(vm, action, str(ctx.author.id))
-        await ctx.send(embed=discord_embed("✅ Done" if result.ok else "❌ Failed", result.message))
-
-else:
-    prefix_action = None  # pragma: no cover
-
-
-async def system_cmd(*args: str, timeout: float = 180.0) -> tuple[int, str, str]:
-    return await run_process(*args, timeout=timeout)
-
-
-async def install_host_dependencies() -> tuple[bool, str]:
-    """Best-effort Debian/Ubuntu host bootstrap for VM dependencies.
-    This never executes arbitrary user-supplied package names or commands.
-    """
-    if not sys.platform.startswith('linux'):
-        return False, 'Automatic host bootstrap is supported only on Linux.'
-    if hasattr(os, 'geteuid') and os.geteuid() != 0:
-        return False, 'Root privileges are required for host dependency installation.'
-    if not command_available('apt-get'):
-        return False, 'apt-get is unavailable; install the virtualization stack manually.'
-    packages = [
-        'software-properties-common','ca-certificates','curl','apt-transport-https','gnupg',
-        'tar','unzip','git','mariadb-server','redis-server','nginx','certbot',
-        'python3-certbot-nginx','qemu-kvm','qemu-utils','libvirt-daemon-system',
-        'libvirt-clients','virtinst','bridge-utils','ovmf','cloud-image-utils','xorriso','genisoimage',
-        'qemu-guest-agent','socat'
-    ]
-    rc, out, err = await system_cmd('apt-get','update','-y',timeout=600)
-    if rc != 0: return False, 'apt-get update failed: ' + clean(err or out, 1200)
-    rc, out, err = await system_cmd('apt-get','full-upgrade','-y',timeout=1800)
-    if rc != 0: return False, 'apt full-upgrade failed: ' + clean(err or out, 1200)
-    rc, out, err = await system_cmd('apt-get','install','-y','--no-install-recommends',*packages,timeout=1800)
-    if rc != 0: return False, 'Dependency installation failed: ' + clean(err or out, 1800)
-    for unit in ('docker','libvirtd','ssh','mariadb','redis-server','nginx'):
-        await system_cmd('systemctl','enable','--now',unit,timeout=90)
-    if command_available('docker'):
-        await system_cmd('docker','compose','version',timeout=30)
-    return True, 'Host dependencies installed/verified: Docker/KVM/libvirt/QEMU/SSHx prerequisites/Node tooling prerequisites.'
-
-# ============================================================================
-# Bootstrap / shutdown
-# ============================================================================
-
-STOP_EVENT = asyncio.Event()
-WEB_RUNNER: web.AppRunner | None = None  # type: ignore[union-attr]
-
-
-def acquire_pid_lock() -> Any:
-    lock_path = Path(os.getenv("LOCK_FILE", "/tmp/rgnodes-vm-manager.lock"))
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = lock_path.open("a+")
+def slot_status_text(user_id: int) -> str:
+    """Return the real persisted slot allocation and current usage."""
     try:
-        import fcntl
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (BlockingIOError, ImportError):
-        handle.close()
-        raise RuntimeError("Another RGNODES VM Manager process is already running.")
-    handle.seek(0)
-    handle.truncate()
-    handle.write(str(os.getpid()))
-    handle.flush()
-    return handle
+        used = max(0, int(db_vps_count(int(user_id))))
+        limit = max(1, int(db_effective_slots(int(user_id))))
+    except Exception:
+        used, limit = 0, max(1, int(SERVER_LIMIT))
+    remaining = max(0, limit - used)
+    if remaining == 0:
+        return f"`{used}/{limit}` used • **SLOTS FULL**"
+    return f"`{used}/{limit}` used • `{remaining}` available"
 
 
-async def shutdown() -> None:
-    STOP_EVENT.set()
-    global WEB_RUNNER
-    if WEB_RUNNER is not None:
-        await WEB_RUNNER.cleanup()
-        WEB_RUNNER = None
-    if bot is not None and not bot.is_closed():
-        await bot.close()
+def status_text(status: str, suspended: bool = False) -> str:
+    if suspended:
+        return "⛔ SUSPENDED"
+    return {"running": "🟢 RUNNING", "stopped": "🔴 STOPPED", "created": "🟡 CREATED", "starting": "🟡 STARTING", "restarting": "🟡 RESTARTING"}.get(status, "⚪ " + clean(status).upper())
+
+
+def is_unknown_interaction(exc: BaseException) -> bool:
+    return isinstance(exc, discord.NotFound) and getattr(exc, "code", None) == 10062
+
+
+async def safe_defer(interaction: discord.Interaction, ephemeral: bool = False, *, claim: bool = True) -> bool:
+    """Defer the original interaction response, optionally claiming it for de-duplication."""
+    if claim and not await claim_interaction_once(interaction):
+        return False
+    if interaction.response.is_done():
+        return True
+    try:
+        await interaction.response.defer(ephemeral=ephemeral, thinking=True)
+        return True
+    except discord.InteractionResponded:
+        return True
+    except discord.NotFound as exc:
+        if is_unknown_interaction(exc):
+            logger.debug("Ignoring expired interaction during defer (10062).")
+            return False
+        logger.warning("Interaction defer failed: %s", safe_log(exc))
+        return False
+    except discord.HTTPException as exc:
+        logger.warning("Interaction defer failed: %s", safe_log(exc))
+        return False
+
+
+async def safe_edit_original(
+    interaction: discord.Interaction,
+    *,
+    embed: discord.Embed,
+    view: discord.ui.View | None = None,
+) -> bool:
+    try:
+        await asyncio.wait_for(
+            interaction.edit_original_response(embed=embed, view=view),
+            timeout=DISCORD_API_TIMEOUT,
+        )
+        return True
+    except discord.NotFound as exc:
+        if is_unknown_interaction(exc):
+            if not INTERACTION_LOG_UNKNOWN_AS_DEBUG:
+                return False
+            logger.debug("Ignoring expired interaction while editing original response (10062).")
+            return False
+        logger.warning("Interaction edit failed: %s", safe_log(exc))
+        return False
+    except (asyncio.TimeoutError, discord.HTTPException, TypeError) as exc:
+        logger.warning("Interaction edit failed: %s", safe_log(exc))
+        return False
+
+
+async def safe_followup(
+    interaction: discord.Interaction,
+    *,
+    embed: discord.Embed,
+    view: discord.ui.View | None = None,
+    ephemeral: bool = True,
+) -> bool:
+    """Finish an interaction without ever creating a second response message."""
+    if interaction.response.is_done():
+        return await safe_edit_original(interaction, embed=embed, view=view)
+    if not await claim_interaction_once(interaction):
+        return False
+    try:
+        await asyncio.wait_for(
+            interaction.response.send_message(embed=embed, view=view, ephemeral=ephemeral),
+            timeout=DISCORD_API_TIMEOUT,
+        )
+        return True
+    except discord.NotFound as exc:
+        if is_unknown_interaction(exc):
+            logger.debug("Ignoring expired interaction while responding (10062).")
+            return False
+        logger.warning("Interaction response failed: %s", safe_log(exc))
+        return False
+    except (asyncio.TimeoutError, discord.HTTPException) as exc:
+        logger.warning("Interaction response failed: %s", safe_log(exc))
+        return False
+
+
+async def safe_respond(interaction: discord.Interaction, *, embed: discord.Embed, ephemeral: bool = True, view: discord.ui.View | None = None) -> bool:
+    """Send/edit the single response owned by this interaction."""
+    if not interaction.response.is_done():
+        if not await claim_interaction_once(interaction):
+            return False
+        try:
+            kwargs: dict[str, Any] = {"embed": embed, "ephemeral": ephemeral}
+            if view is not None:
+                kwargs["view"] = view
+            await asyncio.wait_for(
+                interaction.response.send_message(**kwargs),
+                timeout=DISCORD_API_TIMEOUT,
+            )
+            return True
+        except discord.NotFound as exc:
+            if is_unknown_interaction(exc):
+                logger.debug("Ignoring expired interaction response (10062).")
+                return False
+            logger.warning("Response failed: %s", safe_log(exc))
+            return False
+        except (asyncio.TimeoutError, discord.HTTPException) as exc:
+            logger.warning("Response failed: %s", safe_log(exc))
+            return False
+    return await safe_edit_original(interaction, embed=embed, view=view)
+
+
+async def safe_component_edit(
+    interaction: discord.Interaction,
+    *,
+    embed: discord.Embed,
+    view: discord.ui.View | None = None,
+) -> bool:
+    """Edit the source component message exactly once for this interaction."""
+    if not interaction.response.is_done():
+        if not await claim_interaction_once(interaction):
+            return False
+        try:
+            await asyncio.wait_for(
+                interaction.response.edit_message(embed=embed, view=view),
+                timeout=DISCORD_API_TIMEOUT,
+            )
+            return True
+        except discord.NotFound as exc:
+            if is_unknown_interaction(exc):
+                logger.debug("Ignoring expired component interaction (10062).")
+                return False
+            logger.warning("Component edit failed: %s", safe_log(exc))
+            return False
+        except (asyncio.TimeoutError, discord.HTTPException) as exc:
+            logger.warning("Component edit failed: %s", safe_log(exc))
+            return False
+    return await safe_edit_original(interaction, embed=embed, view=view)
+
+
+async def safe_dm(user: discord.User | discord.Member, embed: discord.Embed, view: discord.ui.View | None = None) -> bool:
+    try:
+        kwargs: dict[str, Any] = {"embed": embed}
+        if view is not None:
+            kwargs["view"] = view
+        await asyncio.wait_for(user.send(**kwargs), timeout=DISCORD_API_TIMEOUT)
+        return True
+    except discord.Forbidden:
+        return False
+    except (asyncio.TimeoutError, discord.HTTPException) as exc:
+        logger.warning("DM failed: %s", safe_log(exc))
+        return False
+
+
+def sshx_view(url: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=900)
+    view.add_item(discord.ui.Button(label="Click to Open", emoji="🌐", style=discord.ButtonStyle.link, url=url))
+    return view
+
+
+def console_embed(vps_name: str, url: str, ipv4: str | None = None, location: str | None = None) -> discord.Embed:
+    embed = make_embed("✨ RGNODES™ • 🌐 SSHx Access", "Your private web SSH console is ready.")
+    embed.add_field(name="🖥️ VPS", value=f"`{clean(vps_name)}`", inline=False)
+    if valid_public_ipv4(ipv4):
+        embed.add_field(name="🌐 Verified IPv4", value=f"`{ipv4}`", inline=True)
+    if location:
+        embed.add_field(name="🌍 Node", value=clean(location, 80), inline=True)
+    embed.add_field(name="🔗 Link", value="Click **Open Console** below.", inline=False)
+    embed.add_field(name="⚠️ Security", value="This link grants direct root access. Do not share it. Generate a new link if it is exposed.", inline=False)
+    return embed
+
+
+def ipv4_dm_embed(vps: sqlite3.Row, network: dict[str, str]) -> discord.Embed:
+    ip = network.get("ip")
+    embed = make_embed("🔐 RGNODES™ • Private Network Details", "Your verified public IPv4 is provided privately in this DM.")
+    embed.add_field(name="🖥️ VPS", value=f"`{clean(vps['container_name'])}` • ID `{vps['id']}`", inline=False)
+    embed.add_field(name="🌐 Verified Public IPv4", value=f"`{clean(ip, 64)}`", inline=True)
+    embed.add_field(name="🌍 Detected Location", value=clean(actual_location_label(network), 80), inline=True)
+    embed.add_field(name="🔒 Privacy", value="This IPv4 is intentionally hidden from public/channel embeds.", inline=False)
+    return embed
+
+
+async def send_private_ipv4(user: discord.User | discord.Member, vps: sqlite3.Row) -> bool:
+    network = await detect_public_network(force=True)
+    ip = network.get("ip")
+    if not valid_public_ipv4(ip):
+        return False
+    db_set_vps_ipv4(vps["container_id"], ip)
+    return await safe_dm(user, ipv4_dm_embed(vps, network))
+
+
+async def host_uptime() -> str:
+    try:
+        raw = Path("/proc/uptime").read_text(encoding="utf-8", errors="replace").split()[0]
+        seconds = max(0, int(float(raw)))
+        days, rem = divmod(seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, secs = divmod(rem, 60)
+        return f"{days}d {hours}h {minutes}m {secs}s"
+    except (OSError, ValueError, IndexError):
+        return "N/A"
+
+
+async def backend_state(vps: sqlite3.Row) -> str | None:
+    if str(vps["backend"] or "docker").lower() == "pterodactyl":
+        return await ptero_status(vps)
+    return await docker_state(vps["container_id"])
+
+
+async def backend_stats(vps: sqlite3.Row) -> dict[str, str]:
+    if str(vps["backend"] or "docker").lower() == "pterodactyl":
+        return await ptero_utilization(vps)
+    return await docker_stats(vps["container_id"])
+
+
+def format_duration_ms(ms: int | float | str | None) -> str:
+    try:
+        seconds = max(0, int(float(ms or 0) / 1000))
+    except (TypeError, ValueError):
+        return "N/A"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+async def backend_uptime(vps: sqlite3.Row) -> str:
+    if str(vps["backend"] or "docker").lower() == "pterodactyl":
+        if not ptero_client_configured():
+            return "N/A"
+        identifier = vps["ptero_identifier"] or vps["container_id"]
+        status, body = await ptero_request(
+            "GET", f"client/servers/{quote(str(identifier), safe='')}/resources",
+            api_key=PTERO_CLIENT_API_KEY,
+        )
+        if status == 200 and isinstance(body, dict):
+            attrs = _ptero_attr(body) or {}
+            resources = attrs.get("resources") or {}
+            return format_duration_ms(resources.get("uptime"))
+        return "N/A"
+    return await docker_uptime(vps["container_id"])
+
+
+async def backend_disk(vps: sqlite3.Row) -> dict[str, str]:
+    if str(vps["backend"] or "docker").lower() == "pterodactyl":
+        stats = await ptero_utilization(vps)
+        return {"used": str(stats.get("disk", "N/A")), "total": clean(vps["disk"]), "percent": "panel limit"}
+    return await docker_disk_usage(vps)
+
+
+async def backend_panel_or_console(vps: sqlite3.Row) -> str | None:
+    if str(vps["backend"] or "docker").lower() == "pterodactyl":
+        return await ptero_panel_link(vps)
+    return normalize_sshx_url(vps["sshx_url"])
+
+
+async def refresh_vps_record_state(vps: sqlite3.Row) -> sqlite3.Row:
+    """Best-effort live state refresh; never let a backend probe break the dashboard."""
+    backend = str(vps["backend"] or "docker").lower()
+    try:
+        state = await asyncio.wait_for(backend_state(vps), timeout=20)
+    except Exception as exc:
+        logger.warning("VPS #%s state probe failed: %s", vps["id"], safe_log(exc))
+        state = None
+    try:
+        if state == "running":
+            db_update_vps(
+                vps["container_id"],
+                status="running",
+                sshx_pid=None if backend == "pterodactyl" else vps["sshx_pid"],
+            )
+        elif state in {"stopped", "off"}:
+            db_update_vps(
+                vps["container_id"],
+                status="stopped",
+                sshx_url=None if backend == "docker" else vps["sshx_url"],
+                sshx_pid=None,
+            )
+    except Exception as exc:
+        logger.warning("VPS #%s state persistence failed: %s", vps["id"], safe_log(exc))
+    return db_get_vps(vps["id"]) or vps
+
+
+def dashboard_embed(vps: sqlite3.Row, stats: dict[str, str], uptime: str, disk: dict[str, str], network: dict[str, str] | None = None, ports: list[sqlite3.Row] | None = None) -> discord.Embed:
+    """Render one stable dashboard layout used by both prefix and slash commands."""
+    _ = network  # Kept for API compatibility; detected node is intentionally not displayed.
+    ports = ports if ports is not None else db_list_ports(vps["id"])
+    port_summary = "None configured" if not ports else " • ".join(
+        f"`{p['host_port']}→{p['container_port']}/{str(p['protocol']).upper()}`" for p in ports[:10]
+    )
+    live = status_text(vps["status"], bool(vps["suspended"]))
+    backend = str(vps["backend"] or "docker").lower()
+    embed = make_embed(
+        f"🖥️ VPS #{vps['id']} • VMID `{vps['id']}`",
+        f"**{live}** • `{clean(vps['container_name'])}`",
+    )
+
+    embed.add_field(
+        name="📦 Resources",
+        value=(
+            f"╭ **RAM:** {clean(vps['ram'])}\n"
+            f"├ **CPU Limit:** {clean(vps['cpu'])} Core(s)\n"
+            f"├ **Storage:** {clean(vps['disk'])}\n"
+            f"├ **OS:** {os_label(vps['os_type'])}\n"
+            f"╰ **Node:** {location_label(vps['location'])}"
+        ),
+        inline=True,
+    )
+
+    runtime_label = "Docker: **:whale:** Ready" if backend == "docker" else "Pterodactyl: Ready"
+    embed.add_field(
+        name="⚙️ Configuration",
+        value=(
+            f"╭ **Slots:** {slot_status_text(vps['user_id'])}\n"
+            f"├ **Uptime:** {clean(uptime)}\n"
+            f"├ **Hostname:** `{clean(vps['hostname'])}`\n"
+            f"├ **IPv4:** 🔒 Sent privately in DM\n"
+            f"╰ **{runtime_label}**"
+        ),
+        inline=True,
+    )
+
+    cpu_value = clean(stats.get("cpu"))
+    memory_value = normalize_dashboard_memory(stats.get("memory"))
+    disk_used = clean(disk.get("used"))
+    # The configured disk is an allocation even when hard quota enforcement is off.
+    if disk_used in {"", "N/A", "None", "null"}:
+        disk_used = "0 B (baseline)" if str(vps["status"]).lower() == "running" else "N/A"
+    network_value = normalize_network_stats(stats.get("network"))
+    embed.add_field(
+        name="📈 Live Stats",
+        value=(
+            f"💻 **CPU:** {cpu_value} used / {clean(vps['cpu'])} limit\n"
+            f"🧠 **Memory:** {memory_value}\n"
+            f"💾 **Disk:** {disk_used} / {clean(vps['disk'])}\n"
+            f"🌐 **Network:** {network_value}"
+        ),
+        inline=False,
+    )
+
+    if backend == "pterodactyl":
+        embed.add_field(
+            name="🦖 Pterodactyl",
+            value=f"Server ID: `{clean(vps['ptero_server_id'])}` • Identifier: `{clean(vps['ptero_identifier'])}`",
+            inline=False,
+        )
+        embed.add_field(name="🌐 Allocations", value="Managed by Pterodactyl Panel/Wings.", inline=False)
+    else:
+        embed.add_field(
+            name=f"🌐 Port Forwarding • {len(ports)}/{MAX_PORTS_PER_VPS}",
+            value=port_summary,
+            inline=False,
+        )
+
+    embed.add_field(
+        name="🎮 Action",
+        value="Use the buttons below to control your VPS.",
+        inline=False,
+    )
+    return embed
+
+
+
+def progress_embed(stage: int, title: str, os_type: str, location: str, ram: str, cpu: str, disk: str, name: str) -> discord.Embed:
+    total = 10
+    filled = max(0, min(stage, total))
+    bar = "▰" * filled + "▱" * (total - filled)
+    embed = make_embed("✨ RGNODES™ VPS Deployment", f"**{title}**\n`{bar}` **{filled * 10}%**")
+    embed.add_field(name="🖥️ OS", value=os_label(os_type), inline=True)
+    embed.add_field(name="🌍 Location", value=location_label(location), inline=True)
+    embed.add_field(name="📦 VPS", value=f"`{clean(name)}`", inline=True)
+    embed.add_field(name="⚙️ Resources", value=f"`{ram}` RAM • `{cpu}` CPU • `{disk}` Disk", inline=False)
+    return embed
+
+
+
+# ================================================================
+# Pterodactyl Application/Client API integration
+# ================================================================
+PTERO_API_LOCK = asyncio.Lock()
+
+def _ptero_headers(api_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "Application/vnd.pterodactyl.v1+json",
+        "User-Agent": "RGNODES-VPS-Manager/2.0",
+    }
+
+
+def _ptero_request_sync(method: str, url: str, api_key: str, payload: dict[str, Any] | None = None) -> tuple[int, dict[str, Any] | str]:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method.upper(), headers=_ptero_headers(api_key))
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            if not raw:
+                return resp.status, {}
+            try:
+                return resp.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return resp.status, raw
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+            try:
+                body: dict[str, Any] | str = json.loads(raw)
+            except json.JSONDecodeError:
+                body = raw
+        except Exception:
+            body = str(exc)
+        return int(exc.code), body
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return 599, str(exc)
+
+
+async def ptero_request(method: str, path: str, *, payload: dict[str, Any] | None = None, api_key: str | None = None) -> tuple[int, dict[str, Any] | str]:
+    key = api_key or PTERO_API_KEY
+    if not PTERO_URL or not key:
+        return 503, "Pterodactyl is not configured."
+    url = f"{PTERO_URL}/api/{path.lstrip('/')}"
+    async with PTERO_API_LOCK:
+        return await asyncio.to_thread(_ptero_request_sync, method, url, key, payload)
+
+
+def ptero_error_message(status: int, body: dict[str, Any] | str) -> str:
+    if isinstance(body, dict):
+        errors = body.get("errors")
+        if isinstance(errors, list):
+            msgs: list[str] = []
+            for item in errors[:4]:
+                if isinstance(item, dict):
+                    detail = item.get("detail") or item.get("code") or item.get("title")
+                    if detail:
+                        msgs.append(str(detail))
+            if msgs:
+                return "; ".join(msgs)
+        if body.get("message"):
+            return str(body["message"])
+    if status == 599:
+        return "Pterodactyl panel is unreachable or timed out."
+    return safe_log(str(body or f"HTTP {status}"), 1200)
+
+
+def _ptero_attr(body: dict[str, Any] | str) -> dict[str, Any] | None:
+    if not isinstance(body, dict):
+        return None
+    attrs = body.get("attributes")
+    return attrs if isinstance(attrs, dict) else None
+
+
+def _ptero_limit_mb(value: str) -> int:
+    return max(256, int(parse_size_bytes(value) / 1024**2))
+
+
+async def ptero_get_server(server_id: int | str) -> dict[str, Any] | None:
+    status, body = await ptero_request("GET", f"application/servers/{quote(str(server_id), safe='')}?include=allocations,node,user")
+    if status != 200:
+        logger.warning("Pterodactyl server lookup failed (%s): %s", status, ptero_error_message(status, body))
+        return None
+    return _ptero_attr(body)
+
+
+async def ptero_create_server(*, name: str, ram: str, cpu: str, disk: str) -> tuple[bool, str, dict[str, Any] | None]:
+    if not ptero_application_configured():
+        return False, (
+            "Pterodactyl Application API is not fully configured. Set "
+            "PTERO_URL, PTERO_API_KEY, PTERO_DEFAULT_USER_ID, PTERO_NODE_ID, "
+            "PTERO_NEST_ID, PTERO_EGG_ID and PTERO_ALLOCATION_ID."
+        ), None
+    owner_id = PTERO_DEFAULT_USER_ID
+
+    environment = dict(PTERO_ENVIRONMENT)
+    payload: dict[str, Any] = {
+        "name": name,
+        "user": owner_id,
+        "node": PTERO_NODE_ID,
+        "nest": PTERO_NEST_ID,
+        "egg": PTERO_EGG_ID,
+        "docker_image": PTERO_DOCKER_IMAGE or "ghcr.io/pterodactyl/yolks:debian",
+        "startup": PTERO_STARTUP or "bash",
+        "environment": environment,
+        "limits": {
+            "memory": _ptero_limit_mb(ram),
+            "swap": PTERO_MEMORY_SWAP,
+            "disk": int(parse_size_bytes(disk) / 1024**2),
+            "io": PTERO_IO,
+            "cpu": max(1, int(float(cpu) * 100)),
+        },
+        "feature_limits": {
+            "databases": PTERO_DATABASES,
+            "allocations": PTERO_ALLOCATIONS,
+            "backups": PTERO_BACKUPS,
+        },
+        "allocation": {"default": PTERO_ALLOCATION_ID},
+        "deploy": {
+            "locations": [],
+            "port_range": [],
+            "dedicated_ip": False,
+        },
+    }
+    payload = {k: v for k, v in payload.items() if v is not None}
+    status, body = await ptero_request("POST", "application/servers", payload=payload)
+    if status not in {200, 201}:
+        return False, ptero_error_message(status, body), None
+    attrs = _ptero_attr(body)
+    if not attrs:
+        return False, "Pterodactyl created the server but returned no server attributes.", None
+    return True, "Pterodactyl server created successfully.", attrs
+
+
+async def ptero_power(vps: sqlite3.Row, action: str) -> tuple[bool, str]:
+    identifier = vps["ptero_identifier"] or vps["container_id"]
+    if not ptero_client_configured():
+        return False, "PTERO_CLIENT_API_KEY is not configured; Pterodactyl power and live-resource commands require a Client API key."
+    signal_name = {"start": "start", "stop": "stop", "restart": "restart", "kill": "kill"}.get(action)
+    if not signal_name:
+        return False, "Unsupported Pterodactyl power action."
+    status, body = await ptero_request("POST", f"client/servers/{quote(str(identifier), safe='')}/power", payload={"signal": signal_name}, api_key=PTERO_CLIENT_API_KEY)
+    if status not in {200, 204}:
+        return False, ptero_error_message(status, body)
+    return True, f"Pterodactyl power action `{signal_name}` completed."
+
+
+async def ptero_utilization(vps: sqlite3.Row) -> dict[str, str]:
+    identifier = vps["ptero_identifier"] or vps["container_id"]
+    if PTERO_CLIENT_API_KEY:
+        status, body = await ptero_request(
+            "GET", f"client/servers/{quote(str(identifier), safe='')}/resources",
+            api_key=PTERO_CLIENT_API_KEY,
+        )
+        if status == 200 and isinstance(body, dict):
+            attrs = _ptero_attr(body) or {}
+            current = attrs.get("current_state", "offline")
+            res = attrs.get("resources") or {}
+            memory = int(res.get("memory_bytes") or 0)
+            cpu_ns = float(res.get("cpu_absolute") or 0.0)
+            disk = int(res.get("disk_bytes") or 0)
+            return {
+                "cpu": f"{cpu_ns:.2f}%",
+                "memory": format_bytes(memory),
+                "network": f"{format_bytes(int(res.get('network_rx_bytes') or 0))} ↓ / {format_bytes(int(res.get('network_tx_bytes') or 0))} ↑",
+                "state": str(current),
+                "disk": format_bytes(disk),
+            }
+    app = await ptero_get_server(vps["ptero_server_id"])
+    if app:
+        suspended = bool(app.get("suspended", False))
+        installed = bool(app.get("installed", True))
+        return {
+            "cpu": "N/A", "memory": "N/A", "network": "N/A", "disk": "N/A",
+            "state": "suspended" if suspended else ("installing" if not installed else "unknown"),
+        }
+    return {"cpu": "N/A", "memory": "N/A", "network": "N/A", "disk": "N/A", "state": "unknown"}
+
+
+async def ptero_status(vps: sqlite3.Row) -> str:
+    data = await ptero_utilization(vps)
+    state = str(data.get("state", "unknown")).lower()
+    if state in {"running", "on"}:
+        return "running"
+    if state in {"starting", "restarting", "installing"}:
+        return state
+    if state in {"stopped", "offline", "off"}:
+        return "stopped"
+    return "unknown"
+
+
+async def ptero_panel_link(vps: sqlite3.Row) -> str:
+    identifier = str(vps["ptero_identifier"] or vps["container_id"])
+    return f"{PTERO_PANEL_PUBLIC_URL}/server/{identifier}" if PTERO_PANEL_PUBLIC_URL else ""
+
+
+# ================================================================
+# Lifecycle / deployment
+# ================================================================
+
+OperationCallback = Callable[[discord.Embed], Awaitable[None]]
+CREATE_LOCK = asyncio.Lock()
+CAPACITY_LOCK = asyncio.Lock()
+VPS_LOCKS: dict[str, asyncio.Lock] = {}
+VPS_SSHX_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def vps_lock(vps_id: int) -> asyncio.Lock:
+    key = str(vps_id)
+    return VPS_LOCKS.setdefault(key, asyncio.Lock())
+
+
+async def next_container_name() -> str:
+    rc, out, _ = await docker_cli("ps", "--all", "--format", "{{.Names}}", timeout=20, retries=1)
+    used: set[int] = set()
+    if rc == 0:
+        for raw in out.decode("utf-8", "replace").splitlines():
+            m = re.fullmatch(r"rgnodes-(\d+)", raw.strip(), flags=re.I)
+            if m:
+                used.add(int(m.group(1)))
+    for row in db_get_all_vps():
+        m = re.fullmatch(r"rgnodes-(\d+)", str(row["container_name"]), flags=re.I)
+        if m:
+            used.add(int(m.group(1)))
+    n = 1
+    while n in used:
+        n += 1
+    return f"rgnodes-{n}"
+
+
+async def update_progress(callback: OperationCallback | None, stage: int, title: str, *, os_type: str, location: str, ram: str, cpu: str, disk: str, name: str) -> None:
+    if not callback:
+        return
+    try:
+        await asyncio.wait_for(
+            callback(progress_embed(stage, title, os_type, location, ram, cpu, disk, name)),
+            timeout=PROGRESS_UPDATE_TIMEOUT,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # UI/network failure must never turn a healthy VPS deployment into a rollback.
+        logger.debug("Progress update skipped at stage %s: %s", stage, safe_log(exc))
+
+
+async def create_vps(
+    user: discord.User | discord.Member,
+    *,
+    os_type: str,
+    location: str,
+    ram: str,
+    cpu: str,
+    disk: str,
+    progress: OperationCallback | None = None,
+    backend_override: str | None = None,
+) -> tuple[bool, str, sqlite3.Row | None]:
+    normalized_os = normalize_os(os_type)
+    normalized_location = normalize_location(location)
+    if not normalized_os:
+        return False, "Unsupported operating system.", None
+    if not normalized_location:
+        return False, "Unsupported location. Choose Singapore (SG) or India (IN).", None
+    try:
+        ram, cpu, disk = validate_resources(ram, cpu, disk)
+    except ValueError as exc:
+        return False, str(exc), None
+    # New VPS creation is always local. Pterodactyl is guest software, not the
+    # creation backend. Keep legacy Pterodactyl records controllable elsewhere,
+    # but never create a new VPS through the Pterodactyl API.
+    backend = "docker"
+    if backend == "docker":
+        capacity_error = resource_capacity_error(ram, cpu, disk)
+        if capacity_error:
+            return False, capacity_error, None
+    if db_is_banned(user.id):
+        return False, "You are not allowed to create VPS instances.", None
+
+    # Public IPv4 detection is intentionally deferred until after the VPS is
+    # durable. External IP providers can be slow/unreachable and must never
+    # delay or abort the actual provisioning transaction.
+    verified_ipv4 = None
+
+    async with CREATE_LOCK:
+        is_admin_user = ADMIN_BYPASS_LIMITS and ADMIN_ID > 0 and int(user.id) == int(ADMIN_ID)
+        slot_limit = db_effective_slots(user.id)
+        slot_used = db_vps_count(user.id)
+        if not is_admin_user and slot_used >= slot_limit:
+            return False, f"SLOTS FULL — you are using `{slot_used}/{slot_limit}` VPS slots. Additional slots will be available soon. Ask an administrator to add slots.", None
+
+        async with CAPACITY_LOCK:
+            if backend == "docker":
+                live_ok, live_running = await docker_running_count()
+                if not live_ok:
+                    live_running = db_running_count()
+            else:
+                live_running = sum(
+                    1 for row in db_get_all_vps()
+                    if str(row["backend"] or "docker").lower() == "pterodactyl"
+                    and str(row["status"]).lower() == "running"
+                    and not row["suspended"]
+                )
+            if not is_admin_user and live_running >= TOTAL_RUNNING_LIMIT:
+                return False, f"Global running VPS limit reached ({TOTAL_RUNNING_LIMIT}).", None
+
+        name = await next_container_name()
+        hostname = f"{VPS_HOSTNAME_PREFIX}-{user.id}"[:63]
+        image = OS_CONFIG[normalized_os]["image"]
+        resource_id: str | None = None
+        ptero_server_id: int | None = None
+        ptero_identifier: str | None = None
+
+        try:
+            await update_progress(progress, 1, f"Validating {backend} backend", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+
+            # Pterodactyl API creation is intentionally disabled for new VPSes.
+            await update_progress(progress, 2, "Preparing Docker", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+            ok, docker_error = await docker_info()
+            if not ok:
+                logger.warning("Docker preflight failed: %s", safe_log(docker_error))
+                return False, (
+                    "Docker is required to create this VPS but the daemon is not reachable. "
+                    f"{safe_log(docker_error)}"
+                ), None
+            await update_progress(progress, 3, "Pulling official image", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+            pulled, pull_error = await docker_pull(image)
+            if not pulled:
+                return False, f"Could not pull `{image}`. {pull_error}", None
+            await update_progress(progress, 4, "Creating isolated VPS", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+            resource_id, create_error = await docker_run(image=image, hostname=hostname, ram=ram, cpu=cpu, disk=disk, container_name=name, location=normalized_location)
+            if not resource_id:
+                return False, f"Docker container creation failed: {create_error}", None
+            await update_progress(progress, 5, "Starting VPS", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+            # `docker run --detach` already starts the container. Only call
+            # `docker start` when the runtime reports that it is not running;
+            # this avoids the common "container is already running" failure.
+            running, start_error = await ensure_docker_running(resource_id)
+            if not running:
+                raise RuntimeError(start_error or "Container could not be started.")
+            ready = False
+            for _ in range(20):
+                if await docker_state(resource_id) == "running":
+                    ready = True
+                    break
+                await asyncio.sleep(0.5)
+            if not ready:
+                raise RuntimeError("Container started but did not reach running state.")
+            if GUEST_SYSTEMD_ENABLED:
+                await update_progress(progress, 6, "Initializing Linux services", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+                guest_ready, guest_error = await wait_for_guest_ready(resource_id)
+                if not guest_ready:
+                    raise RuntimeError(guest_error or "Guest Linux services failed to initialize.")
+            # Persist the VPS immediately after Docker reports it as running.
+            # Console access is strictly optional and must NEVER be allowed to
+            # turn a successful VPS creation into a failure/rollback.
+            await update_progress(progress, 7, "Saving VPS record", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+            db_upsert_user(user.id, str(user))
+            db_insert_vps(
+                user_id=user.id,
+                container_id=resource_id,
+                container_name=name,
+                os_type=normalized_os,
+                location=normalized_location,
+                hostname=hostname,
+                ram=ram,
+                cpu=cpu,
+                disk=disk,
+                sshx_url=None,
+                sshx_pid=None,
+                public_ipv4=verified_ipv4 if valid_public_ipv4(verified_ipv4) else None,
+                ipv4_verified_at=utc_now() if valid_public_ipv4(verified_ipv4) else None,
+                backend="docker",
+                ptero_server_id=None,
+                ptero_identifier=None,
+                ptero_user_id=None,
+            )
+            row = db_find_vps(user.id, resource_id)
+            if not row:
+                # At this point the container exists but there is no durable
+                # record, so cleanup is appropriate and the outer handler will
+                # remove the orphan safely.
+                raise RuntimeError("VPS was created but could not be saved to SQLite.")
+
+            # Best-effort background-style console setup. Every exception is
+            # contained here; SSHx availability is NOT part of VPS readiness.
+            console = None
+            await update_progress(progress, 8, "Preparing optional console access", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+            try:
+                console = await asyncio.wait_for(install_and_start_sshx(resource_id), timeout=max(20, SSHX_TOTAL_TIMEOUT + 5))
+            except Exception as exc:
+                logger.warning("Optional SSHx setup failed for %s; VPS remains healthy: %s", clean(resource_id, 32), safe_log(exc))
+                console = None
+
+            if console and console.get("pid"):
+                db_update_vps(resource_id, sshx_url=normalize_sshx_url(console.get("url")) if console.get("url") else None, sshx_pid=console.get("pid"))
+
+            # Port supervision is useful but is also non-fatal during first boot.
+            try:
+                await supervise_vps_ports(db_get_vps(row["id"]) or row)
+            except Exception as exc:
+                logger.warning("Initial VPS port supervision failed for %s: %s", clean(resource_id, 32), safe_log(exc))
+
+            final_row = db_get_vps(row["id"]) or row
+            await update_progress(progress, 10, "VPS Ready", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+            return True, (
+                "Docker VPS created successfully."
+                + (" Console is ready." if console else " Console is temporarily unavailable; the VPS is online. Use Console/sshx to retry.")
+            ), final_row
+
+        except asyncio.CancelledError:
+            logger.error("VPS creation cancelled for user %s", user.id)
+            if resource_id and backend == "docker":
+                with contextlib.suppress(Exception):
+                    await stop_sshx(resource_id)
+                with contextlib.suppress(Exception):
+                    await docker_remove(resource_id)
+            elif ptero_server_id:
+                with contextlib.suppress(Exception):
+                    await ptero_delete_server(ptero_server_id, force=True)
+            raise
+        except Exception as exc:
+            logger.error("VPS creation failed: %s", safe_log(exc))
+            if resource_id and backend == "docker":
+                with contextlib.suppress(Exception):
+                    await stop_sshx(resource_id)
+                with contextlib.suppress(Exception):
+                    await docker_remove(resource_id)
+            elif ptero_server_id:
+                with contextlib.suppress(Exception):
+                    await ptero_delete_server(ptero_server_id, force=True)
+            return False, f"VPS creation failed safely: {safe_log(exc)}", None
+
+
+async def ptero_delete_server(server_id: int, force: bool = False) -> tuple[bool, str]:
+    suffix = "?force=true" if force else ""
+    status, body = await ptero_request("DELETE", f"application/servers/{int(server_id)}{suffix}")
+    if status not in {200, 204}:
+        return False, ptero_error_message(status, body)
+    return True, "Pterodactyl server deleted."
+
+
+async def ptero_suspend_server(server_id: int, suspended: bool) -> tuple[bool, str]:
+    action = "suspend" if suspended else "unsuspend"
+    status, body = await ptero_request("POST", f"application/servers/{int(server_id)}/{action}")
+    if status not in {200, 204}:
+        return False, ptero_error_message(status, body)
+    return True, f"Pterodactyl server {action}ed."
+
+
+async def docker_reinstall_vps(vps: sqlite3.Row, os_type: str) -> tuple[bool, str]:
+    """Replace a Docker VPS container with a clean container using the selected OS.
+
+    The VPS database row, ID, allocation and user ownership are preserved. The
+    container itself is recreated from the selected image.
+    """
+    normalized = normalize_os(os_type)
+    if not normalized:
+        return False, "Unsupported operating system."
+    old_container = str(vps["container_id"])
+    image = str(OS_CONFIG[normalized]["image"])
+    new_container = f"{str(vps['container_name'])[:48]}-reinstall-{int(time.time()) % 100000}"[:63]
+    old_exists = await docker_exists(old_container)
+    new_exists = await docker_exists(new_container)
+    if new_exists:
+        with contextlib.suppress(Exception):
+            await docker_remove(new_container)
+    if old_exists:
+        await stop_sshx(old_container)
+        for p_row in db_list_ports(vps["id"]):
+            await stop_port_forward(p_row)
+        if not await docker_stop(old_container):
+            state_now = await docker_state(old_container)
+            if state_now not in {"exited", "stopped", None}:
+                return False, "Could not stop the current VPS before reinstall."
+    try:
+        created_id, err = await docker_run(
+            image=image,
+            container_name=new_container,
+            ram=str(vps["ram"]),
+            cpu=str(vps["cpu"]),
+            disk=str(vps["disk"]),
+            hostname=str(vps["hostname"]),
+            location=str(vps["location"]),
+            persistent_key=str(vps["container_name"]),
+        )
+        if not created_id:
+            # Roll the old VPS back to running state so a failed reinstall does
+            # not unnecessarily leave the user's service offline.
+            if old_exists:
+                with contextlib.suppress(Exception):
+                    await docker_start(old_container)
+            return False, f"Reinstall failed while creating the new container: {err or 'Docker run failed.'}"
+        # Keep the old container until the replacement passes the full
+        # readiness gate. It remains stopped, so persistent volumes are not
+        # written by two containers at the same time.
+        container_ref = str(created_id)
+        for _ in range(30):
+            if await docker_state(container_ref) == "running":
+                break
+            await asyncio.sleep(0.5)
+        else:
+            with contextlib.suppress(Exception):
+                await docker_remove(container_ref)
+            if old_exists:
+                with contextlib.suppress(Exception):
+                    await docker_start(old_container)
+            return False, "Reinstall container did not reach running state; the previous VPS was restored."
+        if GUEST_SYSTEMD_ENABLED:
+            guest_ready, guest_error = await wait_for_guest_ready(container_ref)
+            if not guest_ready:
+                with contextlib.suppress(Exception):
+                    await docker_remove(container_ref)
+                if old_exists:
+                    with contextlib.suppress(Exception):
+                        await docker_start(old_container)
+                return False, f"Reinstall guest bootstrap failed: {guest_error}"
+        console = await install_and_start_sshx(container_ref)
+        if old_exists:
+            if not await docker_remove(old_container):
+                logger.warning(
+                    "Old reinstall container %s could not be removed after successful readiness; keeping it stopped.",
+                    clean(old_container, 48),
+                )
+        conn = db_connect()
+        try:
+            conn.execute(
+                "UPDATE vps SET container_id=?, container_name=?, os_type=?, status='running', suspended=0, sshx_url=?, sshx_pid=?, updated_at=? WHERE id=?",
+                (container_ref, new_container, normalized, console.get("url") if console else None, console.get("pid") if console else None, utc_now(), int(vps["id"])),
+            )
+        finally:
+            conn.close()
+        latest = db_get_vps(vps["id"])
+        if latest:
+            await supervise_vps_ports(latest)
+        return True, f"VPS reinstalled successfully with **{os_label(normalized)}**."
+    except Exception as exc:
+        logger.exception("Docker reinstall failed for VPS #%s", vps["id"])
+        with contextlib.suppress(Exception):
+            await docker_remove(locals().get("container_ref", new_container))
+        return False, f"Reinstall failed safely: {safe_log(exc)}"
+
+
+async def lifecycle_action(vps: sqlite3.Row, action: str) -> tuple[bool, str]:
+    async with vps_lock(vps["id"]):
+        backend = str(vps["backend"] or "docker").lower()
+
+        if backend == "pterodactyl":
+            server_id = int(vps["ptero_server_id"] or 0)
+            if not server_id:
+                return False, "Pterodactyl server ID is missing from this VPS record."
+
+            if action in {"start", "stop", "restart"}:
+                if action == "start" and vps["suspended"]:
+                    return False, "This VPS is suspended by an administrator."
+                if action == "start" and not vps["suspended"]:
+                    current_state = await ptero_status(vps)
+                    if current_state != "running":
+                        running_count = sum(
+                            1 for row in db_get_all_vps()
+                            if str(row["backend"] or "docker").lower() == "pterodactyl"
+                            and str(row["status"]).lower() == "running"
+                            and not row["suspended"]
+                        )
+                        if running_count >= TOTAL_RUNNING_LIMIT and not (ADMIN_BYPASS_LIMITS and int(vps["user_id"]) == int(ADMIN_ID)):
+                            return False, f"Global running VPS limit reached ({TOTAL_RUNNING_LIMIT})."
+                ok, message = await ptero_power(vps, action)
+                if ok:
+                    await asyncio.sleep(1)
+                    status_now = await ptero_status(vps)
+                    db_update_vps(vps["container_id"], status=status_now, sshx_url=await ptero_panel_link(vps))
+                    return True, message
+                return False, message
+
+            if action == "suspend":
+                ok, message = await ptero_suspend_server(server_id, True)
+                if ok:
+                    db_update_vps(vps["container_id"], status="stopped", suspended=1)
+                return ok, message
+
+            if action == "unsuspend":
+                ok, message = await ptero_suspend_server(server_id, False)
+                if ok:
+                    db_update_vps(vps["container_id"], suspended=0)
+                return ok, message
+
+            if action == "delete":
+                for p_row in db_list_ports(vps["id"]):
+                    await stop_port_forward(p_row)
+                ok, message = await ptero_delete_server(server_id, force=False)
+                if not ok and "not found" in message.lower():
+                    ok, message = await ptero_delete_server(server_id, force=True)
+                if ok:
+                    db_delete_vps(vps["container_id"])
+                return ok, message
+
+            if action == "reinstall":
+                status, body = await ptero_request("POST", f"application/servers/{server_id}/reinstall")
+                if status not in {200, 204}:
+                    return False, ptero_error_message(status, body)
+                return True, "Pterodactyl reinstall requested."
+
+            if action == "rebuild":
+                status, body = await ptero_request("POST", f"application/servers/{server_id}/rebuild")
+                if status not in {200, 204}:
+                    return False, ptero_error_message(status, body)
+                return True, "Pterodactyl rebuild requested."
+
+            return False, "Unsupported Pterodactyl VPS action."
+
+        container = vps["container_id"]
+        exists = await docker_exists(container)
+        if action == "start":
+            if vps["suspended"]:
+                return False, "This VPS is suspended by an administrator."
+            if not exists:
+                return False, "The Docker container no longer exists. Ask an administrator to recreate this VPS."
+            async with CAPACITY_LOCK:
+                _, current = await docker_running_count()
+                already_running = (await docker_state(container)) == "running"
+                if not already_running and current >= TOTAL_RUNNING_LIMIT:
+                    return False, f"Global running VPS limit reached ({TOTAL_RUNNING_LIMIT})."
+                ok, error = await docker_start(container)
+            if not ok:
+                return False, error or "Failed to start the VPS."
+            for _ in range(20):
+                if await docker_state(container) == "running":
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                return False, "The VPS start command returned, but the container is not running."
+            console = await install_and_start_sshx(container)
+            existing = db_get_vps(vps["id"]) or vps
+            db_update_vps(container, status="running", sshx_url=console["url"] if console else existing["sshx_url"], sshx_pid=console.get("pid") if console else existing["sshx_pid"])
+            await supervise_vps_ports(vps)
+            return True, "VPS started. Console refreshed." if console else "VPS started; press Console to retry SSHx."
+
+        if action == "stop":
+            if exists:
+                await stop_sshx(container)
+                for p_row in db_list_ports(vps["id"]):
+                    await stop_port_forward(p_row)
+                if not await docker_stop(container) and await docker_state(container) not in {"exited", "stopped"}:
+                    return False, "Failed to stop the VPS."
+            db_update_vps(container, status="stopped", sshx_url=None, sshx_pid=None)
+            return True, "VPS stopped successfully."
+
+        if action == "restart":
+            if not exists:
+                return False, "The Docker container no longer exists."
+            async with CAPACITY_LOCK:
+                _, current = await docker_running_count()
+                if current >= TOTAL_RUNNING_LIMIT and (await docker_state(container)) != "running":
+                    return False, f"Global running VPS limit reached ({TOTAL_RUNNING_LIMIT})."
+                await stop_sshx(container)
+                ok, error = await docker_restart(container)
+            if not ok:
+                return False, error or "Failed to restart the VPS."
+            for _ in range(20):
+                if await docker_state(container) == "running":
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                return False, "The VPS restart command returned, but the container is not running."
+            console = await install_and_start_sshx(container)
+            existing = db_get_vps(vps["id"]) or vps
+            db_update_vps(container, status="running", sshx_url=console["url"] if console else existing["sshx_url"], sshx_pid=console.get("pid") if console else existing["sshx_pid"])
+            await supervise_vps_ports(vps)
+            return True, "VPS restarted successfully." if console else "VPS restarted; press Console to retry SSHx."
+
+        if action == "reinstall":
+            return False, "Select an operating system from the Reinstall menu first."
+
+        if action == "delete":
+            for p_row in db_list_ports(vps["id"]):
+                await stop_port_forward(p_row)
+            if exists:
+                await stop_sshx(container)
+                if not await docker_remove(container):
+                    return False, "Docker cleanup failed; the VPS record was kept."
+            db_delete_vps(container)
+            return True, "VPS deleted successfully."
+
+        if action == "suspend":
+            if exists:
+                await stop_sshx(container)
+                for p_row in db_list_ports(vps["id"]):
+                    await stop_port_forward(p_row)
+                stopped = await docker_stop(container)
+                if not stopped:
+                    state_now = await docker_state(container)
+                    if state_now not in {"exited", "stopped", None}:
+                        return False, "Failed to stop the VPS before suspension."
+            db_update_vps(container, status="stopped", suspended=1, sshx_url=None, sshx_pid=None)
+            return True, "VPS stopped and suspended."
+
+        if action == "unsuspend":
+            db_update_vps(container, suspended=0)
+            return True, "VPS unsuspended."
+
+        return False, "Unsupported VPS action."
+
+
+async def create_console_access(vps: sqlite3.Row, user: discord.User | discord.Member) -> tuple[bool, str]:
+    backend = str(vps["backend"] or "docker").lower()
+    if backend == "pterodactyl":
+        status = await ptero_status(vps)
+        if status != "running":
+            return False, "Start the Pterodactyl server before opening Console."
+        url = await ptero_panel_link(vps)
+        if not url:
+            return False, "Pterodactyl panel URL is not configured."
+        db_update_vps(vps["container_id"], status="running", sshx_url=url, sshx_pid=None)
+        sent = await safe_dm(user, make_embed("✨ RGNODES™ • 🦖 Pterodactyl Panel", "Open your VPS panel from the button below."), sshx_view(url))
+        return True, "Pterodactyl panel access link sent by DM." if sent else "Pterodactyl panel is ready, but your DM is closed."
+
+    state = await docker_state(vps["container_id"])
+    if state != "running":
+        db_update_vps(vps["container_id"], status="stopped", sshx_url=None, sshx_pid=None)
+        return False, "Start the VPS before opening Console."
+    try:
+        console = await asyncio.wait_for(
+            install_and_start_sshx(vps["container_id"]),
+            timeout=max(20, SSHX_TOTAL_TIMEOUT + 5),
+        )
+    except asyncio.TimeoutError:
+        console = None
+        logger.warning("SSHx Console request timed out for VPS %s", vps["id"])
+    if not console:
+        existing_url = normalize_sshx_url(vps["sshx_url"]) if vps["sshx_url"] else None
+        existing_pid = str(vps["sshx_pid"] or "")
+        if existing_url and existing_pid and await sshx_process_alive(vps["container_id"], existing_pid):
+            return True, "Private SSHx link is still active and was kept unchanged."
+        db_update_vps(vps["container_id"], sshx_url=None, sshx_pid=None)
+        return False, "SSHx could not start a console session. The VPS is still online. Press Console again after checking SSHx network/launch logs."
+
+    console_pid = str(console.get("pid") or "")
+    console_url = normalize_sshx_url(console.get("url")) if console.get("url") else None
+
+    # The launcher is intentionally non-blocking. When SSHx has started but
+    # its encrypted browser URL has not been emitted yet, read the persisted
+    # state once more after a very short delay. This does not turn deployment
+    # into a long polling loop.
+    if console_pid and not console_url:
+        await asyncio.sleep(0.35)
+        late_url, late_pid = await _read_sshx_state(vps["container_id"])
+        if late_url and late_pid:
+            console_url, console_pid = late_url, late_pid
+
+    if not console_url:
+        if console_pid and await sshx_process_alive(vps["container_id"], console_pid):
+            db_update_vps(vps["container_id"], sshx_url=None, sshx_pid=console_pid)
+            return False, "SSHx is running and initializing its encrypted console link. Press Console again in a moment."
+        db_update_vps(vps["container_id"], sshx_url=None, sshx_pid=None)
+        return False, "SSHx started incorrectly and stopped. Check the VPS SSHx log and press Console again."
+
+    db_update_vps(vps["container_id"], sshx_url=console_url, sshx_pid=console_pid or None)
+    network = await detect_public_network(force=True)
+    ip_ok = valid_public_ipv4(network.get("ip"))
+    if ip_ok:
+        db_set_vps_ipv4(vps["container_id"], network["ip"])
+    dm_sent = await safe_dm(user, console_embed(vps["container_name"], console_url, network.get("ip") if ip_ok else None, actual_location_label(network)), sshx_view(console_url))
+    if ip_ok:
+        await safe_dm(user, ipv4_dm_embed(vps, network))
+    return (True, "Private SSHx link generated and sent to your DM." if dm_sent else "Console is ready, but your DM is closed. Enable DMs and press Console again.")
+
+
+# ================================================================
+# Public network identity + real host location
+# ================================================================
+
+NETWORK_CACHE: dict[str, str] = {"ip": "N/A", "country": "N/A", "region": "N/A", "city": "N/A"}
+NETWORK_CACHE_AT = 0.0
+NETWORK_LOCK = asyncio.Lock()
+
+
+def valid_public_ipv4(value: str | None) -> bool:
+    try:
+        ip = ipaddress.ip_address(str(value or "").strip())
+        return isinstance(ip, ipaddress.IPv4Address) and ip.is_global
+    except ValueError:
+        return False
+
+
+def local_ipv4_addresses() -> set[str]:
+    addresses: set[str] = set()
+    try:
+        for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addresses.add(item[4][0])
+    except OSError:
+        pass
+    # iproute2 is already a bootstrap dependency; use it when available so
+    # cloud secondary IPv4 addresses are detected reliably.
+    return addresses
+
+
+def _fetch_real_public_ipv4_sync() -> str | None:
+    """Return an externally observed, globally routable IPv4 only after quorum.
+
+    This is the host's real Internet egress/public IPv4. We intentionally do
+    not invent or derive a public address from private container addresses.
+    A value must be independently observed by at least two providers.
+    """
+    headers = {"User-Agent": "RGNODES-VPS/IPv4-verify"}
+    endpoints = (
+        "https://api.ipify.org",
+        "https://icanhazip.com",
+        "https://ifconfig.me/ip",
+        "https://checkip.amazonaws.com",
+    )
+    observations: list[str] = []
+    for url in endpoints:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=7) as resp:
+                value = resp.read().decode("utf-8", "replace").strip()
+            # Reject anything containing extra text, not only invalid ipaddress objects.
+            if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value) and valid_public_ipv4(value):
+                observations.append(value)
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            continue
+    counts: dict[str, int] = {}
+    for value in observations:
+        counts[value] = counts.get(value, 0) + 1
+    if not counts:
+        return None
+    winner, votes = max(counts.items(), key=lambda item: item[1])
+    # Two independent confirmations are required for a verified address.
+    return winner if votes >= 2 else None
+
+
+async def real_public_ipv4(force: bool = False) -> str | None:
+    global NETWORK_CACHE_AT, NETWORK_CACHE
+    now = asyncio.get_running_loop().time()
+    cached = str(NETWORK_CACHE.get("ip") or "")
+    if not force and NETWORK_CACHE_AT and now - NETWORK_CACHE_AT < IPV4_REFRESH and valid_public_ipv4(cached):
+        return cached
+    ip = await asyncio.to_thread(_fetch_real_public_ipv4_sync)
+    if ip:
+        NETWORK_CACHE["ip"] = ip
+        NETWORK_CACHE_AT = asyncio.get_running_loop().time()
+    return ip
+
+
+async def detect_public_network(force: bool = False) -> dict[str, str]:
+    global NETWORK_CACHE_AT, NETWORK_CACHE
+    now = asyncio.get_running_loop().time()
+    if not force and NETWORK_CACHE_AT and now - NETWORK_CACHE_AT < PUBLIC_IP_REFRESH:
+        return dict(NETWORK_CACHE)
+    async with NETWORK_LOCK:
+        now = asyncio.get_running_loop().time()
+        if not force and NETWORK_CACHE_AT and now - NETWORK_CACHE_AT < PUBLIC_IP_REFRESH:
+            return dict(NETWORK_CACHE)
+
+        verified_ip = await real_public_ipv4(force=force)
+        if not valid_public_ipv4(verified_ip):
+            # Keep previously verified information only while it is still valid.
+            return dict(NETWORK_CACHE)
+
+        def fetch_geo() -> dict[str, str]:
+            headers = {"User-Agent": "RGNODES-VPS/1.0"}
+            for url in ("https://ipapi.co/json/", "https://ipinfo.io/json"):
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=7) as resp:
+                        data = json.loads(resp.read().decode("utf-8", "replace"))
+                    # The IP shown to users always comes from quorum verification;
+                    # geo providers supply location metadata only.
+                    return {
+                        "ip": verified_ip,
+                        "country": str(data.get("country_name") or data.get("country") or "N/A"),
+                        "region": str(data.get("region") or data.get("regionName") or "N/A"),
+                        "city": str(data.get("city") or "N/A"),
+                    }
+                except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
+                    continue
+            return {"ip": verified_ip, "country": "N/A", "region": "N/A", "city": "N/A"}
+
+        NETWORK_CACHE = fetch_geo()
+        NETWORK_CACHE["ip"] = verified_ip
+        NETWORK_CACHE_AT = asyncio.get_running_loop().time()
+        return dict(NETWORK_CACHE)
+
+
+def actual_location_label(network: dict[str, str]) -> str:
+    country = network.get("country", "N/A")
+    if country in {"Singapore", "SG"}:
+        return "Singapore 🇸🇬"
+    if country in {"India", "IN"}:
+        return "India 🇮🇳"
+    return clean(country, 64)
+
+
+# ================================================================
+# Port forwarding (10 TCP mappings per VPS, supervised 24/7)
+# ================================================================
+
+PORT_LOCK = asyncio.Lock()
+
+
+def port_in_use(host: str, port: int) -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return sock.connect_ex((host, port)) == 0
+    except OSError:
+        return True
+    finally:
+        sock.close()
+
+
+def port_bindable(port: int) -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+async def docker_container_ip(container: str) -> str | None:
+    rc, out, _ = await docker_cli("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", container, timeout=20, retries=1)
+    if rc != 0:
+        return None
+    ip = out.decode("utf-8", "replace").strip().splitlines()[0] if out else ""
+    return ip if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", ip) else None
+
+
+async def process_matches(pid: int, needle: str) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        proc_cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+        return needle.lower() in proc_cmdline.lower()
+    except (OSError, UnicodeError):
+        return False
+
+
+async def process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+async def kill_host_pid(pid: int | None, expected_command: str | None = None) -> None:
+    if not pid or int(pid) <= 0:
+        return
+    pid = int(pid)
+    if expected_command and not await process_matches(pid, expected_command):
+        return
+    if not await process_alive(pid):
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.kill(pid, signal.SIGTERM)
+    for _ in range(10):
+        if not await process_alive(pid):
+            return
+        await asyncio.sleep(0.1)
+    if await process_alive(pid):
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
+async def allocate_host_port() -> int | None:
+    conn = db_connect()
+    try:
+        reserved = {int(r[0]) for r in conn.execute("SELECT host_port FROM vps_ports")}
+    finally:
+        conn.close()
+    start = max(1024, PORT_RANGE_START)
+    end = min(65535, PORT_RANGE_END)
+    for port in range(start, end + 1):
+        if port in reserved:
+            continue
+        if port_bindable(port):
+            return port
+    return None
+
+
+async def verify_host_listener(port: int) -> bool:
+    """Confirm a local TCP listener exists on the selected host port."""
+    try:
+        rc, out, _ = await system_command("ss", "-H", "-ltn", timeout=8) if command_available("ss") else (127, "", "")
+        if rc == 0:
+            for line in out.splitlines():
+                if re.search(rf":{int(port)}\b", line):
+                    return True
+        # Fallback: probe localhost. This does not guarantee Internet reachability
+        # but confirms the forwarding process is accepting local TCP connections.
+        return await asyncio.to_thread(port_in_use, "127.0.0.1", int(port))
+    except Exception:
+        return False
+
+
+async def start_port_forward(port_row: sqlite3.Row, vps: sqlite3.Row) -> tuple[bool, str]:
+    if str(port_row["protocol"]).lower() != "tcp":
+        return False, "Only TCP forwarding is enabled."
+    if await docker_state(vps["container_id"]) != "running":
+        db_update_port(port_row["id"], status="stopped", pid=None, target_ip=None)
+        return False, "VPS is not running. Start it first."
+    if not command_available("socat"):
+        return False, "Port forwarding requires `socat`. Run `/install-system confirm` as administrator."
+
+    public_ipv4 = str(vps["public_ipv4"] or "").strip()
+    if not valid_public_ipv4(public_ipv4):
+        public_ipv4 = await real_public_ipv4(force=True) or ""
+        if valid_public_ipv4(public_ipv4):
+            db_set_vps_ipv4(vps["container_id"], public_ipv4)
+    if not valid_public_ipv4(public_ipv4):
+        return False, "Verified real public IPv4 is unavailable; forwarding was not started."
+
+    target_ip = await docker_container_ip(vps["container_id"])
+    if not target_ip:
+        return False, "Could not determine the VPS container IPv4."
+    try:
+        target_obj = ipaddress.ip_address(target_ip)
+        if not isinstance(target_obj, ipaddress.IPv4Address) or not target_obj.is_private:
+            return False, "Container IPv4 validation failed."
+    except ValueError:
+        return False, "Container IPv4 validation failed."
+
+    host_port = int(port_row["host_port"])
+    container_port = int(port_row["container_port"])
+    old_pid = int(port_row["pid"]) if str(port_row["pid"] or "").isdigit() else None
+
+    async with PORT_LOCK:
+        if old_pid and await process_alive(old_pid) and await process_matches(old_pid, "socat"):
+            if str(port_row["target_ip"] or "") == target_ip and await verify_host_listener(host_port):
+                db_update_port(port_row["id"], status="running")
+                return True, f"Port forwarding is already online on public port `{host_port}`."
+            await kill_host_pid(old_pid, "socat")
+
+        if not port_bindable(host_port):
+            # It may be the same listener just not represented by our PID; refuse
+            # to steal an unrelated service's port.
+            db_update_port(port_row["id"], status="error", pid=None, target_ip=target_ip)
+            return False, f"Public port `{host_port}` is already in use."
+
+        pid, error = await spawn_detached(
+            "socat",
+            "-ly",
+            f"TCP4-LISTEN:{host_port},bind=0.0.0.0,reuseaddr,fork",
+            f"TCP4:{target_ip}:{container_port}",
+        )
+        if not pid:
+            db_update_port(port_row["id"], status="error", pid=None, target_ip=target_ip)
+            return False, error or "Could not start the forwarding process."
+
+        await asyncio.sleep(0.25)
+        if not await process_alive(pid) or not await process_matches(pid, "socat") or not await verify_host_listener(host_port):
+            await kill_host_pid(pid, "socat")
+            db_update_port(port_row["id"], status="error", pid=None, target_ip=target_ip)
+            return False, f"Forwarding process started but could not be verified on port `{host_port}`."
+
+        db_update_port(port_row["id"], status="running", pid=pid, target_ip=target_ip)
+        return True, f"Port forwarding is online: public port `{host_port}` → VPS port `{container_port}/TCP`."
+
+
+async def stop_port_forward(port_row: sqlite3.Row) -> None:
+    await kill_host_pid(int(port_row["pid"]) if port_row["pid"] else None, "socat")
+    db_update_port(port_row["id"], status="stopped", pid=None)
+
+
+async def supervise_vps_ports(vps: sqlite3.Row) -> None:
+    try:
+        ports = db_list_ports(vps["id"])
+        if not ports:
+            return
+        running = (await docker_state(vps["container_id"])) == "running"
+        for p_row in ports:
+            try:
+                if running:
+                    await start_port_forward(p_row, vps)
+                else:
+                    await stop_port_forward(p_row)
+            except Exception as exc:
+                logger.warning("Port supervisor failed for VPS #%s port #%s: %s", vps["id"], p_row["id"], safe_log(exc))
+    except Exception as exc:
+        logger.warning("Port supervisor unavailable for VPS #%s: %s", vps["id"], safe_log(exc))
+
+
+
+# ================================================================
+# Docker snapshots
+# ================================================================
+SNAPSHOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+async def docker_snapshot_create(vps: sqlite3.Row, name: str) -> tuple[bool, str]:
+    if str(vps["backend"] or "docker").lower() != "docker":
+        return False, "Snapshots are currently available for Docker VPS instances only. Pterodactyl backups are managed by the panel."
+    name = name.strip()
+    if not SNAPSHOT_NAME_RE.fullmatch(name):
+        return False, "Snapshot name must be 1–64 characters and use only letters, numbers, `.`, `_`, or `-`."
+    if db_get_snapshot(vps["id"], name):
+        return False, "A snapshot with that name already exists."
+    if await docker_state(vps["container_id"]) != "running":
+        return False, "Start the VPS before creating a snapshot."
+    image_ref = f"rgnodes-snapshot:{int(vps['id'])}-{name.lower()}"
+    rc, out, err = await docker_cli("commit", vps["container_id"], image_ref, timeout=180, retries=1)
+    if rc != 0:
+        return False, f"Docker snapshot failed: {safe_log(err.decode('utf-8', 'replace'))}"
+    if not out.decode("utf-8", "replace").strip():
+        return False, "Docker did not return a snapshot image ID."
+    try:
+        db_insert_snapshot(vps["id"], name, image_ref)
+    except sqlite3.IntegrityError:
+        return False, "Snapshot record already exists."
+    return True, f"Snapshot `{name}` created successfully."
+
+
+async def docker_snapshot_restore(vps: sqlite3.Row, name: str) -> tuple[bool, str]:
+    if str(vps["backend"] or "docker").lower() != "docker":
+        return False, "Snapshot restore is currently available for Docker VPS instances only."
+    snap = db_get_snapshot(vps["id"], name.strip())
+    if not snap:
+        return False, "Snapshot not found."
+    container = vps["container_id"]
+    snapshot_image = str(snap["image_ref"])
+    rc, _, err = await docker_cli("image", "inspect", snapshot_image, timeout=30, retries=1)
+    if rc != 0:
+        db_delete_snapshot(vps["id"], name.strip())
+        return False, "Snapshot image no longer exists; its stale database record was removed."
+    new_name = str(vps["container_name"])
+    async with vps_lock(vps["id"]):
+        await stop_sshx(container)
+        for p_row in db_list_ports(vps["id"]):
+            await stop_port_forward(p_row)
+        if await docker_exists(container) and not await docker_remove(container):
+            return False, "Could not remove the current container safely, so restore was aborted."
+        new_container, create_error = await docker_run(
+            image=snapshot_image,
+            hostname=str(vps["hostname"]),
+            ram=str(vps["ram"]),
+            cpu=str(vps["cpu"]),
+            disk=str(vps["disk"]),
+            container_name=new_name,
+            location=str(vps["location"]),
+            persistent_key=str(vps["container_name"]),
+        )
+        if not new_container:
+            return False, f"Restore failed while recreating the container: {create_error}"
+        # `docker run --detach` starts the restored container already.
+        # Only start it explicitly when it is not running.
+        ok, error = await ensure_docker_running(new_container)
+        if not ok:
+            await docker_remove(new_container)
+            return False, f"Restore created a container but could not start it: {error}"
+        for _ in range(20):
+            if await docker_state(new_container) == "running":
+                break
+            await asyncio.sleep(0.5)
+        else:
+            await docker_remove(new_container)
+            return False, "Restored container did not reach running state."
+        console = await install_and_start_sshx(new_container)
+        # Atomically update the existing VPS record to the restored container.
+        conn = db_connect()
+        try:
+            conn.execute(
+                "UPDATE vps SET container_id=?, status='running', suspended=0, sshx_url=?, sshx_pid=?, updated_at=? WHERE id=?",
+                (new_container, console["url"] if console else None, console.get("pid") if console else None, utc_now(), int(vps["id"])),
+            )
+        finally:
+            conn.close()
+        latest = db_get_vps(vps["id"])
+        if latest:
+            await supervise_vps_ports(latest)
+    return True, f"Snapshot `{name}` restored successfully."
+
+
+async def snapshot_delete_image(vps: sqlite3.Row, name: str) -> tuple[bool, str]:
+    snap = db_get_snapshot(vps["id"], name.strip())
+    if not snap:
+        return False, "Snapshot not found."
+    image_ref = str(snap["image_ref"])
+    rc, _, err = await docker_cli("image", "rm", "-f", image_ref, timeout=60, retries=1)
+    if rc != 0 and "No such image" not in err.decode("utf-8", "replace"):
+        return False, f"Could not remove snapshot image: {safe_log(err.decode('utf-8', 'replace'))}"
+    db_delete_snapshot(vps["id"], name.strip())
+    return True, f"Snapshot `{name}` deleted."
+
+
+# ================================================================
+# Host/system bootstrap
+# ================================================================
+
+SYSTEM_PACKAGE_LOCK = asyncio.Lock()
+SYSTEM_PACKAGES = (
+    "ca-certificates",
+    "curl",
+    "bash",
+    "coreutils",
+    "procps",
+    "iproute2",
+    "iputils-ping",
+    "tar",
+    "gzip",
+    "unzip",
+    "socat",
+    "systemd",
+    "systemd-sysv",
+    "dbus",
+)
+DOCKER_PACKAGE = "docker.io"
+
+
+def host_os_info() -> dict[str, str]:
+    data: dict[str, str] = {}
+    try:
+        for raw in Path("/etc/os-release").read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" not in raw or raw.startswith("#"):
+                continue
+            key, value = raw.split("=", 1)
+            data[key] = value.strip().strip('"')
+    except (OSError, UnicodeError):
+        pass
+    try:
+        pid1 = Path("/proc/1/comm").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        pid1 = "unknown"
+    return {
+        "id": data.get("ID", "unknown"),
+        "name": data.get("PRETTY_NAME", data.get("NAME", "Unknown Linux")),
+        "version": data.get("VERSION_ID", "unknown"),
+        "pid1": pid1 or "unknown",
+        "systemd": str(pid1 == "systemd" or Path("/run/systemd/system").exists()).lower(),
+        "root": str(os.geteuid() == 0).lower() if hasattr(os, "geteuid") else "unknown",
+    }
+
+
+async def system_command(*args: str, timeout: float = 180) -> tuple[int, str, str]:
+    rc, out, err = await run_process(*args, timeout=timeout)
+    return rc, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+
+def command_available(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+async def _probe_docker_info() -> tuple[bool, str]:
+    """Probe the Docker CLI/daemon without attempting installation or repair."""
+    if not command_available("docker"):
+        return False, "Docker CLI is not installed or is not available in PATH."
+    rc, out, err = await docker_cli("info", timeout=30, retries=2)
+    if rc == 0:
+        return True, out.decode("utf-8", "replace")
+    detail = safe_log(err.decode("utf-8", "replace").strip() or out.decode("utf-8", "replace").strip() or "Docker daemon is unavailable.")
+    return False, detail
+
+
+async def docker_daemon_ready() -> tuple[bool, str]:
+    return await _probe_docker_info()
+
+
+async def install_system_dependencies() -> tuple[bool, str]:
+    async with SYSTEM_PACKAGE_LOCK:
+        info = host_os_info()
+        if info["root"] != "true":
+            return False, "Administrator/root privileges are required. Run the bot as root or grant it the required host permissions."
+
+        package_manager = shutil.which("apt-get")
+        if not package_manager:
+            if shutil.which("apk"):
+                return False, "This host uses Alpine/apk. Automatic bootstrap is intentionally limited to Debian/Ubuntu apt hosts."
+            return False, "No supported package manager was found. Supported automatic bootstrap: Debian/Ubuntu with apt-get."
+
+        os_id = info["id"].lower()
+        if os_id not in {"debian", "ubuntu", "linuxmint", "pop", "raspbian"}:
+            return False, f"Unsupported host OS for automatic bootstrap: `{info['name']}`."
+
+        messages: list[str] = [f"Host: {info['name']}", f"PID 1: `{info['pid1']}`"]
+        env = os.environ.copy()
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+
+        async def apt(*args: str, timeout: float = 300) -> tuple[int, str, str]:
+            return await system_command(
+                "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", *args,
+                timeout=timeout,
+            )
+
+        # Do not assume systemd exists just because systemctl exists. This is
+        # important in Docker/containers/WSL-like environments.
+        rc, _, err = await apt("update", "-y", timeout=300)
+        if rc != 0:
+            return False, "apt-get update failed:\n" + safe_log(err.strip() or "unknown apt error")
+
+        # command/package names differ (ca-certificates has no binary check).
+        # Install the full small base set; apt safely skips packages already installed.
+        rc, out, err = await apt("install", "-y", "--no-install-recommends", *SYSTEM_PACKAGES, timeout=360)
+        if rc != 0:
+            return False, "Base dependency installation failed:\n" + safe_log(err.strip() or out.strip() or "unknown apt error")
+        messages.append("Base Linux dependencies: installed/verified.")
+
+        # Install Docker only when the CLI is actually missing. Existing Docker
+        # installations are never replaced by this command.
+        if not command_available("docker"):
+            rc, out, err = await apt("install", "-y", "--no-install-recommends", DOCKER_PACKAGE, timeout=360)
+            if rc != 0:
+                return False, "Docker installation failed:\n" + safe_log(err.strip() or out.strip() or "unknown apt error")
+            messages.append("Docker CLI: installed from the distro package.")
+        else:
+            messages.append("Docker CLI: already present.")
+
+        # Refresh PATH-dependent checks after package installation.
+        docker_bin = shutil.which("docker")
+        if not docker_bin:
+            return False, "\n".join(messages + ["Docker CLI is still unavailable after installation."])
+
+        if info["systemd"] == "true" and command_available("systemctl"):
+            rc_unit, _, _ = await system_command("systemctl", "list-unit-files", "docker.service", timeout=30)
+            if rc_unit == 0:
+                rc_start, out_start, err_start = await system_command(
+                    "systemctl", "enable", "--now", "docker.service", timeout=90
+                )
+                if rc_start == 0:
+                    messages.append("Docker service: enabled and started via systemd.")
+                else:
+                    messages.append("Docker service: systemd detected, but start failed: " + safe_log(err_start.strip() or out_start.strip() or "unknown error"))
+            else:
+                messages.append("systemd: running, but docker.service was not found; Docker daemon may be socket-managed or externally managed.")
+        else:
+            messages.append(
+                "systemd: not active as PID 1. The command did not attempt `systemctl` "
+                "because systemd cannot manage services from this environment."
+            )
+
+        ready, docker_detail = await _probe_docker_info()
+        if ready:
+            messages.append("Docker daemon: ✅ reachable.")
+        else:
+            messages.append("Docker daemon: ⚠️ not reachable.")
+            messages.append("Reason: " + safe_log(docker_detail))
+
+        messages.append("Install-system completed without modifying VPS containers.")
+        return ready, "\n".join(messages)
+
+
+# ================================================================
+# Bot + UI
+# ================================================================
+
+intents = discord.Intents.default()
+intents.message_content = True
+
+
+class RGNODESBot(commands.Bot):
+    def __init__(self) -> None:
+        super().__init__(command_prefix=PREFIX, intents=intents, help_command=None)
+        self.synced = False
+        self.loops_started = False
+
+
+bot = RGNODESBot()
+CLAIMED_INTERACTION_IDS: set[str] = set()
+INTERACTION_GUARD_LOCK = asyncio.Lock()
+
+async def claim_interaction_once(interaction: discord.Interaction) -> bool:
+    """Atomically allow exactly one response pipeline per Discord interaction."""
+    interaction_id = getattr(interaction, "id", None)
+    if interaction_id is None:
+        return True
+    key = str(interaction_id)
+    async with INTERACTION_GUARD_LOCK:
+        if key in CLAIMED_INTERACTION_IDS:
+            return False
+        if not claim_processed_event(f"interaction:{key}", "interaction"):
+            return False
+        CLAIMED_INTERACTION_IDS.add(key)
+        if len(CLAIMED_INTERACTION_IDS) > 20000:
+            CLAIMED_INTERACTION_IDS.clear()
+            CLAIMED_INTERACTION_IDS.add(key)
+        return True
+
+
+class ReinstallView(discord.ui.View):
+    def __init__(self, vps_id: int, owner_id: int):
+        super().__init__(timeout=300)
+        self.vps_id = int(vps_id)
+        self.owner_id = int(owner_id)
+        self.os_select = discord.ui.Select(
+            placeholder="Select OS for clean reinstall",
+            min_values=1, max_values=1, row=0,
+            options=[
+                discord.SelectOption(label=c["label"], value=k, emoji="🟠" if k.startswith("ubuntu") else "🔵")
+                for k, c in OS_CONFIG.items()
+            ],
+        )
+        self.confirm_button = discord.ui.Button(label="Confirm Reinstall", emoji="♻️", style=discord.ButtonStyle.danger, row=1)
+        self.cancel_button = discord.ui.Button(label="Cancel", emoji="✖️", style=discord.ButtonStyle.secondary, row=1)
+        self.os_select.callback = self.select_os
+        self.confirm_button.callback = self.confirm
+        self.cancel_button.callback = self.cancel
+        self.add_item(self.os_select); self.add_item(self.confirm_button); self.add_item(self.cancel_button)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        vps = db_get_vps(self.vps_id)
+        allowed = bool(vps and (interaction.user.id in {self.owner_id, ADMIN_ID} or db_find_accessible_vps(interaction.user.id, str(self.vps_id))))
+        if allowed:
+            return True
+        await safe_respond(interaction, embed=make_embed("❌ Access Denied", "You do not have access to this VPS."))
+        return False
+
+    async def select_os(self, interaction: discord.Interaction) -> None:
+        value = self.os_select.values[0]
+        await safe_component_edit(
+            interaction,
+            embed=make_embed("♻️ Reinstall VPS", f"Selected OS: **{os_label(value)}**\n\nThis performs a clean reinstall and replaces the current container. Existing VPS data inside the container will be lost.\n\nPress **Confirm Reinstall** to continue."),
+            view=self,
+        )
+
+    async def confirm(self, interaction: discord.Interaction) -> None:
+        if not await claim_interaction_once(interaction):
+            return
+        selected = self.os_select.values[0] if self.os_select.values else ""
+        if not selected:
+            await safe_respond(interaction, embed=make_embed("⚠️ Select OS", "Choose an operating system before confirming reinstall."))
+            return
+        if not await safe_defer(interaction, ephemeral=True, claim=False):
+            return
+        try:
+            vps = db_get_vps(self.vps_id)
+            if not vps:
+                await safe_edit_original(interaction, embed=make_embed("❌ VPS Not Found", "This VPS no longer exists."), view=None)
+                return
+            backend = str(vps["backend"] or "docker").lower()
+            if backend == "docker":
+                async with vps_lock(self.vps_id):
+                    ok, message = await docker_reinstall_vps(vps, selected)
+            elif backend == "pterodactyl":
+                # lifecycle_action() owns its own VPS lock; do not nest it here.
+                ok, message = await lifecycle_action(vps, "reinstall")
+                if ok:
+                    message = f"Pterodactyl reinstall requested. The panel controls the server image; OS selector **{os_label(selected)}** was informational only."
+            else:
+                ok, message = False, "Unsupported VPS backend."
+            if ok:
+                latest = db_get_vps(self.vps_id) or vps
+                stats, uptime, disk, network, ports = await _dashboard_live_data(latest)
+                await safe_edit_original(interaction, embed=dashboard_embed(latest, stats, uptime, disk, network, ports), view=ManageView(latest["id"], latest["user_id"]))
+            else:
+                await safe_edit_original(interaction, embed=make_embed("❌ Reinstall Failed", message), view=ManageView(vps["id"], vps["user_id"]))
+        finally:
+            self.stop()
+
+    async def cancel(self, interaction: discord.Interaction) -> None:
+        await safe_component_edit(
+            interaction,
+            embed=make_embed("♻️ Reinstall Cancelled", "No changes were made to this VPS."),
+            view=None,
+        )
+        self.stop()
+
+
+class ManageView(discord.ui.View):
+    def __init__(self, vps_id: int, owner_id: int):
+        super().__init__(timeout=900)
+        self.vps_id = int(vps_id)
+        self.owner_id = int(owner_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        vps = db_get_vps(self.vps_id)
+        allowed = bool(vps and (
+            int(interaction.user.id) in {int(self.owner_id), int(ADMIN_ID)}
+            or db_find_accessible_vps(int(interaction.user.id), str(self.vps_id))
+        ))
+        if allowed:
+            return True
+        await safe_respond(
+            interaction,
+            embed=make_embed("❌ Access Denied", "You do not have access to this VPS."),
+        )
+        return False
+
+    async def run_action(self, interaction: discord.Interaction, action: str) -> None:
+        if not await claim_interaction_once(interaction):
+            return
+        if not await safe_defer(interaction, ephemeral=True, claim=False):
+            return
+        vps = db_get_vps(self.vps_id)
+        if not vps:
+            await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "This VPS no longer exists."))
+            self.stop()
+            return
+        try:
+            if action in {"stats", "refresh"}:
+                await show_dashboard(interaction, vps)
+                return
+            if action == "console":
+                ok, message = await create_console_access(vps, interaction.user)
+                latest = db_get_vps(self.vps_id) or vps
+                if ok and latest["sshx_url"]:
+                    # Keep console result as a single edited response; no duplicate follow-up.
+                    await safe_edit_original(
+                        interaction,
+                        embed=make_embed("✅ Console Ready", message),
+                        view=sshx_view(latest["sshx_url"]),
+                    )
+                else:
+                    await safe_edit_original(
+                        interaction,
+                        embed=make_embed("✅ Console Ready" if ok else "❌ Console Failed", message),
+                        view=ManageView(vps["id"], vps["user_id"]) if ok else ManageView(vps["id"], vps["user_id"]),
+                    )
+                return
+            ok, message = await lifecycle_action(vps, action)
+            if ok and action in {"start", "restart"}:
+                await send_private_ipv4(interaction.user, db_get_vps(vps["id"]) or vps)
+            if action == "delete" and ok:
+                self.stop()
+                await safe_edit_original(interaction, embed=make_embed("🗑️ VPS Removed", f"`{clean(vps['container_name'])}` and its forwarding rules were removed successfully."), view=None)
+                return
+            latest = await refresh_vps_record_state(db_get_vps(self.vps_id) or vps)
+            if str(latest["backend"] or "docker").lower() == "docker":
+                await asyncio.gather(supervise_vps_ports(latest), detect_public_network(), return_exceptions=True)
+                ports = db_list_ports(latest["id"])
+            else:
+                ports = []
+            stats, uptime, disk = await _safe_vps_live_data(latest)
+            dash = dashboard_embed(latest, stats, uptime, disk, NETWORK_CACHE, ports)
+            prefix = "✅" if ok else "❌"
+            dash.description = f"{prefix} {message}\n\n`{clean(latest['container_name'])}`\n\n**Status:** {status_text(latest['status'], bool(latest['suspended']))}"
+            await safe_edit_original(interaction, embed=dash, view=ManageView(latest["id"], latest["user_id"]))
+        except Exception as exc:
+            logger.error("Manage action failed for VPS #%s: %s", self.vps_id, safe_log(exc))
+            await safe_edit_original(
+                interaction,
+                embed=make_embed("❌ Action Failed", "The action could not be completed safely."),
+                view=ManageView(vps["id"], vps["user_id"]),
+            )
+
+    @discord.ui.button(label="Start", emoji="▶️", style=discord.ButtonStyle.secondary, row=0)
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button): await self.run_action(interaction, "start")
+    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.secondary, row=0)
+    async def stop_vps(self, interaction: discord.Interaction, button: discord.ui.Button): await self.run_action(interaction, "stop")
+    @discord.ui.button(label="Console", emoji="🖥️", style=discord.ButtonStyle.secondary, row=0)
+    async def console(self, interaction: discord.Interaction, button: discord.ui.Button): await self.run_action(interaction, "console")
+    @discord.ui.button(label="Stats", emoji="📊", style=discord.ButtonStyle.secondary, row=0)
+    async def stats(self, interaction: discord.Interaction, button: discord.ui.Button): await self.run_action(interaction, "stats")
+    @discord.ui.button(label="Restart", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
+    async def restart(self, interaction: discord.Interaction, button: discord.ui.Button): await self.run_action(interaction, "restart")
+    @discord.ui.button(label="Reinstall", emoji="♻️", style=discord.ButtonStyle.danger, row=1)
+    async def reinstall(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vps = db_get_vps(self.vps_id)
+        if not vps:
+            await safe_respond(interaction, embed=make_embed("❌ VPS Not Found", "This VPS no longer exists."))
+            return
+        await safe_respond(
+            interaction,
+            embed=make_embed("♻️ Reinstall VPS", "Select the operating system for the clean reinstall, then confirm.\n\n⚠️ Existing data inside the current VPS container will be lost."),
+            view=ReinstallView(self.vps_id, self.owner_id),
+            ephemeral=True,
+        )
+    @discord.ui.button(label="Refresh", emoji="🔃", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button): await self.run_action(interaction, "stats")
+    @discord.ui.button(label="Delete", emoji="🗑️", style=discord.ButtonStyle.secondary, row=1)
+    async def delete_vps(self, interaction: discord.Interaction, button: discord.ui.Button): await self.run_action(interaction, "delete")
+
+
+class DeployView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=180)
+        self.user_id = int(user_id)
+        self.selected_os = "ubuntu-24.04"
+        self.selected_location = DEFAULT_LOCATION
+        self.os_select = discord.ui.Select(placeholder="1️⃣ Select operating system", options=[discord.SelectOption(label=c["label"], value=k, emoji="🟠" if k.startswith("ubuntu") else "🔵") for k, c in OS_CONFIG.items()], row=0)
+        self.location_select = discord.ui.Select(
+            placeholder="2️⃣ Select location",
+            options=[
+                discord.SelectOption(
+                    label=cfg["label"],
+                    value=code,
+                    emoji=("🇸🇬" if code == "SG" else "🇮🇳"),
+                )
+                for code, cfg in LOCATION_CONFIG.items()
+            ],
+            row=1,
+        )
+        self.deploy_button = discord.ui.Button(label="Deploy VPS", emoji="🚀", style=discord.ButtonStyle.secondary, row=2)
+        self.os_select.callback = self.select_os
+        self.location_select.callback = self.select_location
+        self.deploy_button.callback = self.deploy
+        self.add_item(self.os_select); self.add_item(self.location_select); self.add_item(self.deploy_button)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id in {self.user_id, ADMIN_ID}:
+            return True
+        await safe_respond(interaction, embed=make_embed("❌ Access Denied", "This deployment menu belongs to another user."))
+        return False
+
+    async def select_os(self, interaction: discord.Interaction) -> None:
+        self.selected_os = normalize_os(self.os_select.values[0]) or self.selected_os
+        await safe_component_edit(
+            interaction,
+            embed=make_embed("🚀 Configure RGNODES™ VPS", f"OS: **{os_label(self.selected_os)}**\nLocation: **{location_label(self.selected_location)}**\n\nSelect both options, then press **Deploy VPS**."),
+            view=self,
+        )
+
+    async def select_location(self, interaction: discord.Interaction) -> None:
+        self.selected_location = normalize_location(self.location_select.values[0]) or DEFAULT_LOCATION
+        await safe_component_edit(
+            interaction,
+            embed=make_embed("🚀 Configure RGNODES™ VPS", f"OS: **{os_label(self.selected_os)}**\nLocation: **{location_label(self.selected_location)}**\n\nSelect both options, then press **Deploy VPS**."),
+            view=self,
+        )
+
+    async def deploy(self, interaction: discord.Interaction) -> None:
+        # Claim and defer exactly once before any early response.
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        # Re-check slots at click time so two open deploy menus cannot oversubscribe.
+        is_admin = ADMIN_BYPASS_LIMITS and ADMIN_ID > 0 and interaction.user.id == ADMIN_ID
+        used = db_vps_count(interaction.user.id)
+        limit = db_effective_slots(interaction.user.id)
+        if not is_admin and used >= limit:
+            await safe_edit_original(
+                interaction,
+                embed=make_embed(
+                    "🎟️ Slots Full",
+                    f"You are using **{used}/{limit}** VPS slots.\n\n**SLOTS FULL** — additional slots will be available soon. Ask an administrator to add slots.",
+                ),
+                view=self,
+            )
+            return
+        self.deploy_button.disabled = True
+        try:
+            await deploy_flow(interaction, user=interaction.user, os_type=self.selected_os, location=self.selected_location, ram=DEFAULT_RAM, cpu=DEFAULT_CPU, disk=DEFAULT_DISK)
+        finally:
+            self.stop()
+
+
+async def _dashboard_live_data(vps: sqlite3.Row) -> tuple[dict[str, str], str, dict[str, str], dict[str, str], list[sqlite3.Row]]:
+    """Collect dashboard data independently so one broken probe cannot blank the UI."""
+    backend = str(vps["backend"] or "docker").lower()
+    network = NETWORK_CACHE
+    ports: list[sqlite3.Row] = []
+    if backend == "docker":
+        await asyncio.gather(
+            supervise_vps_ports(vps),
+            detect_public_network(),
+            return_exceptions=True,
+        )
+        try:
+            ports = db_list_ports(vps["id"])
+        except Exception as exc:
+            logger.warning("VPS #%s port listing failed: %s", vps["id"], safe_log(exc))
+            ports = []
+
+    stats, uptime, disk = await _safe_vps_live_data(vps)
+    return stats, uptime, disk, network, ports
+
+
+async def _safe_vps_live_data(vps: sqlite3.Row) -> tuple[dict[str, str], str, dict[str, str]]:
+    """Collect live metrics independently; failed probes become N/A."""
+    try:
+        stats, uptime, disk = await asyncio.gather(
+            backend_stats(vps), backend_uptime(vps), backend_disk(vps),
+            return_exceptions=True,
+        )
+    except Exception as exc:
+        logger.warning("VPS #%s live-data gather failed: %s", vps["id"], safe_log(exc))
+        stats, uptime, disk = RuntimeError("stats unavailable"), "N/A", RuntimeError("disk unavailable")
+    if isinstance(stats, BaseException) or not isinstance(stats, dict):
+        stats = {"cpu": "N/A", "memory": "N/A", "network": "N/A"}
+    else:
+        stats = {str(k): clean(v) for k, v in stats.items()}
+    stats.setdefault("cpu", "N/A")
+    stats.setdefault("memory", "N/A")
+    stats.setdefault("network", "N/A")
+    if isinstance(uptime, BaseException) or uptime is None:
+        uptime = "N/A"
+    if isinstance(disk, BaseException) or not isinstance(disk, dict):
+        disk = {"used": "N/A", "total": clean(vps["disk"]), "percent": "N/A"}
+    else:
+        disk = {str(k): clean(v) for k, v in disk.items()}
+    disk.setdefault("used", "N/A")
+    disk.setdefault("total", clean(vps["disk"]))
+    disk.setdefault("percent", "N/A")
+    return stats, str(uptime), disk
+
+
+async def show_dashboard(interaction: discord.Interaction, vps: sqlite3.Row) -> None:
+    """Render exactly one dashboard response for slash/component interactions."""
+    vps = await refresh_vps_record_state(vps)
+    stats, uptime, disk, network, ports = await _dashboard_live_data(vps)
+    embed = dashboard_embed(vps, stats, uptime, disk, network, ports)
+    view = ManageView(vps["id"], vps["user_id"])
+    # A deferred interaction already owns its original response. Editing it is
+    # the only safe path; creating a follow-up here is what previously produced
+    # duplicate dashboard messages after button presses.
+    if interaction.response.is_done():
+        await safe_edit_original(interaction, embed=embed, view=view)
+    else:
+        await safe_followup(interaction, embed=embed, view=view)
+
+
+async def deploy_flow(interaction: discord.Interaction, *, user: discord.User | discord.Member, os_type: str, location: str, ram: str, cpu: str, disk: str, backend_override: str | None = None) -> None:
+    async def progress(embed: discord.Embed) -> None:
+        await safe_edit_original(interaction, embed=embed)
+
+    try:
+        ok, message, vps = await asyncio.wait_for(
+            create_vps(
+                user,
+                os_type=os_type,
+                location=location,
+                ram=ram,
+                cpu=cpu,
+                disk=disk,
+                progress=progress,
+                backend_override=backend_override,
+            ),
+            timeout=DEPLOY_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.error("Deployment timed out for user %s after %ss", user.id, DEPLOY_TIMEOUT)
+        await safe_edit_original(
+            interaction,
+            embed=make_embed(
+                "❌ VPS Creation Timed Out",
+                "Docker took too long to complete the deployment. Any partially created container was cleaned up when possible. Please retry.",
+            ),
+        )
+        return
+    except Exception:
+        logger.exception("Unhandled deployment exception for user %s", user.id)
+        await safe_edit_original(
+            interaction,
+            embed=make_embed("❌ VPS Creation Failed", "Deployment failed safely due to an unexpected backend error. Check the bot log for details."),
+        )
+        return
+    if not ok or not vps:
+        await safe_edit_original(interaction, embed=make_embed("❌ VPS Creation Failed", message))
+        return
+    network = await detect_public_network(force=True)
+    ip_ok = valid_public_ipv4(network.get("ip"))
+    if ip_ok:
+        with contextlib.suppress(Exception):
+            db_set_vps_ipv4(vps["container_id"], network["ip"])
+
+    console_url = normalize_sshx_url(vps["sshx_url"]) if vps["sshx_url"] else None
+    dm_sent = False
+    if console_url:
+        dm_sent = await safe_dm(
+            user,
+            console_embed(vps["container_name"], console_url, network.get("ip") if ip_ok else None, actual_location_label(network)),
+            sshx_view(console_url),
+        )
+        if ip_ok:
+            await safe_dm(user, ipv4_dm_embed(vps, network))
+    elif ip_ok:
+        await safe_dm(user, ipv4_dm_embed(vps, network))
+
+    final = make_embed("✅ VPS Ready", f"Your **{os_label(vps['os_type'])}** VPS is online.")
+    final.add_field(name="🖥️ VPS", value=f"`{clean(vps['container_name'])}` • ID `{vps['id']}`", inline=False)
+    final.add_field(name="🌍 Location", value=location_label(vps["location"]), inline=True)
+    if console_url:
+        console_state = "✅ SSHx link sent by DM" if dm_sent else "⚠️ SSHx ready, but DM is closed"
+    else:
+        console_state = "⚠️ SSHx temporarily unavailable — use Console/sshx to retry"
+    final.add_field(name="🌐 Console", value=console_state, inline=True)
+    await safe_edit_original(interaction, embed=final, view=ManageView(vps["id"], vps["user_id"]))
+
+
+def actor_vps(interaction: discord.Interaction, identifier: str | None) -> sqlite3.Row | None:
+    if interaction.user.id == ADMIN_ID:
+        return db_find_vps(interaction.user.id, identifier, admin=True)
+    return db_find_accessible_vps(interaction.user.id, identifier)
+
+
+# ================================================================
+# Slash commands (same public UI)
+# ================================================================
+
+
+def os_choices():
+    return [app_commands.Choice(name=c["label"], value=k) for k, c in OS_CONFIG.items()]
+
+
+def location_choices():
+    return [app_commands.Choice(name=c["label"], value=k) for k, c in LOCATION_CONFIG.items()]
+
+
+@bot.tree.command(name="deploy", description="Deploy a new RGNODES VPS.")
+@app_commands.describe(os_type="Operating system", location="VPS location", ram="RAM, e.g. 2g", cpu="CPU cores, e.g. 1", disk="Disk allocation, e.g. 10g")
+@app_commands.choices(os_type=os_choices(), location=location_choices())
+async def deploy_slash(interaction: discord.Interaction, os_type: str, location: str = DEFAULT_LOCATION, ram: str = DEFAULT_RAM, cpu: str = DEFAULT_CPU, disk: str = DEFAULT_DISK) -> None:
+    if await safe_defer(interaction, ephemeral=True):
+        await deploy_flow(interaction, user=interaction.user, os_type=os_type, location=location, ram=ram, cpu=cpu, disk=disk)
+
+
+@bot.tree.command(name="myvm", description="Open your newest RGNODES™ VPS dashboard.")
+async def myvm_slash(interaction: discord.Interaction) -> None:
+    """Open the caller's newest VPS, matching /manage with no identifier."""
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    vps = db_find_vps(interaction.user.id, None, admin=True) if interaction.user.id == ADMIN_ID and ADMIN_ID > 0 else db_find_accessible_vps(interaction.user.id, None)
+    if not vps:
+        await safe_followup(
+            interaction,
+            embed=make_embed("❌ No VPS Found", f"You do not have any VPS instances yet. Use `{PREFIX}deploy` first."),
+        )
+        return
+    await show_dashboard(interaction, vps)
+
+
+@bot.tree.command(name="manage", description="Open your VPS management dashboard.")
+@app_commands.describe(vps_identifier="VPS ID/name; blank uses your newest VPS")
+async def manage_slash(interaction: discord.Interaction, vps_identifier: str | None = None):
+    if not await safe_defer(interaction, ephemeral=True): return
+    vps = actor_vps(interaction, vps_identifier)
+    if not vps: await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found.")); return
+    await show_dashboard(interaction, vps)
+
+
+async def slash_lifecycle(interaction: discord.Interaction, identifier: str, action: str):
+    if not await safe_defer(interaction, ephemeral=True): return
+    vps = actor_vps(interaction, identifier)
+    if not vps: await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found.")); return
+    ok, message = await lifecycle_action(vps, action)
+    if ok and action in {"start", "restart"}:
+        await send_private_ipv4(interaction.user, db_get_vps(vps["id"]) or vps)
+    await safe_followup(interaction, embed=make_embed("✅ Action Complete" if ok else "❌ Action Failed", message))
+
+
+@bot.tree.command(name="start", description="Start a VPS.")
+async def start_slash(interaction: discord.Interaction, vps_identifier: str): await slash_lifecycle(interaction, vps_identifier, "start")
+@bot.tree.command(name="stop", description="Stop a VPS.")
+async def stop_slash(interaction: discord.Interaction, vps_identifier: str): await slash_lifecycle(interaction, vps_identifier, "stop")
+@bot.tree.command(name="restart", description="Restart a VPS.")
+async def restart_slash(interaction: discord.Interaction, vps_identifier: str): await slash_lifecycle(interaction, vps_identifier, "restart")
+
+
+@bot.tree.command(name="console", description="Generate a private SSHx console link and send it by DM.")
+async def console_slash(interaction: discord.Interaction, vps_identifier: str):
+    if not await safe_defer(interaction, ephemeral=True): return
+    vps = actor_vps(interaction, vps_identifier)
+    if not vps: await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found.")); return
+    ok, message = await create_console_access(vps, interaction.user)
+    await safe_followup(interaction, embed=make_embed("✅ Console Ready" if ok else "❌ Console Failed", message))
+
+
+@bot.tree.command(name="vps-info", description="Show full live VPS information.")
+async def vps_info_slash(interaction: discord.Interaction, vps_identifier: str | None = None):
+    if not await safe_defer(interaction, ephemeral=True): return
+    vps = actor_vps(interaction, vps_identifier)
+    if not vps: await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found.")); return
+    await show_dashboard(interaction, vps)
+
+
+@bot.tree.command(name="remove", description="Delete a VPS and its Docker container.")
+async def remove_slash(interaction: discord.Interaction, vps_identifier: str): await slash_lifecycle(interaction, vps_identifier, "delete")
+
+
+@bot.tree.command(name="list", description="List your VPS instances.")
+async def list_slash(interaction: discord.Interaction):
+    if not await safe_defer(interaction, ephemeral=True): return
+    rows = db_get_all_vps() if interaction.user.id == ADMIN_ID and ADMIN_ID > 0 else db_get_user_vps(interaction.user.id)
+    embed = make_embed("📋 Your RGNODES™ VPS")
+    if not rows: embed.description = "You do not have any VPS instances."
+    for row in rows[:25]:
+        embed.add_field(name=f"{status_text(row['status'], bool(row['suspended']))} {clean(row['container_name'])}", value=f"ID: `{row['id']}` • {os_label(row['os_type'])}\n{clean(row['ram'])} RAM • {clean(row['cpu'])} CPU • {clean(row['disk'])} Disk • {location_label(row['location'])}", inline=False)
+    await safe_followup(interaction, embed=embed)
+
+
+@bot.tree.command(name="ping", description="Check RGNODES™ bot latency.")
+async def ping_slash(interaction: discord.Interaction):
+    await safe_respond(interaction, embed=make_embed("🏓 Pong!", f"Discord latency: `{round(bot.latency * 1000)}ms`"))
+
+
+
+@bot.tree.command(name="myvps", description="Open your newest RGNODES™ VPS dashboard.")
+async def myvps_slash_alias(interaction: discord.Interaction):
+    await myvm_slash(interaction)
+
+
+@bot.tree.command(name="vps-stats", description="Show live VPS statistics.")
+async def vps_stats_slash(interaction: discord.Interaction, vps_identifier: str):
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    vps = actor_vps(interaction, vps_identifier)
+    if not vps:
+        await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found."))
+        return
+    vps = await refresh_vps_record_state(vps)
+    stats, uptime, disk = await _safe_vps_live_data(vps)
+    await safe_followup(interaction, embed=make_embed(
+        f"📈 VPS Stats • {clean(vps['container_name'])}",
+        f"CPU: `{clean(stats.get('cpu'))}`\nMemory: `{clean(stats.get('memory'))}`\n"
+        f"Disk: `{clean(disk.get('used'))} / {clean(vps['disk'])}`\n"
+        f"Network: `{clean(stats.get('network'))}`\nUptime: `{clean(uptime)}`"
+    ))
+
+
+@bot.tree.command(name="vps-uptime", description="Show VPS uptime.")
+async def vps_uptime_slash(interaction: discord.Interaction, vps_identifier: str):
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    vps = actor_vps(interaction, vps_identifier)
+    if not vps:
+        await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found."))
+        return
+    await safe_followup(interaction, embed=make_embed("⏱️ VPS Uptime", f"`{clean(await backend_uptime(vps))}`"))
+
+
+@bot.tree.command(name="restart-vps", description="Restart a VPS safely.")
+async def restart_vps_slash(interaction: discord.Interaction, vps_identifier: str):
+    await slash_lifecycle(interaction, vps_identifier, "restart")
+
+
+@bot.tree.command(name="snapshot", description="Create a Docker VPS snapshot.")
+async def snapshot_slash(interaction: discord.Interaction, vps_identifier: str, name: str | None = None):
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    vps = actor_vps(interaction, vps_identifier)
+    if not vps:
+        await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found."))
+        return
+    snap_name = (name or "").strip() or f"snapshot-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    ok, message = await docker_snapshot_create(vps, snap_name)
+    await safe_followup(interaction, embed=make_embed("📸 Snapshot Created" if ok else "❌ Snapshot Failed", message))
+
+
+@bot.tree.command(name="list-snapshots", description="List snapshots for a VPS.")
+async def list_snapshots_slash(interaction: discord.Interaction, vps_identifier: str):
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    vps = actor_vps(interaction, vps_identifier)
+    if not vps:
+        await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found."))
+        return
+    if str(vps["backend"] or "docker").lower() != "docker":
+        await safe_followup(interaction, embed=make_embed("🦖 Pterodactyl Backups", "This VPS uses Pterodactyl. Use the Panel's backup system instead of local Docker snapshots."))
+        return
+    rows = db_list_snapshots(vps["id"])
+    body = "\n".join(f"`{clean(r['name'])}` • {str(r['created_at'])[:19]} UTC" for r in rows[:20]) or "No snapshots."
+    await safe_followup(interaction, embed=make_embed(f"📋 Snapshots • {clean(vps['container_name'])}", body))
+
+
+@bot.tree.command(name="restore-snapshot", description="Restore a Docker VPS snapshot.")
+async def restore_snapshot_slash(interaction: discord.Interaction, vps_identifier: str, name: str):
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    vps = actor_vps(interaction, vps_identifier)
+    if not vps:
+        await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found."))
+        return
+    if not db_is_owner_or_admin(interaction.user.id, vps):
+        await safe_followup(interaction, embed=make_embed("❌ Permission Denied", "Only the VPS owner or administrator can restore snapshots."))
+        return
+    ok, message = await docker_snapshot_restore(vps, name)
+    await safe_followup(interaction, embed=make_embed("✅ Snapshot Restored" if ok else "❌ Restore Failed", message))
+
+
+@bot.tree.command(name="manage-shared", description="Manage a user's shared VPS access.")
+async def manage_shared_slash(interaction: discord.Interaction, owner_user: discord.User, vps_identifier: str):
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    vps = db_find_vps(owner_user.id, vps_identifier)
+    if not vps or not db_is_owner_or_admin(interaction.user.id, vps):
+        await safe_followup(interaction, embed=make_embed("❌ Permission Denied", "Only the VPS owner or administrator can manage shared access."))
+        return
+    shared = db_list_shared(vps["id"])
+    body = "\n".join(f"<@{r['user_id']}> • granted by <@{r['shared_by']}>" for r in shared) or "No users currently have shared access."
+    await safe_followup(interaction, embed=make_embed(f"👥 Shared Access • {clean(vps['container_name'])}", body), view=ManageView(vps["id"], vps["user_id"]))
+
+
+@bot.tree.command(name="share-ruser", description="Revoke a user's shared VPS access.")
+async def share_ruser_slash(interaction: discord.Interaction, vps_identifier: str, target_user: discord.User):
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    vps = actor_vps(interaction, vps_identifier)
+    if not vps or not db_is_owner_or_admin(interaction.user.id, vps):
+        await safe_followup(interaction, embed=make_embed("❌ Permission Denied", "Only the VPS owner or administrator can revoke shared access."))
+        return
+    ok, message = db_unshare_vps(vps["id"], target_user.id)
+    await safe_followup(interaction, embed=make_embed("✅ Access Removed" if ok else "⚠️ Nothing Changed", f"{message}\nVPS: `{clean(vps['container_name'])}` • User: <@{target_user.id}>"))
+
+
+@bot.tree.command(name="serverstats", description="Show host and VPS server statistics.")
+async def serverstats_slash(interaction: discord.Interaction):
+    await safe_defer(interaction, ephemeral=True)
+    info = host_os_info()
+    try:
+        load = os.getloadavg()[0]
+        load_text = f"{load:.2f}"
+    except (AttributeError, OSError):
+        load_text = "N/A"
+    try:
+        meminfo = Path("/proc/meminfo").read_text(encoding="utf-8", errors="replace")
+        total_m = re.search(r"^MemTotal:\s+(\d+)", meminfo, re.M)
+        avail_m = re.search(r"^MemAvailable:\s+(\d+)", meminfo, re.M)
+        ram_text = f"{format_bytes((int(total_m.group(1))-int(avail_m.group(1)))*1024)} / {format_bytes(int(total_m.group(1))*1024)}" if total_m and avail_m else "N/A"
+    except Exception:
+        ram_text = "N/A"
+    du = shutil.disk_usage("/")
+    ok, active = await docker_running_count()
+    if not ok:
+        active = db_running_count()
+    await safe_followup(interaction, embed=make_embed("📊 RGNODES™ • Server Statistics",
+        f"OS: `{clean(info['name'], 100)}`\nPID 1: `{clean(info['pid1'])}`\n"
+        f"Host uptime: `{await host_uptime()}`\nRAM: `{ram_text}`\n"
+        f"Disk: `{format_bytes(du.used)} / {format_bytes(du.total)}`\n"
+        f"CPU cores: `{os.cpu_count() or 1}` • Load: `{load_text}`\nActive VPS: `{active}`"))
+
+
+@bot.tree.command(name="thresholds", description="Show RGNODES™ resource thresholds.")
+async def thresholds_slash(interaction: discord.Interaction):
+    await safe_respond(interaction, embed=make_embed("📋 RGNODES™ • Thresholds",
+        f"Per-user slots: `{db_effective_slots(interaction.user.id)}`\nGlobal running VPS: `{TOTAL_RUNNING_LIMIT}`\n"
+        f"Max ports/VPS: `{MAX_PORTS_PER_VPS}`\nPort range: `{PORT_RANGE_START}-{PORT_RANGE_END}`\n"
+        "RAM per VPS: `256MB-256GB`\nDisk per VPS: `1GB-10TB`\nCPU per VPS: `>0-64 cores`"))
+
+
+@bot.tree.command(name="set-status", description="Admin: set the bot presence.")
+@app_commands.choices(status_type=[
+    app_commands.Choice(name="Playing", value="playing"),
+    app_commands.Choice(name="Watching", value="watching"),
+    app_commands.Choice(name="Listening", value="listening"),
+    app_commands.Choice(name="Competing", value="competing"),
+])
+async def set_status_slash(interaction: discord.Interaction, status_type: str, name: str):
+    if not admin_ok(interaction):
+        await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required."))
+        return
+    if status_type == "watching":
+        activity = discord.Activity(type=discord.ActivityType.watching, name=name)
+    elif status_type == "listening":
+        activity = discord.Activity(type=discord.ActivityType.listening, name=name)
+    elif status_type == "competing":
+        activity = discord.Activity(type=discord.ActivityType.competing, name=name)
+    else:
+        activity = discord.Game(name=name)
+    await bot.change_presence(activity=activity)
+    await safe_respond(interaction, embed=make_embed("✅ Status Updated", f"Type: `{status_type}`\nName: `{clean(name, 200)}`"))
+
+
+@bot.tree.command(name="about", description="Show RGNODES™ information.")
+async def about_slash(interaction: discord.Interaction):
+    embed = make_embed("☁️ RGNODES™ VPS Management", "Fast Docker VPS management with private SSHx access.")
+    embed.add_field(name="🛠️ Stack", value="Python 3 • discord.py • Docker • SQLite WAL", inline=False)
+    embed.add_field(name="🔐 Security", value="Console links are generated on demand and sent by DM only.", inline=False)
+    await safe_respond(interaction, embed=embed)
+
+
+@bot.tree.command(name="logs", description="View recent logs for your VPS.")
+async def logs_slash(interaction: discord.Interaction, vps_identifier: str, lines: int = 50):
+    if not await safe_defer(interaction, ephemeral=True): return
+    vps = actor_vps(interaction, vps_identifier)
+    if not vps: await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found.")); return
+    logs = await docker_logs(vps["container_id"], lines)
+    embed = make_embed(f"📜 Logs • {clean(vps['container_name'])}")
+    # Prevent user/container output from closing the Discord code block.
+    logs = str(logs).replace("```", "'''")
+    embed.add_field(name="Recent output", value=f"```text\n{logs[:3900]}\n```", inline=False)
+    await safe_followup(interaction, embed=embed)
+
+
+@bot.tree.command(name="ports", description="Show your VPS port forwarding rules.")
+async def ports_slash(interaction: discord.Interaction, vps_identifier: str):
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    vps = actor_vps(interaction, vps_identifier)
+    if not vps:
+        await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found."))
+        return
+    await supervise_vps_ports(vps)
+    ports = db_list_ports(vps["id"])
+    network = await detect_public_network(force=True)
+    if valid_public_ipv4(network.get("ip")):
+        db_set_vps_ipv4(vps["container_id"], network["ip"])
+        await safe_dm(interaction.user, ipv4_dm_embed(vps, network))
+    embed = make_embed(f"🌐 Ports • {clean(vps['container_name'])}", f"IPv4: 🔒 Sent by DM\nUsed: `{len(ports)}/{MAX_PORTS_PER_VPS}`")
+    if not ports:
+        embed.description += "\n\nNo forwarding rules configured. Use `/port-add`."
+    for p_row in ports:
+        embed.add_field(name=f"#{p_row['id']} • {str(p_row['protocol']).upper()}", value=f"Public port `{p_row['host_port']}` → VPS port `:{p_row['container_port']}` • **{clean(p_row['status']).upper()}**", inline=False)
+    await safe_followup(interaction, embed=embed)
+
+
+@bot.tree.command(name="port-add", description="Add a TCP port forward (maximum 10 per VPS).")
+@app_commands.describe(vps_identifier="VPS ID/name", container_port="Port inside the VPS", host_port="Public host port; leave 0 for automatic allocation")
+async def port_add_slash(interaction: discord.Interaction, vps_identifier: str, container_port: int, host_port: int = 0):
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    if not 1 <= container_port <= 65535:
+        await safe_followup(interaction, embed=make_embed("❌ Invalid Port", "Container port must be between 1 and 65535."))
+        return
+    vps = actor_vps(interaction, vps_identifier)
+    if not vps:
+        await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found."))
+        return
+    async with PORT_LOCK:
+        ports = db_list_ports(vps["id"])
+        if len(ports) >= MAX_PORTS_PER_VPS:
+            await safe_followup(interaction, embed=make_embed("⚠️ Port Limit Reached", f"A VPS can use at most `{MAX_PORTS_PER_VPS}` forwarding rules."))
+            return
+        if db_find_port(vps["id"], container_port, "tcp"):
+            await safe_followup(interaction, embed=make_embed("⚠️ Already Exists", "That container port is already forwarded."))
+            return
+        if host_port == 0:
+            host_port = await allocate_host_port() or 0
+        if not 1024 <= host_port <= 65535 or not port_bindable(host_port):
+            await safe_followup(interaction, embed=make_embed("❌ Host Port Unavailable", "Choose a free host port from 1024–65535, or use `0` for automatic allocation."))
+            return
+        try:
+            port_id = db_insert_port(vps["id"], container_port, host_port, "tcp")
+        except sqlite3.IntegrityError:
+            await safe_followup(interaction, embed=make_embed("❌ Port Conflict", "That public port is already reserved by another VPS."))
+            return
+    row = db_get_port(port_id)
+    ok, message = await start_port_forward(row, vps) if row else (False, "Forwarding record disappeared unexpectedly.")
+    if not ok:
+        if row:
+            await stop_port_forward(row)
+        db_delete_port(port_id)
+    else:
+        await send_private_ipv4(interaction.user, db_get_vps(vps["id"]) or vps)
+    await safe_followup(interaction, embed=make_embed("✅ Port Forward Added" if ok else "❌ Port Forward Failed", message))
+
+
+@bot.tree.command(name="port-remove", description="Remove a TCP port forward.")
+async def port_remove_slash(interaction: discord.Interaction, vps_identifier: str, port_id: int):
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    vps = actor_vps(interaction, vps_identifier)
+    row = db_get_port(port_id)
+    if not vps or not row or int(row["vps_id"]) != int(vps["id"]):
+        await safe_followup(interaction, embed=make_embed("❌ Port Not Found", "That forwarding rule does not belong to the selected VPS."))
+        return
+    await stop_port_forward(row)
+    db_delete_port(port_id)
+    await safe_followup(interaction, embed=make_embed("🗑️ Port Forward Removed", f"Forwarding rule `#{port_id}` has been removed."))
+
+
+@bot.tree.command(name="help", description="Open the RGNODES command navigator.")
+async def help_slash(interaction: discord.Interaction):
+    admin = interaction.user.id == ADMIN_ID
+    await safe_respond(interaction, embed=build_help_embed(admin, "home"), ephemeral=True, view=HelpView(interaction.user.id, admin))
+
+
+# ================================================================
+# Admin commands — compatibility surface kept
+# ================================================================
+
+
+def admin_ok(source: discord.Interaction | commands.Context) -> bool:
+    """Check the configured admin for slash interactions and prefix contexts."""
+    user = getattr(source, "user", None)
+    if user is None:
+        user = getattr(source, "author", None)
+    return bool(user and ADMIN_ID > 0 and int(user.id) == int(ADMIN_ID))
+
+
+@bot.tree.command(name="admin-create", description="Admin: create a VPS for another user.")
+@app_commands.choices(os_type=os_choices(), location=location_choices())
+async def admin_create(interaction: discord.Interaction, target_user: discord.User, os_type: str, location: str = DEFAULT_LOCATION, ram: str = DEFAULT_RAM, cpu: str = DEFAULT_CPU, disk: str = DEFAULT_DISK):
+    if not admin_ok(interaction): await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    if await safe_defer(interaction, ephemeral=True): await deploy_flow(interaction, user=target_user, os_type=os_type, location=location, ram=ram, cpu=cpu, disk=disk)
+
+
+@bot.tree.command(name="add-slots", description="Admin: add VPS slots to a user.")
+@app_commands.describe(target_user="Discord user", slots="How many additional VPS slots to add")
+async def add_slots_slash(interaction: discord.Interaction, target_user: discord.User, slots: int):
+    if not admin_ok(interaction):
+        await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required."))
+        return
+    if slots <= 0 or slots > 1000:
+        await safe_respond(interaction, embed=make_embed("❌ Invalid Slot Amount", "Choose a positive slot amount up to 1000."))
+        return
+    db_upsert_user(target_user.id, str(target_user))
+    total = db_add_slots(target_user.id, slots)
+    await safe_respond(interaction, embed=make_embed("🎟️ Slots Added", f"<@{target_user.id}> now has **{total} VPS slots**.\n\nAdditional slots added: `{slots}`"))
+
+
+@bot.tree.command(name="remove-all", description="Admin: delete every RGNODES VPS and reset VPS IDs.")
+@app_commands.describe(confirm="Must be true to perform this destructive action")
+async def remove_all_slash(interaction: discord.Interaction, confirm: bool = False):
+    if not admin_ok(interaction):
+        await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required."))
+        return
+    if not confirm:
+        await safe_respond(interaction, embed=make_embed("⚠️ Confirm Remove All", "This permanently removes all managed VPS containers, forwarding rules and VPS records. It also resets the VPS ID sequence. Run `/remove-all confirm:true` to continue."))
+        return
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    rows = db_get_all_vps()
+    removed = 0
+    failed = 0
+    for vps in rows:
+        try:
+            ok, _ = await lifecycle_action(vps, "delete")
+            removed += 1 if ok else 0
+            failed += 0 if ok else 1
+        except Exception as exc:
+            failed += 1
+            logger.exception("remove-all failed for VPS #%s: %s", vps["id"], exc)
+    # Clean orphaned managed Docker containers and reset relational records/sequence.
+    rc, out, _ = await docker_cli("ps", "-aq", "--format", "{{.ID}}\t{{.Names}}", timeout=60, retries=1)
+    orphans = []
+    if rc == 0:
+        for line in out.decode("utf-8", "replace").splitlines():
+            parts = line.strip().split("\t", 1)
+            if len(parts) == 2 and re.fullmatch(r"rgnodes-\d+", parts[1].strip(), flags=re.I):
+                orphans.append(parts[0])
+    for cid in orphans:
+        with contextlib.suppress(Exception):
+            await docker_remove(cid)
+    db_delete_all_vps()
+    await safe_followup(interaction, embed=make_embed("✅ Remove All Complete", f"Managed VPS removed: `{removed}`\nFailures: `{failed}`\nVPS ID sequence reset to `1`.\nAll forwarding records were cleared."))
+
+
+@bot.tree.command(name="admin-list", description="Admin: list all VPS instances.")
+async def admin_list(interaction: discord.Interaction):
+    if not admin_ok(interaction): await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    if not await safe_defer(interaction, ephemeral=True): return
+    rows = db_get_all_vps(); embed = make_embed("🗂️ Admin • All VPS")
+    if not rows: embed.description = "No VPS instances found."
+    for row in rows[:25]: embed.add_field(name=f"#{row['id']} • {clean(row['container_name'])}", value=f"Owner: <@{row['user_id']}>\n{status_text(row['status'], bool(row['suspended']))} • {location_label(row['location'])}", inline=False)
+    await safe_followup(interaction, embed=embed)
+
+
+@bot.tree.command(name="admin-delete-user", description="Admin: delete one VPS belonging to a user.")
+async def admin_delete_user(interaction: discord.Interaction, target_user: discord.User, vps_identifier: str):
+    if not admin_ok(interaction): await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    if not await safe_defer(interaction, ephemeral=True): return
+    vps = db_find_vps(target_user.id, vps_identifier)
+    if not vps: await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found.")); return
+    ok, message = await lifecycle_action(vps, "delete")
+    await safe_followup(interaction, embed=make_embed("✅ VPS Deleted" if ok else "❌ Delete Failed", message))
+
+
+@bot.tree.command(name="admin-ban", description="Admin: block a user from creating VPS instances.")
+async def admin_ban(interaction: discord.Interaction, target_user: discord.User):
+    if not admin_ok(interaction): await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    db_set_ban(target_user.id, True); await safe_respond(interaction, embed=make_embed("✅ User Restricted", f"<@{target_user.id}> can no longer create VPS instances."))
+
+
+@bot.tree.command(name="admin-unban", description="Admin: allow a user to create VPS instances again.")
+async def admin_unban(interaction: discord.Interaction, target_user: discord.User):
+    if not admin_ok(interaction): await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    db_set_ban(target_user.id, False); await safe_respond(interaction, embed=make_embed("✅ User Restored", f"<@{target_user.id}> may create VPS instances again."))
+
+
+@bot.tree.command(name="sshx", description="Generate a fresh private SSHx browser console link.")
+async def sshx_slash(interaction: discord.Interaction, vps_identifier: str): await console_slash(interaction, vps_identifier)
+
+
+@bot.tree.command(name="share-user", description="Share your VPS with another Discord user.")
+async def share_user_slash(interaction: discord.Interaction, vps_identifier: str, target_user: discord.User):
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    vps = actor_vps(interaction, vps_identifier)
+    if not vps or not db_is_owner_or_admin(interaction.user.id, vps):
+        await safe_followup(interaction, embed=make_embed("❌ Permission Denied", "Only the VPS owner or administrator can share this VPS."))
+        return
+    ok, message = db_share_vps(vps["id"], target_user.id, interaction.user.id)
+    await safe_followup(interaction, embed=make_embed("✅ VPS Shared" if ok else "⚠️ Share Failed", f"{message}\nVPS: `{vps['container_name']}` • User: <@{target_user.id}>"))
+
+
+@bot.tree.command(name="unshare-user", description="Remove a user's access to your VPS.")
+async def unshare_user_slash(interaction: discord.Interaction, vps_identifier: str, target_user: discord.User):
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    vps = actor_vps(interaction, vps_identifier)
+    if not vps or not db_is_owner_or_admin(interaction.user.id, vps):
+        await safe_followup(interaction, embed=make_embed("❌ Permission Denied", "Only the VPS owner or administrator can remove shared access."))
+        return
+    ok, message = db_unshare_vps(vps["id"], target_user.id)
+    await safe_followup(interaction, embed=make_embed("✅ Access Removed" if ok else "⚠️ Nothing Changed", f"{message}\nVPS: `{vps['container_name']}` • User: <@{target_user.id}>"))
+
+
+
+
+@bot.tree.command(name="admin-manage", description="Admin: control a user's VPS.")
+@app_commands.choices(action=[app_commands.Choice(name=x.title(), value=x) for x in ("start", "stop", "restart", "delete", "suspend", "unsuspend")])
+async def admin_manage(interaction: discord.Interaction, target_user: discord.User, vps_identifier: str, action: str):
+    if not admin_ok(interaction): await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    if not await safe_defer(interaction, ephemeral=True): return
+    vps = db_find_vps(target_user.id, vps_identifier)
+    if not vps: await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found.")); return
+    if action in {"start", "stop", "restart", "delete"}:
+        ok, message = await lifecycle_action(vps, action)
+    elif action == "suspend":
+        ok, message = await lifecycle_action(vps, "stop")
+        if ok: db_update_vps(vps["container_id"], suspended=1); message = "VPS stopped and suspended."
+    else:
+        db_update_vps(vps["container_id"], suspended=0); ok, message = True, "VPS unsuspended."
+    await safe_followup(interaction, embed=make_embed("✅ Admin Action Complete" if ok else "❌ Admin Action Failed", message))
+
+
+@bot.tree.command(name="admin-list-users", description="Admin: list users and VPS counts.")
+async def admin_list_users(interaction: discord.Interaction):
+    if not admin_ok(interaction): await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    if not await safe_defer(interaction, ephemeral=True): return
+    conn = db_connect()
+    try:
+        rows = conn.execute("SELECT u.user_id,u.username,COUNT(v.id) AS total_vps,SUM(CASE WHEN v.status='running' AND v.suspended=0 THEN 1 ELSE 0 END) AS running_vps FROM users u LEFT JOIN vps v ON u.user_id=v.user_id GROUP BY u.user_id,u.username ORDER BY total_vps DESC").fetchall()
+    finally: conn.close()
+    embed = make_embed("👥 Admin • Users")
+    if not rows: embed.description = "No users have been recorded yet."
+    for row in rows[:25]: embed.add_field(name=clean(row["username"]), value=f"Total: `{row['total_vps']}` • Running: `{row['running_vps'] or 0}`", inline=False)
+    await safe_followup(interaction, embed=embed)
+
+
+@bot.tree.command(name="admin-stats", description="Admin: show RGNODES statistics.")
+async def admin_stats(interaction: discord.Interaction):
+    if not admin_ok(interaction): await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    if not await safe_defer(interaction, ephemeral=True): return
+    conn = db_connect()
+    try:
+        users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]; total = conn.execute("SELECT COUNT(*) FROM vps").fetchone()[0]; running = conn.execute("SELECT COUNT(*) FROM vps WHERE status='running' AND suspended=0").fetchone()[0]; banned = conn.execute("SELECT COUNT(*) FROM bans").fetchone()[0]
+    finally: conn.close()
+    embed = make_embed("📊 Admin • Statistics")
+    docker_ok, docker_running = await docker_running_count()
+    if not docker_ok:
+        docker_running = db_running_count()
+    ptero_running = sum(1 for row in db_get_all_vps() if str(row["backend"] or "docker").lower() == "pterodactyl" and str(row["status"]).lower() in {"running", "starting", "restarting"} and not row["suspended"])
+    live_running = docker_running + ptero_running
+    for n, v in (("Users", users), ("Banned", banned), ("Total VPS", total), ("DB Running", running), ("Live Active", live_running), ("Running limit", TOTAL_RUNNING_LIMIT)): embed.add_field(name=n, value=str(v), inline=True)
+    await safe_followup(interaction, embed=embed)
+
+
+@bot.tree.command(name="admin-vps-info", description="Admin: view a user's VPS dashboard.")
+async def admin_vps_info(interaction: discord.Interaction, target_user: discord.User, vps_identifier: str):
+    if not admin_ok(interaction): await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    if not await safe_defer(interaction, ephemeral=True): return
+    vps = db_find_vps(target_user.id, vps_identifier)
+    if not vps: await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found.")); return
+    vps = await refresh_vps_record_state(vps)
+    stats, uptime, disk = await _safe_vps_live_data(vps)
+    ports = db_list_ports(vps["id"]) if str(vps["backend"] or "docker").lower() == "docker" else []
+    await safe_followup(interaction, embed=dashboard_embed(vps, stats, uptime, disk, NETWORK_CACHE, ports))
+
+
+@bot.tree.command(name="admin-logs", description="Admin: view a user's VPS logs.")
+async def admin_logs(interaction: discord.Interaction, target_user: discord.User, vps_identifier: str, lines: int = 50):
+    if not admin_ok(interaction): await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    if not await safe_defer(interaction, ephemeral=True): return
+    vps = db_find_vps(target_user.id, vps_identifier)
+    if not vps: await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found.")); return
+    logs = (await docker_logs(vps["container_id"], lines)).replace("```", "'''")
+    embed = make_embed(f"📜 Admin Logs • {clean(vps['container_name'])}"); embed.add_field(name="Recent output", value=f"```text\n{logs[:3900]}\n```", inline=False)
+    await safe_followup(interaction, embed=embed)
+
+
+@bot.tree.command(name="admin-kill-all", description="Admin: stop all running VPS instances.")
+async def admin_kill_all(interaction: discord.Interaction):
+    if not admin_ok(interaction): await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    if not await safe_defer(interaction, ephemeral=True): return
+    results = await asyncio.gather(*(lifecycle_action(vps, "stop") for vps in db_get_all_vps() if vps["status"] == "running"), return_exceptions=True)
+    stopped = sum(1 for x in results if isinstance(x, tuple) and x[0])
+    await safe_followup(interaction, embed=make_embed("🛑 Admin • Kill All", f"Stopped `{stopped}` VPS instance(s)."))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ================================================================
+# System bootstrap commands
+# ================================================================
+
+def confirm_value(value: str | bool | None) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"confirm", "true", "yes", "y", "1"}
+
+
+@bot.tree.command(
+    name="install-system",
+    description="Admin: install/repair Linux and Docker dependencies.",
+)
+@app_commands.describe(confirm="Set true to actually run the system bootstrap.")
+async def install_system_slash(interaction: discord.Interaction, confirm: bool = False):
+    if not admin_ok(interaction):
+        await safe_respond(interaction, embed=make_embed(
+            "❌ Permission Denied",
+            "Administrator access is required.",
+        ))
+        return
+
+    if not confirm:
+        info = host_os_info()
+        await safe_respond(interaction, embed=make_embed(
+            "🛠️ RGNODES™ • Install System",
+            (
+                "This command can install/repair the small Linux dependency set "
+                "and Docker when Docker is missing.\n\n"
+                f"**Detected OS:** `{clean(info['name'])}`\n"
+                f"**PID 1:** `{clean(info['pid1'])}`\n"
+                f"**Root:** `{clean(info['root'])}`\n\n"
+                "**Nothing has been changed.**\n"
+                "Run `/install-system confirm:true` to proceed."
+            ),
+        ))
+        return
+
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    try:
+        ok, result = await asyncio.wait_for(install_system_dependencies(), timeout=900)
+        title = "✅ Install System Complete" if ok else "⚠️ Install System Finished With Issues"
+        await safe_followup(interaction, embed=make_embed(title, f"```text\n{safe_log(result, 3800)}\n```"))
+    except asyncio.TimeoutError:
+        await safe_followup(interaction, embed=make_embed(
+            "❌ Install System Timeout",
+            "The host bootstrap exceeded the 15-minute safety timeout. Check the host package manager and Docker daemon manually.",
+        ))
+    except Exception as exc:
+        logger.exception("install-system failed")
+        await safe_followup(interaction, embed=make_embed(
+            "❌ Install System Failed",
+            f"```text\n{safe_log(exc, 3800)}\n```",
+        ))
+
+
+# ================================================================
+# Prefix compatibility layer
+# ================================================================
+
+def ctx_vps(ctx: commands.Context, identifier: str | None = None) -> sqlite3.Row | None:
+    """Single VPS resolver for every prefix command. Admins can see all VPSs;
+    normal users can see owned or shared VPSs. Empty identifier means newest.
+    """
+    needle = (identifier or "").strip()
+    if ctx.author.id == ADMIN_ID and ADMIN_ID > 0:
+        return db_find_vps(ctx.author.id, needle, admin=True)
+    return db_find_accessible_vps(ctx.author.id, needle)
+
+
+@bot.check
+async def _global_prefix_event_guard(ctx: commands.Context) -> bool:
+    """Prevent the same Discord message from being processed twice.
+
+    This protects against brief multi-process overlap and duplicate gateway
+    delivery during a restart without sending a second response.
+    """
+    message = getattr(ctx, "message", None)
+    event_id = getattr(message, "id", None)
+    allowed = claim_processed_event(f"msg:{event_id}", "prefix")
+    if not allowed:
+        setattr(ctx, "_rgnodes_duplicate_event", True)
+    return allowed
+
+
+@bot.command(name="share-user")
+async def prefix_share_user(ctx: commands.Context, target_user: discord.User, vps_identifier: str):
+    vps = ctx_vps(ctx, vps_identifier)
+    if not vps or not db_is_owner_or_admin(ctx.author.id, vps):
+        await safe_ctx_send(ctx, make_embed("❌ Permission Denied", "Only the VPS owner or administrator can share this VPS."))
+        return
+    ok, message = db_share_vps(vps["id"], target_user.id, ctx.author.id)
+    await safe_ctx_send(ctx, make_embed("✅ VPS Shared" if ok else "⚠️ Share Failed", f"{message}\nVPS: `{clean(vps['container_name'])}` • User: <@{target_user.id}>"))
+
+
+@bot.command(name="share-ruser", aliases=["unshare-user"])
+async def prefix_share_ruser(ctx: commands.Context, target_user: discord.User, vps_identifier: str):
+    vps = ctx_vps(ctx, vps_identifier)
+    if not vps or not db_is_owner_or_admin(ctx.author.id, vps):
+        await safe_ctx_send(ctx, make_embed("❌ Permission Denied", "Only the VPS owner or administrator can revoke access."))
+        return
+    ok, message = db_unshare_vps(vps["id"], target_user.id)
+    await safe_ctx_send(ctx, make_embed("✅ Access Removed" if ok else "⚠️ Nothing Changed", f"{message}\nVPS: `{clean(vps['container_name'])}` • User: <@{target_user.id}>"))
+
+
+
+
+@bot.command(name="myvps", aliases=["myvm"])
+async def prefix_myvps(ctx: commands.Context) -> None:
+    await prefix_manage(ctx, "")
+
+
+@bot.command(name="uptime")
+async def prefix_uptime(ctx: commands.Context):
+    await safe_ctx_send(ctx, make_embed("⏱️ RGNODES™ • Host Uptime", f"Host uptime: `{await host_uptime()}`"))
+
+
+@bot.command(name="vpsinfo", aliases=["vps-info"])
+async def prefix_vpsinfo(ctx: commands.Context, identifier: str = ""):
+    vps = ctx_vps(ctx, identifier)
+    if not vps:
+        await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
+        return
+    await safe_ctx_send(ctx, make_embed(
+        f"📊 VPS Info • {clean(vps['container_name'])}",
+        f"ID: `{vps['id']}`\nStatus: **{status_text(vps['status'], bool(vps['suspended']))}**\n"
+        f"OS: `{os_label(vps['os_type'])}`\nLocation: `{location_label(vps['location'])}`\n"
+        f"RAM: `{vps['ram']}` • CPU: `{vps['cpu']}` • Disk: `{vps['disk']}`\n"
+        f"Backend: `{str(vps['backend'] or 'docker').lower()}`"
+    ))
+
+
+@bot.command(name="vps-stats")
+async def prefix_vps_stats(ctx: commands.Context, identifier: str = ""):
+    vps = ctx_vps(ctx, identifier)
+    if not vps:
+        await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
+        return
+    vps = await refresh_vps_record_state(vps)
+    stats, uptime, disk = await _safe_vps_live_data(vps)
+    await safe_ctx_send(ctx, make_embed(
+        f"📈 VPS Stats • {clean(vps['container_name'])}",
+        f"CPU: `{clean(stats.get('cpu'))}`\nMemory: `{clean(stats.get('memory'))}`\n"
+        f"Disk: `{clean(disk.get('used'))} / {clean(vps['disk'])}`\nNetwork: `{clean(stats.get('network'))}`\nUptime: `{clean(uptime)}`"
+    ))
+
+
+@bot.command(name="vps-uptime")
+async def prefix_vps_uptime(ctx: commands.Context, identifier: str = ""):
+    vps = ctx_vps(ctx, identifier)
+    if not vps:
+        await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
+        return
+    try:
+        uptime = await asyncio.wait_for(backend_uptime(vps), timeout=25)
+    except Exception as exc:
+        logger.warning("Prefix VPS uptime failed for #%s: %s", vps["id"], safe_log(exc))
+        uptime = "N/A"
+    await safe_ctx_send(ctx, make_embed("⏱️ VPS Uptime", f"`{clean(uptime)}`"))
+
+
+
+
+@bot.command(name="restart-vps")
+async def prefix_restart_vps(ctx: commands.Context, identifier: str = ""):
+    await prefix_action(ctx, identifier, "restart")
+
+
+@bot.command(name="snapshot")
+async def prefix_snapshot(ctx: commands.Context, identifier: str, name: str = ""):
+    vps = ctx_vps(ctx, identifier)
+    if not vps:
+        await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
+        return
+    name = name.strip() or f"snapshot-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    ok, message = await docker_snapshot_create(vps, name)
+    await safe_ctx_send(ctx, make_embed("📸 Snapshot Created" if ok else "❌ Snapshot Failed", message))
+
+
+@bot.command(name="list-snapshots")
+async def prefix_list_snapshots(ctx: commands.Context, identifier: str = ""):
+    vps = ctx_vps(ctx, identifier)
+    if not vps:
+        await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
+        return
+    rows = db_list_snapshots(vps["id"])
+    body = "\n".join(f"`{r['name']}` • {str(r['created_at'])[:19]}" for r in rows[:20]) or "No snapshots."
+    await safe_ctx_send(ctx, make_embed(f"📋 Snapshots • {clean(vps['container_name'])}", body))
+
+
+@bot.command(name="restore-snapshot")
+async def prefix_restore_snapshot(ctx: commands.Context, identifier: str, name: str):
+    vps = ctx_vps(ctx, identifier)
+    if not vps:
+        await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
+        return
+    if not db_is_owner_or_admin(ctx.author.id, vps):
+        await safe_ctx_send(ctx, make_embed("❌ Permission Denied", "Only the VPS owner or administrator can restore snapshots."))
+        return
+    ok, message = await docker_snapshot_restore(vps, name)
+    await safe_ctx_send(ctx, make_embed("✅ Snapshot Restored" if ok else "❌ Restore Failed", message))
+
+
+@bot.command(name="manage-shared")
+async def prefix_manage_shared(ctx: commands.Context, target_user: discord.User, vps_identifier: str):
+    vps = db_find_vps(target_user.id, vps_identifier)
+    if not vps or not db_is_owner_or_admin(ctx.author.id, vps):
+        await safe_ctx_send(ctx, make_embed("❌ Permission Denied", "Only the VPS owner or administrator can manage shared access."))
+        return
+    shared = db_list_shared(vps["id"])
+    body = "\n".join(f"<@{r['user_id']}> • granted by <@{r['shared_by']}>" for r in shared) or "No users currently have shared access."
+    await safe_ctx_send(ctx, make_embed(f"👥 Shared Access • {clean(vps['container_name'])}", body), ManageView(vps["id"], vps["user_id"]))
+
+
+@bot.command(name="serverstats")
+async def prefix_serverstats(ctx: commands.Context):
+    info = host_os_info()
+    try:
+        load = os.getloadavg()[0]
+        load_text = f"{load:.2f}"
+    except (AttributeError, OSError):
+        load_text = "N/A"
+    try:
+        meminfo = Path("/proc/meminfo").read_text(encoding="utf-8", errors="replace")
+        total_kb = int(re.search(r"^MemTotal:\\s+(\\d+)", meminfo, re.M).group(1))
+        avail_kb = int(re.search(r"^MemAvailable:\\s+(\\d+)", meminfo, re.M).group(1))
+        ram_text = f"{format_bytes((total_kb-avail_kb)*1024)} / {format_bytes(total_kb*1024)}"
+    except Exception:
+        ram_text = "N/A"
+    disk = shutil.disk_usage("/")
+    ok, active = await docker_running_count()
+    if not ok:
+        active = db_running_count()
+    await safe_ctx_send(ctx, make_embed("📊 RGNODES™ • Server Statistics",
+        f"OS: `{clean(info['name'], 100)}`\nPID 1: `{clean(info['pid1'])}`\n"
+        f"Host uptime: `{await host_uptime()}`\nRAM: `{ram_text}`\n"
+        f"Disk: `{format_bytes(disk.used)} / {format_bytes(disk.total)}`\n"
+        f"CPU cores: `{os.cpu_count() or 1}` • Load: `{load_text}`\nActive VPS: `{active}`"))
+
+
+@bot.command(name="thresholds")
+async def prefix_thresholds(ctx: commands.Context):
+    await safe_ctx_send(ctx, make_embed("📋 RGNODES™ • Thresholds",
+        f"Per-user slots: `{db_effective_slots(ctx.author.id)}`\n"
+        f"Global running VPS: `{TOTAL_RUNNING_LIMIT}`\n"
+        f"Max ports/VPS: `{MAX_PORTS_PER_VPS}`\n"
+        f"Port range: `{PORT_RANGE_START}-{PORT_RANGE_END}`\n"
+        f"RAM per VPS: `256MB-256GB`\nDisk per VPS: `1GB-10TB`\nCPU per VPS: `0-64 cores`"))
+
+
+@bot.command(name="set-status")
+async def prefix_set_status(ctx: commands.Context, status_type: str, *, name: str):
+    if not admin_ok(ctx):
+        await safe_ctx_send(ctx, make_embed("❌ Permission Denied", "Administrator access is required."))
+        return
+    kind = status_type.strip().lower()
+    activity: discord.BaseActivity
+    if kind == "watching":
+        activity = discord.Activity(type=discord.ActivityType.watching, name=name)
+    elif kind == "listening":
+        activity = discord.Activity(type=discord.ActivityType.listening, name=name)
+    elif kind == "competing":
+        activity = discord.Activity(type=discord.ActivityType.competing, name=name)
+    else:
+        kind = "playing"
+        activity = discord.Game(name=name)
+    await bot.change_presence(activity=activity)
+    await safe_ctx_send(ctx, make_embed("✅ Status Updated", f"Type: `{kind}`\nName: `{clean(name, 200)}`"))
+
+
+@bot.group(name="ports", invoke_without_command=True)
+async def prefix_ports(ctx: commands.Context, identifier: str = ""):
+    if ctx.invoked_subcommand:
+        return
+    vps = ctx_vps(ctx, identifier)
+    if not vps:
+        await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", f"Use `{PREFIX}ports list <vps#>` or open `{PREFIX}manage`."))
+        return
+    if str(vps["backend"] or "docker").lower() != "docker":
+        panel = await ptero_panel_link(vps)
+        await safe_ctx_send(ctx, make_embed("🦖 Pterodactyl Ports", f"Port allocations are managed by Pterodactyl.\nPanel: {panel or 'not configured'}"))
+        return
+    rows = db_list_ports(vps["id"])
+    body = "\n".join(f"#{r['id']} • `{r['host_port']}→{r['container_port']}/TCP` • `{r['status']}`" for r in rows) or "No forwarding rules."
+    await safe_ctx_send(ctx, make_embed(f"🌐 Ports • {clean(vps['container_name'])}", body))
+
+
+@prefix_ports.command(name="add")
+async def prefix_ports_add(ctx: commands.Context, identifier: str, container_port: int, host_port: int = 0):
+    vps = ctx_vps(ctx, identifier)
+    if not vps:
+        await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
+        return
+    if str(vps["backend"] or "docker").lower() != "docker":
+        await safe_ctx_send(ctx, make_embed("🦖 Pterodactyl Allocations", "This VPS uses Pterodactyl. Manage ports/allocations from the panel."))
+        return
+    if not 1 <= container_port <= 65535:
+        await safe_ctx_send(ctx, make_embed("❌ Invalid Port", "Container port must be between 1 and 65535."))
+        return
+    async with PORT_LOCK:
+        if len(db_list_ports(vps["id"])) >= MAX_PORTS_PER_VPS:
+            await safe_ctx_send(ctx, make_embed("⚠️ Port Limit Reached", f"Maximum `{MAX_PORTS_PER_VPS}` forwarding rules per VPS."))
+            return
+        if db_find_port(vps["id"], container_port, "tcp"):
+            await safe_ctx_send(ctx, make_embed("⚠️ Already Exists", "That container port is already forwarded."))
+            return
+        if host_port == 0:
+            host_port = await allocate_host_port() or 0
+        if not 1024 <= host_port <= 65535 or not port_bindable(host_port):
+            await safe_ctx_send(ctx, make_embed("❌ Host Port Unavailable", "Use a free port 1024–65535 or 0 for auto-allocation."))
+            return
+        try:
+            port_id = db_insert_port(vps["id"], container_port, host_port, "tcp")
+        except sqlite3.IntegrityError:
+            await safe_ctx_send(ctx, make_embed("❌ Port Conflict", "That public port is already reserved."))
+            return
+    row = db_get_port(port_id)
+    ok, message = await start_port_forward(row, vps) if row else (False, "Forwarding record disappeared.")
+    if not ok:
+        if row:
+            await stop_port_forward(row)
+        db_delete_port(port_id)
+    await safe_ctx_send(ctx, make_embed("✅ Port Added" if ok else "❌ Port Failed", message))
+
+
+@prefix_ports.command(name="list")
+async def prefix_ports_list(ctx: commands.Context, identifier: str = ""):
+    vps = ctx_vps(ctx, identifier)
+    if not vps:
+        await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
+        return
+    if str(vps["backend"] or "docker").lower() != "docker":
+        panel = await ptero_panel_link(vps)
+        await safe_ctx_send(ctx, make_embed("🦖 Pterodactyl Ports", f"Port allocations are managed by Pterodactyl.\nPanel: {panel or 'not configured'}"))
+        return
+    rows = db_list_ports(vps["id"])
+    body = "\n".join(f"#{r['id']} • `{r['host_port']}→{r['container_port']}/TCP` • `{r['status']}`" for r in rows) or "No forwarding rules."
+    await safe_ctx_send(ctx, make_embed(f"🌐 Ports • {clean(vps['container_name'])}", body))
+
+
+@prefix_ports.command(name="remove")
+async def prefix_ports_remove(ctx: commands.Context, port_id: int):
+    row = db_get_port(port_id)
+    if not row:
+        await safe_ctx_send(ctx, make_embed("❌ Port Not Found", "No such forwarding rule exists."))
+        return
+    vps = db_get_vps(int(row["vps_id"]))
+    if not vps or not db_is_owner_or_admin(ctx.author.id, vps):
+        await safe_ctx_send(ctx, make_embed("❌ Permission Denied", "You do not own that forwarding rule."))
+        return
+    await stop_port_forward(row)
+    db_delete_port(port_id)
+    await safe_ctx_send(ctx, make_embed("🗑️ Port Removed", f"Forwarding rule `#{port_id}` removed."))
+
+
+@bot.command(name="deploy")
+async def prefix_deploy(
+    ctx: commands.Context,
+    os_type: str | None = None,
+    ram: str = DEFAULT_RAM,
+    cpu: str = DEFAULT_CPU,
+    disk: str = DEFAULT_DISK,
+    location: str = DEFAULT_LOCATION,
+):
+    if not os_type:
+        is_admin = ADMIN_BYPASS_LIMITS and ADMIN_ID > 0 and ctx.author.id == ADMIN_ID
+        used = db_vps_count(ctx.author.id)
+        limit = db_effective_slots(ctx.author.id)
+        if not is_admin and used >= limit:
+            await safe_ctx_send(ctx, make_embed(
+                "🎟️ VPS Slots Full",
+                f"You are using **{used}/{limit}** VPS slots.\n\n**SLOTS FULL** — more slots are coming soon. Ask an administrator to add slots.\n\nCurrent allocation: `{used}/{limit}`.",
+            ))
+            return
+        await safe_ctx_send(
+            ctx,
+            make_embed(
+                "🚀 Deploy RGNODES™ VPS",
+                f"Current slots: **{slot_status_text(ctx.author.id)}**\n\nSelect the operating system first, then choose a location: Singapore 🇸🇬 or India 🇮🇳.",
+            ),
+            DeployView(ctx.author.id),
+        )
+        return
+
+    normalized_location = normalize_location(location) or DEFAULT_LOCATION
+    message = await ctx.send(
+        embed=progress_embed(
+            1,
+            "Starting deployment",
+            normalize_os(os_type) or os_type,
+            normalized_location,
+            ram,
+            cpu,
+            disk,
+            "rgnodes-pending",
+        )
+    )
+
+    async def edit(embed: discord.Embed):
+        with contextlib.suppress(discord.HTTPException):
+            await message.edit(embed=embed)
+
+    try:
+        ok, reason, vps = await asyncio.wait_for(
+            create_vps(
+                ctx.author,
+                os_type=os_type,
+                location=normalized_location,
+                ram=ram,
+                cpu=cpu,
+                disk=disk,
+                progress=edit,
+            ),
+            timeout=DEPLOY_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        ok, reason, vps = False, "Deployment timed out safely. Check the bot log before retrying.", None
+    except Exception:
+        logger.exception("Prefix deployment failed for user %s", ctx.author.id)
+        ok, reason, vps = False, "Deployment failed safely. Check the bot log for details.", None
+    if not ok or not vps:
+        with contextlib.suppress(discord.HTTPException):
+            await message.edit(embed=make_embed("❌ VPS Creation Failed", reason))
+        return
+    view = sshx_view(vps["sshx_url"]) if vps["sshx_url"] else None
+    dm_sent = False
+    if vps["sshx_url"]:
+        dm_sent = await safe_dm(ctx.author, console_embed(vps["container_name"], vps["sshx_url"]), view)
+    final = make_embed("✅ VPS Ready", f"`{clean(vps['container_name'])}` is online.")
+    final.add_field(name="🌐 Console", value="✅ Link sent by DM" if dm_sent else ("⚠️ SSHx pending — use Console to retry" if not vps["sshx_url"] else "⚠️ DM unavailable"), inline=False)
+    await message.edit(embed=final, view=ManageView(vps["id"], vps["user_id"]))
+
+
+@bot.command(name="manage")
+async def prefix_manage(ctx: commands.Context, identifier: str = ""):
+    vps = ctx_vps(ctx, identifier)
+    if not vps:
+        await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", f"No matching VPS was found. Create one with `{PREFIX}deploy`."))
+        return
+    try:
+        vps = await refresh_vps_record_state(vps)
+        stats, uptime, disk, network, ports = await _dashboard_live_data(vps)
+        await safe_ctx_send(
+            ctx,
+            dashboard_embed(vps, stats, uptime, disk, network, ports),
+            ManageView(vps["id"], vps["user_id"]),
+        )
+    except Exception as exc:
+        logger.exception("Prefix manage failed for VPS %s: %s", identifier or "latest", exc)
+        await safe_ctx_send(ctx, make_embed("❌ Dashboard Error", "The VPS record exists, but its live dashboard could not be loaded. Try the command again."))
+
+
+@bot.command(name="console")
+async def prefix_console(ctx: commands.Context, identifier: str = ""):
+    vps = ctx_vps(ctx, identifier)
+    if not vps:
+        await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No matching VPS was found."))
+        return
+    ok, message = await create_console_access(vps, ctx.author)
+    latest = db_get_vps(vps["id"]) or vps
+    view = sshx_view(latest["sshx_url"]) if latest["sshx_url"] else None
+    await safe_ctx_send(ctx, make_embed("✅ Console Ready" if ok else "❌ Console Failed", message), view=view)
+
+
+@bot.command(name="list")
+async def prefix_list(ctx: commands.Context):
+    rows = db_get_all_vps() if (ctx.author.id == ADMIN_ID and ADMIN_ID > 0) else db_get_user_vps(ctx.author.id); embed = make_embed("📋 Your RGNODES™ VPS")
+    if not rows:
+        embed.description = "You do not have any VPS instances."
+    else:
+        embed.add_field(name="🎟️ VPS Slots", value=slot_status_text(ctx.author.id), inline=False)
+    for row in rows[:25]:
+        embed.add_field(
+            name=f"{status_text(row['status'], bool(row['suspended']))} {clean(row['container_name'])}",
+            value=f"ID: `{row['id']}` • {os_label(row['os_type'])} • {location_label(row['location'])}",
+            inline=False,
+        )
+    await safe_ctx_send(ctx, embed)
+
+
+@bot.command(name="remove")
+async def prefix_remove(ctx: commands.Context, identifier: str = ""): await prefix_action(ctx, identifier, "delete")
+
+
+@bot.command(name="start")
+async def prefix_start(ctx: commands.Context, identifier: str = ""): await prefix_action(ctx, identifier, "start")
+@bot.command(name="stop")
+async def prefix_stop(ctx: commands.Context, identifier: str = ""): await prefix_action(ctx, identifier, "stop")
+@bot.command(name="restart")
+async def prefix_restart(ctx: commands.Context, identifier: str = ""): await prefix_action(ctx, identifier, "restart")
+
+
+async def prefix_action(ctx: commands.Context, identifier: str, action: str):
+    vps = ctx_vps(ctx, identifier)
+    if not vps:
+        await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No matching VPS was found."))
+        return
+    try:
+        ok, message = await lifecycle_action(vps, action)
+    except Exception:
+        logger.exception("Prefix lifecycle action %s failed for VPS #%s", action, vps["id"])
+        ok, message = False, "The VPS action failed safely. Check the bot log for details."
+    await safe_ctx_send(ctx, make_embed("✅ Action Complete" if ok else "❌ Action Failed", message))
+
+
+class HelpSelect(discord.ui.Select):
+    def __init__(self, owner_id: int, admin: bool):
+        options = [
+            discord.SelectOption(label="User Commands", value="user", emoji="👤", description="Commands for all VPS users"),
+            discord.SelectOption(label="VPS Management", value="vps", emoji="🖥️", description="Start, stop, stats and VPS access"),
+            discord.SelectOption(label="Port Forwarding", value="ports", emoji="🔌", description="Network and port management"),
+            discord.SelectOption(label="System Status", value="system", emoji="⚙️", description="Host monitoring and limits"),
+            discord.SelectOption(label="Bot Info", value="bot", emoji="🤖", description="Bot information and status"),
+        ]
+        if admin:
+            options.append(discord.SelectOption(label="Admin Commands", value="admin", emoji="🛡️", description="Administrator commands"))
+        super().__init__(
+            placeholder="Select Category",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.owner_id = owner_id
+        self.admin = admin
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            await safe_respond(interaction, embed=make_embed("❌ Access Denied", "This help menu belongs to another user."))
+            return
+        try:
+            await safe_component_edit(interaction, embed=build_help_embed(self.admin, self.values[0]), view=self.view)
+        except discord.NotFound:
+            return
+        except discord.HTTPException as exc:
+            logger.warning("Help menu interaction failed: %s", safe_log(exc))
+            with contextlib.suppress(Exception):
+                await safe_respond(interaction, embed=make_embed("❌ Help Error", f"The menu expired. Run `{PREFIX}help` again."))
+        except Exception as exc:
+            logger.exception("Help menu callback failed: %s", exc)
+            with contextlib.suppress(Exception):
+                await safe_respond(interaction, embed=make_embed("❌ Help Error", "The help menu could not be updated."))
+
+
+class HelpView(discord.ui.View):
+    def __init__(self, owner_id: int, admin: bool):
+        super().__init__(timeout=600)
+        self.add_item(HelpSelect(owner_id, admin))
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+
+def build_help_embed(admin: bool, category: str = "user") -> discord.Embed:
+    embed = make_embed("📚 RGNODES™ Help", "Use the dropdown below to switch categories.")
+    category = category if category in {"user", "vps", "ports", "system", "bot", "admin"} else "user"
+
+    if category == "user":
+        embed.title = "📚 RGNODES™ • 👤 User Commands"
+        embed.add_field(name="Basic commands for all users", value="Use the dropdown below to switch categories.", inline=False)
+        embed.add_field(name="Available Commands", value=(
+            f"**`{PREFIX}ping`** ╰ Check bot latency\n"
+            f"**`{PREFIX}uptime`** ╰ Show host uptime\n"
+            f"**`{PREFIX}myvps`** ╰ View your VPS dashboard\n"
+            f"**`{PREFIX}manage [vps#]`** ╰ Manage your VPS instances\n"
+            f"**`{PREFIX}share-user @user <vps#>`** ╰ Share VPS access\n"
+            f"**`{PREFIX}share-ruser @user <vps#>`** ╰ Revoke shared access\n"
+            f"**`{PREFIX}manage-shared @owner <vps#>`** ╰ Manage shared VPS"
+        ), inline=False)
+        return embed
+
+    if category == "vps":
+        embed.title = "📚 RGNODES™ • 🖥️ VPS Management"
+        embed.add_field(name="Commands for VPS control", value="Use the dropdown below to switch categories.", inline=False)
+        embed.add_field(name="Available Commands", value=(
+            f"**`{PREFIX}myvps`** ╰ List your VPS\n"
+            f"**`{PREFIX}vpsinfo <vps#>`** ╰ VPS information\n"
+            f"**`{PREFIX}vps-stats <vps#>`** ╰ Live statistics\n"
+            f"**`{PREFIX}vps-uptime <vps#>`** ╰ VPS uptime\n"
+            f"**`{PREFIX}restart-vps <vps#>`** ╰ Restart VPS\n"
+            f"**`{PREFIX}snapshot <vps#> [name]`** ╰ Create snapshot\n"
+            f"**`{PREFIX}list-snapshots <vps#>`** ╰ List snapshots\n"
+            f"**`{PREFIX}restore-snapshot <vps#> <name>`** ╰ Restore snapshot"
+        ), inline=False)
+        embed.add_field(name="Also available", value=f"`{PREFIX}start` • `{PREFIX}stop` • `{PREFIX}restart` • `{PREFIX}console` • `{PREFIX}logs` • `{PREFIX}remove`", inline=False)
+        return embed
+
+    if category == "ports":
+        embed.title = "📚 RGNODES™ • 🔌 Port Forwarding"
+        embed.add_field(name="Network and port management", value="Use the dropdown below to switch categories.", inline=False)
+        embed.add_field(name="Available Commands", value=(
+            f"**`{PREFIX}ports add <vps#> <port>`** ╰ Add port forward\n"
+            f"**`{PREFIX}ports list <vps#>`** ╰ List your ports\n"
+            f"**`{PREFIX}ports remove <id>`** ╰ Remove port forward\n"
+            f"**`/ports <vps#>`** ╰ View forwarding rules\n"
+            f"**`/port-add <vps#> <port>`** ╰ Add forwarding rule\n"
+            f"**`/port-remove <vps#> <id>`** ╰ Remove forwarding rule"
+        ), inline=False)
+        return embed
+
+    if category == "system":
+        embed.title = "📚 RGNODES™ • ⚙️ System Status"
+        embed.add_field(name="System monitoring commands", value="Use the dropdown below to switch categories.", inline=False)
+        embed.add_field(name="Available Commands", value=(
+            f"**`{PREFIX}serverstats`** ╰ Server statistics\n"
+            f"**`{PREFIX}thresholds`** ╰ View thresholds\n"
+            f"**`{PREFIX}set-status <type> <name>`** ╰ Set bot status (admin)"
+        ), inline=False)
+        return embed
+
+    if category == "bot":
+        embed.title = "📚 RGNODES™ • 🤖 Bot Info"
+        embed.add_field(name="Bot information and status", value="Use the dropdown below to switch categories.", inline=False)
+        embed.add_field(name="Available Commands", value=(
+            f"**`{PREFIX}ping`** ╰ Check latency\n"
+            f"**`{PREFIX}uptime`** ╰ Host uptime\n"
+            f"**`{PREFIX}help`** ╰ This help menu\n"
+            f"**`/about`** ╰ RGNODES™ information"
+        ), inline=False)
+        return embed
+
+    embed.title = "📚 RGNODES™ • 🛡️ Admin Commands"
+    embed.add_field(name="Administration", value=(
+        "`/admin-create` • `/admin-manage` • `/admin-list` • `/admin-list-users` • `/admin-stats`\n"
+        "`/admin-vps-info` • `/admin-logs` • `/admin-delete-user` • `/admin-ban` • `/admin-unban`\n"
+        "`/add-slots` • `/remove-all confirm:true` • `/admin-kill-all` • `/install-system confirm:true`"
+    ), inline=False)
+    return embed
+
+
+@bot.command(name="ping")
+async def prefix_ping(ctx: commands.Context):
+    latency = round(bot.latency * 1000) if bot.is_ready() else 0
+    await safe_ctx_send(ctx, make_embed("🏓 Pong!", f"Discord latency: `{latency}ms`"))
+
+
+@bot.command(name="about")
+async def prefix_about(ctx: commands.Context):
+    embed = make_embed("☁️ RGNODES™ VPS Management", "Production Discord VPS management with Docker/Pterodactyl backends.")
+    embed.add_field(name="🛠️ Stack", value="Python • discord.py • Docker • SQLite WAL", inline=False)
+    embed.add_field(name="⚙️ Prefix", value=f"`{PREFIX}`", inline=True)
+    embed.add_field(name="🖥️ Backend", value=f"`{active_backend()}`", inline=True)
+    await safe_ctx_send(ctx, embed)
+
+
+@bot.command(name="logs")
+async def prefix_logs(ctx: commands.Context, identifier: str, lines: int = 50):
+    vps = ctx_vps(ctx, identifier)
+    if not vps:
+        await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
+        return
+    if str(vps["backend"] or "docker").lower() != "docker":
+        await safe_ctx_send(ctx, make_embed("🦖 Pterodactyl Logs", "Use the Pterodactyl Panel for server logs."))
+        return
+    logs = (await docker_logs(vps["container_id"], lines)).replace("```", "'''")
+    await safe_ctx_send(ctx, make_embed(
+        f"📜 Logs • {clean(vps['container_name'])}",
+        f"```text\n{logs[:3900]}\n```",
+    ))
+
+
+@bot.command(name="help")
+async def prefix_help(ctx: commands.Context):
+    admin = ctx.author.id == ADMIN_ID
+    await safe_ctx_send(ctx, build_help_embed(admin, "user"), HelpView(ctx.author.id, admin))
+
+
+async def safe_ctx_send(ctx: commands.Context, embed: discord.Embed, view: discord.ui.View | None = None) -> None:
+    """Best-effort prefix response that never creates a second command exception."""
+    try:
+        kwargs: dict[str, Any] = {"embed": embed}
+        if view is not None:
+            kwargs["view"] = view
+        await ctx.send(**kwargs)
+    except discord.HTTPException as exc:
+        logger.warning("Prefix response HTTP failure: %s", safe_log(exc))
+    except Exception as exc:
+        logger.exception("Prefix response failed: %s", exc)
+
+
+# ================================================================
+# Background sync / startup recovery
+# ================================================================
+
+STATUS_SEMAPHORE = asyncio.Semaphore(STATUS_CONCURRENCY)
+
+
+async def sync_one(row: sqlite3.Row) -> None:
+    async with STATUS_SEMAPHORE:
+        try:
+            backend = str(row["backend"] or "docker").lower()
+            if backend == "pterodactyl":
+                state = await ptero_status(row)
+                if state in {"running", "starting", "restarting", "stopped"}:
+                    db_update_vps(row["container_id"], status=state, sshx_url=await ptero_panel_link(row), sshx_pid=None)
+                return
+
+            state = await docker_state(row["container_id"])
+            if state == "running":
+                if row["status"] != "running":
+                    db_update_vps(row["container_id"], status="running")
+                await supervise_vps_ports(row)
+            elif state in {"exited", "created", "dead", "paused", "restarting", "removing"}:
+                if row["status"] != "stopped" or row["sshx_url"] or row["sshx_pid"]:
+                    db_update_vps(row["container_id"], status="stopped", sshx_url=None, sshx_pid=None)
+                for p_row in db_list_ports(row["id"]):
+                    await stop_port_forward(p_row)
+            elif state is None:
+                logger.debug("Docker inspect unavailable for VPS #%s; retaining current database status.", row["id"])
+        except Exception as exc:
+            logger.warning("Status sync failed for #%s: %s", row["id"], safe_log(exc))
+
+
+@tasks.loop(seconds=STATUS_INTERVAL)
+async def sync_statuses() -> None:
+    rows = db_get_all_vps()
+    if rows:
+        await asyncio.gather(*(sync_one(row) for row in rows), return_exceptions=True)
+
+
+@sync_statuses.before_loop
+async def before_sync_statuses(): await bot.wait_until_ready()
+
+
+@tasks.loop(seconds=60)
+async def update_presence():
+    try:
+        if not bot.is_ready():
+            return
+        docker_ok, docker_active = await docker_running_count()
+        if not docker_ok:
+            docker_active = db_running_count()
+        ptero_active = sum(1 for row in db_get_all_vps() if str(row["backend"] or "docker").lower() == "pterodactyl" and str(row["status"]).lower() in {"running", "starting", "restarting"} and not row["suspended"])
+        active = docker_active + ptero_active
+        await bot.change_presence(activity=discord.Game(name=f"{BOT_STATUS_NAME} • {active} Active ⚡"))
+    except (discord.HTTPException, discord.GatewayNotFound, discord.ClientException, asyncio.CancelledError):
+        if isinstance(sys.exc_info()[1], asyncio.CancelledError):
+            raise
+    except Exception as exc:
+        logger.debug("Presence update skipped: %s", safe_log(exc))
+
+
+@update_presence.before_loop
+async def before_update_presence(): await bot.wait_until_ready()
+
+
+@tasks.loop(seconds=PORT_SUPERVISOR_INTERVAL)
+async def supervise_all_ports_loop():
+    try:
+        await asyncio.gather(*(supervise_vps_ports(vps) for vps in db_get_all_vps()), return_exceptions=True)
+    except Exception as exc:
+        logger.warning("Port supervisor loop error: %s", safe_log(exc))
+
+
+@supervise_all_ports_loop.before_loop
+async def before_supervise_all_ports_loop(): await bot.wait_until_ready()
+
+
+@tasks.loop(seconds=REAL_LOCATION_REFRESH)
+async def refresh_network_identity():
+    try:
+        await detect_public_network(force=True)
+    except Exception as exc:
+        logger.debug("Network identity refresh skipped: %s", safe_log(exc))
+
+
+@refresh_network_identity.before_loop
+async def before_refresh_network_identity(): await bot.wait_until_ready()
+
+
+@bot.event
+async def on_ready():
+    logger.info("RGNODES™ online as %s", bot.user)
+    if not bot.loops_started:
+        if not sync_statuses.is_running():
+            sync_statuses.start()
+        if not update_presence.is_running():
+            update_presence.start()
+        if not supervise_all_ports_loop.is_running():
+            supervise_all_ports_loop.start()
+        if not refresh_network_identity.is_running():
+            refresh_network_identity.start()
+        bot.loops_started = True
+        await detect_public_network()
+
+    if not bot.synced:
+        for attempt in range(3):
+            try:
+                synced = await bot.tree.sync()
+                bot.synced = True
+                logger.info("Synced %d slash commands", len(synced))
+                break
+            except discord.HTTPException as exc:
+                logger.warning("Slash command sync attempt %d failed: %s", attempt + 1, safe_log(exc))
+                if attempt < 2:
+                    await asyncio.sleep(3 * (attempt + 1))
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if getattr(ctx, "_rgnodes_duplicate_event", False):
+        return
+    # CommandInvokeError is the wrapper discord.py uses for exceptions raised
+    # inside a command. Always log the original exception so the real cause is
+    # visible instead of producing an unhelpful generic Discord message.
+    original = getattr(error, "original", error)
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.CommandOnCooldown):
+        await safe_ctx_send(ctx, make_embed("⏳ Please Wait", f"Try again in `{error.retry_after:.1f}s`."))
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await safe_ctx_send(ctx, make_embed("❌ Missing Argument", f"Use `{PREFIX}help` to view the correct command syntax."))
+        return
+    if isinstance(error, (commands.BadArgument, commands.UserNotFound, commands.MemberNotFound, commands.ChannelNotFound, commands.RoleNotFound)):
+        await safe_ctx_send(ctx, make_embed("❌ Invalid Argument", f"Use `{PREFIX}help` to view the correct command syntax."))
+        return
+    command_name = getattr(ctx.command, "qualified_name", "unknown")
+    if isinstance(original, BaseException):
+        logger.error(
+            "Prefix command '%s' failed: %s",
+            command_name,
+            safe_log(original),
+            exc_info=(type(original), original, original.__traceback__),
+        )
+    else:
+        logger.error("Prefix command '%s' failed: %s", command_name, safe_log(original))
+    await safe_ctx_send(ctx, make_embed("❌ Command Error", "That command hit an internal error. The failure was logged for repair."))
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    logger.error("Slash command error: %s", safe_log(error))
+    await safe_respond(
+        interaction,
+        embed=make_embed("❌ Command Error", "The command could not be completed safely."),
+    )
 
 
 async def main() -> None:
-    db_init()
-    lock_handle = acquire_pid_lock()
+    acquire_singleton()
+    # Start the health listener before Discord so hosting platforms can still
+    # observe the service while Discord connectivity is temporarily unavailable.
+    await start_health_server()
+
+    if not TOKEN:
+        await stop_health_server()
+        raise SystemExit(
+            "Discord bot token is missing. Set TOKEN=YOUR_BOT_TOKEN in .env "
+            "(or DISCORD_TOKEN/BOT_TOKEN) and restart the bot."
+        )
+
+    if ADMIN_ID <= 0:
+        logger.warning("ADMIN_ID is not configured; admin commands will be unavailable.")
+
+    logger.info(
+        "RGNODES starting | build=%s | token_source=%s | prefix=%r | backend=%s | quota=%s fallback=%s location=%s | locations=SG,IN",
+        RGNODES_BUILD, TOKEN_SOURCE, PREFIX, active_backend(), ENABLE_HARD_DISK_QUOTA, QUOTA_FALLBACK, DEFAULT_LOCATION,
+    )
+
+    attempt = 0
     try:
-        global WEB_RUNNER
-        if not password_configured():
-            logger.warning("WEB_ADMIN_PASSWORD_HASH/WEB_ADMIN_PASSWORD is not set; web dashboard login is disabled.")
-        else:
-            WEB_RUNNER = await start_web_server()
-        abuse_task = asyncio.create_task(abuse_loop(STOP_EVENT), name="rgnodes-abuse-monitor")
-        try:
-            if bot is not None and DISCORD_TOKEN:
-                await bot.start(DISCORD_TOKEN)
-            else:
-                logger.warning("Discord bot disabled because DISCORD_TOKEN is missing.")
-                await STOP_EVENT.wait()
-        finally:
-            abuse_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await abuse_task
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
+        while True:
+            attempt += 1
+            try:
+                # discord.py's reconnect=True handles normal gateway disconnects.
+                # This outer retry additionally covers failures before the
+                # gateway session exists, such as aiohttp TCP/TLS resets while
+                # requesting GET /users/@me.
+                await bot.start(TOKEN, reconnect=True)
+                logger.warning("Discord client stopped cleanly; restarting login loop.")
+                attempt = 0
+
+            except discord.LoginFailure:
+                # Invalid/revoked credentials will not be fixed by retrying.
+                logger.error("Discord rejected the bot token (HTTP 401 / invalid credentials).")
+                logger.error(
+                    "Check that %s contains the current token for the correct Discord bot.",
+                    TOKEN_SOURCE,
+                )
+                logger.error("The value should be the raw bot token, without a leading 'Bot '.")
+                raise SystemExit(1) from None
+
+            except (aiohttp.ClientConnectorError, aiohttp.ClientConnectionError,
+                    aiohttp.ClientOSError, aiohttp.ServerDisconnectedError,
+                    asyncio.TimeoutError, ConnectionError, ConnectionResetError,
+                    BrokenPipeError, OSError) as exc:
+                # These are transport-level failures. They are often caused by
+                # transient host egress/DNS/TLS problems and are safe to retry.
+                delay = min(
+                    DISCORD_LOGIN_RETRY_MAX,
+                    DISCORD_LOGIN_RETRY_BASE * (2 ** min(max(attempt - 1, 0), 6)),
+                )
+                logger.warning(
+                    "Discord network connection failed during startup/session: %s | retry=%ss | attempt=%s",
+                    safe_log(exc), delay, attempt,
+                )
+                if DISCORD_LOGIN_MAX_ATTEMPTS and attempt >= DISCORD_LOGIN_MAX_ATTEMPTS:
+                    logger.error("Discord retry limit reached (%s attempts).", DISCORD_LOGIN_MAX_ATTEMPTS)
+                    raise SystemExit(1) from None
+                with contextlib.suppress(Exception):
+                    await bot.close()
+                await asyncio.sleep(delay)
+
+            except discord.HTTPException as exc:
+                status = getattr(exc, "status", None)
+                # Retry transient HTTP failures, but do not loop forever on
+                # authentication/permission failures.
+                if status in {401, 403}:
+                    logger.error(
+                        "Discord HTTP authentication/permission failure: status=%s code=%s message=%s",
+                        status, getattr(exc, "code", "unknown"), safe_log(str(exc)),
+                    )
+                    raise SystemExit(1) from None
+                delay = min(
+                    DISCORD_LOGIN_RETRY_MAX,
+                    DISCORD_LOGIN_RETRY_BASE * (2 ** min(max(attempt - 1, 0), 6)),
+                )
+                logger.warning(
+                    "Discord HTTP startup/session failure: status=%s code=%s message=%s | retry=%ss",
+                    status, getattr(exc, "code", "unknown"), safe_log(str(exc)), delay,
+                )
+                if DISCORD_LOGIN_MAX_ATTEMPTS and attempt >= DISCORD_LOGIN_MAX_ATTEMPTS:
+                    logger.error("Discord retry limit reached (%s attempts).", DISCORD_LOGIN_MAX_ATTEMPTS)
+                    raise SystemExit(1) from None
+                with contextlib.suppress(Exception):
+                    await bot.close()
+                await asyncio.sleep(delay)
+
+            except discord.GatewayNotFound as exc:
+                delay = min(
+                    DISCORD_LOGIN_RETRY_MAX,
+                    DISCORD_LOGIN_RETRY_BASE * (2 ** min(max(attempt - 1, 0), 6)),
+                )
+                logger.warning("Discord gateway unavailable: %s | retry=%ss", safe_log(exc), delay)
+                if DISCORD_LOGIN_MAX_ATTEMPTS and attempt >= DISCORD_LOGIN_MAX_ATTEMPTS:
+                    logger.error("Discord retry limit reached (%s attempts).", DISCORD_LOGIN_MAX_ATTEMPTS)
+                    raise SystemExit(1) from None
+                with contextlib.suppress(Exception):
+                    await bot.close()
+                await asyncio.sleep(delay)
+
+            except discord.ClientException as exc:
+                # Client lifecycle/configuration errors are generally not fixed
+                # by retrying, except when they are explicitly transport-like.
+                text = str(exc).lower()
+                if any(token in text for token in (
+                    "connection", "connect", "reset", "timeout", "gateway", "disconnected"
+                )):
+                    delay = min(
+                        DISCORD_LOGIN_RETRY_MAX,
+                        DISCORD_LOGIN_RETRY_BASE * (2 ** min(max(attempt - 1, 0), 6)),
+                    )
+                    logger.warning("Discord client connectivity error: %s | retry=%ss", safe_log(exc), delay)
+                    if DISCORD_LOGIN_MAX_ATTEMPTS and attempt >= DISCORD_LOGIN_MAX_ATTEMPTS:
+                        raise SystemExit(1) from None
+                    with contextlib.suppress(Exception):
+                        await bot.close()
+                    await asyncio.sleep(delay)
+                    continue
+                logger.error("Discord client startup failed: %s", safe_log(exc))
+                raise SystemExit(1) from None
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as exc:
+                # Last-resort protection: unexpected startup exceptions are
+                # logged and retried unless explicitly limited by env config.
+                delay = min(
+                    DISCORD_LOGIN_RETRY_MAX,
+                    DISCORD_LOGIN_RETRY_BASE * (2 ** min(max(attempt - 1, 0), 6)),
+                )
+                logger.exception(
+                    "Unexpected Discord startup/session exception: %s | retry=%ss",
+                    safe_log(exc), delay,
+                )
+                if DISCORD_LOGIN_MAX_ATTEMPTS and attempt >= DISCORD_LOGIN_MAX_ATTEMPTS:
+                    raise
+                with contextlib.suppress(Exception):
+                    await bot.close()
+                await asyncio.sleep(delay)
+
     finally:
-        await shutdown()
+        for loop in (sync_statuses, update_presence, supervise_all_ports_loop, refresh_network_identity):
+            if loop.is_running():
+                loop.cancel()
         with contextlib.suppress(Exception):
-            import fcntl
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-        lock_handle.close()
+            await bot.close()
+        with contextlib.suppress(Exception):
+            await stop_health_server()
+        release_singleton()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        logger.info("RGNODES stopped by user.")
