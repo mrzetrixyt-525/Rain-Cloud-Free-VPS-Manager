@@ -17,7 +17,7 @@ bash scripts/run-forever.sh
 python3 vm.py
 
 sudo nano /etc/systemd/system/rgbot.service
-
+``
 [Unit]
 Description=rgBot Discord Bot
 After=network.target
@@ -32,6 +32,6 @@ Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
-
+``
 sudo systemctl daemon-reload
 sudo systemctl restart unixbot
