@@ -13,6 +13,8 @@ import sqlite3
 import sys
 import json
 import time
+import uuid
+import shlex
 import aiohttp
 import secrets
 try:
@@ -86,17 +88,38 @@ TOKEN, TOKEN_SOURCE = load_discord_token()
 # Native-Docker guest bootstrap settings.
 # Kept near the top because function default arguments are evaluated when the
 # function is defined, not when it is called.
-GUEST_SYSTEMD_ENABLED = env_bool("GUEST_SYSTEMD_ENABLED", True)
+GUEST_SYSTEMD_ENABLED = True
 GUEST_NESTED_DOCKER = env_bool("GUEST_NESTED_DOCKER", True)
 GUEST_SYSTEMD_PRIVILEGED = env_bool("GUEST_SYSTEMD_PRIVILEGED", True)
 GUEST_CGROUPNS_HOST = env_bool("GUEST_CGROUPNS_HOST", True)
-GUEST_KVM_ENABLED = env_bool("GUEST_KVM_ENABLED", True)
+GUEST_KVM_ENABLED = False
 GUEST_INSTALL_WINGS = env_bool("GUEST_INSTALL_WINGS", True)
 GUEST_INSTALL_WEB_STACK = env_bool("GUEST_INSTALL_WEB_STACK", True)
 GUEST_INSTALL_DATABASE_STACK = env_bool("GUEST_INSTALL_DATABASE_STACK", True)
 GUEST_BOOTSTRAP_TIMEOUT = env_int("GUEST_BOOTSTRAP_TIMEOUT", 1200, 120, 1800)
 GUEST_DOCKER_PACKAGE = os.getenv("GUEST_DOCKER_PACKAGE", "docker.io").strip() or "docker.io"
 GUEST_PERSISTENT_DATA = env_bool("GUEST_PERSISTENT_DATA", True)
+
+# Real VPS backend: QEMU system emulation with software TCG only. KVM is never used.
+VPS_BACKEND = "qemu"
+QEMU_ACCEL = "tcg"
+QEMU_VM_ROOT = Path(os.getenv("QEMU_VM_ROOT", "qemu-vms")).expanduser().resolve()
+QEMU_IMAGE_CACHE = Path(os.getenv("QEMU_IMAGE_CACHE", str(QEMU_VM_ROOT / "_images"))).expanduser().resolve()
+QEMU_SSH_PORT_START = env_int("QEMU_SSH_PORT_START", 41000, 1024, 65530)
+QEMU_SSH_PORT_END = env_int("QEMU_SSH_PORT_END", 45000, QEMU_SSH_PORT_START, 65535)
+QEMU_AUTO_INSTALL_HOST_TOOLS = env_bool("QEMU_AUTO_INSTALL_HOST_TOOLS", True)
+QEMU_HOST_PREP_TIMEOUT = env_int("QEMU_HOST_PREP_TIMEOUT", 900, 120, 1800)
+QEMU_BOOT_TIMEOUT = env_int("QEMU_BOOT_TIMEOUT", 900, 120, 1800)
+QEMU_SSH_USER = os.getenv("QEMU_SSH_USER", "rgnodes").strip() or "rgnodes"
+
+QEMU_IMAGE_URLS = {
+    "ubuntu-22.04": "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img",
+    "ubuntu-24.04": "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
+    "ubuntu-26.04": "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img",
+    "debian-11": "https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-generic-amd64.qcow2",
+    "debian-12": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2",
+    "debian-13": "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2",
+}
 
 ADMIN_ID = env_int("ADMIN_ID", 0, 0)
 DATABASE_FILE = os.getenv("DATABASE_FILE", "vps_bot.db").strip() or "vps_bot.db"
@@ -116,7 +139,7 @@ ADMIN_BYPASS_LIMITS = env_bool("ADMIN_BYPASS_LIMITS", True)
 STATUS_INTERVAL = env_int("STATUS_INTERVAL", 45, 15, 300)
 DOCKER_TIMEOUT = env_int("DOCKER_TIMEOUT", 120, 30, 900)
 ACCESS_TIMEOUT = env_int("ACCESS_TIMEOUT", 120, 30, 300)
-DEPLOY_TIMEOUT = env_int("DEPLOY_TIMEOUT", 600, 120, 840)
+DEPLOY_TIMEOUT = env_int("DEPLOY_TIMEOUT", 1200, 300, 1800)
 IMAGE_PULL_TIMEOUT = env_int("IMAGE_PULL_TIMEOUT", 300, 60, 600)
 INTERACTION_LOG_UNKNOWN_AS_DEBUG = env_bool("INTERACTION_LOG_UNKNOWN_AS_DEBUG", True)
 ENABLE_HARD_DISK_QUOTA = env_bool("ENABLE_HARD_DISK_QUOTA", False)
@@ -167,14 +190,6 @@ _requested_web_port = env_int("PORT", 247, 1, 65535) if USE_PLATFORM_PORT else e
 WEB_PORT = 247 if _requested_web_port in WEB_RESERVED_PORTS else _requested_web_port
 WEB_PATH = os.getenv("WEB_PATH", "/").strip() or "/"
 
-# VPS backend selection:
-#   docker        -> native Docker backend (default, works without Pterodactyl)
-#   pterodactyl   -> create/control servers through Pterodactyl Application API
-# VM creation is always local. Pterodactyl support means the guest is
-# provisioned so Panel/Wings can be installed INSIDE the guest; the bot never
-# redirects VM creation through the Pterodactyl Application API.
-VPS_BACKEND = "docker"
-
 PTERO_URL = os.getenv("PTERO_URL", "").strip().rstrip("/")
 PTERO_API_KEY = (os.getenv("PTERO_API_KEY") or os.getenv("PTERODACTYL_APPLICATION_API_KEY") or "").strip()
 PTERO_CLIENT_API_KEY = (os.getenv("PTERO_CLIENT_API_KEY") or os.getenv("PTERODACTYL_CLIENT_API_KEY") or "").strip()
@@ -217,10 +232,7 @@ def ptero_configured() -> bool:
     return ptero_application_configured() and ptero_client_configured()
 
 def active_backend() -> str:
-    # The bot creates the guest locally. Pterodactyl support means the guest
-    # is provisioned with Panel/Wings prerequisites; it must not silently
-    # switch a VM creation request into a Pterodactyl API server.
-    return "docker"
+    return "qemu"
 
 if not WEB_PATH.startswith("/"):
     WEB_PATH = "/" + WEB_PATH
@@ -234,8 +246,9 @@ OS_CONFIG = {
     "ubuntu-26.04": {"label": "Ubuntu 26.04 LTS", "image": "ubuntu:26.04"},
     "ubuntu-24.04": {"label": "Ubuntu 24.04 LTS", "image": "ubuntu:24.04"},
     "ubuntu-22.04": {"label": "Ubuntu 22.04 LTS", "image": "ubuntu:22.04"},
-    "debian-12": {"label": "Debian 12", "image": "debian:12"},
-    "debian-11": {"label": "Debian 11", "image": "debian:11"},
+    "debian-13": {"label": "Debian 13", "image": "debian:13.6"},
+    "debian-12": {"label": "Debian 12", "image": "debian:12.15"},
+    "debian-11": {"label": "Debian 11", "image": "debian:11.11"},
 }
 
 LOCATION_ALIASES = {
@@ -249,7 +262,8 @@ OS_ALIASES = {
     "ubuntu": "ubuntu-24.04", "ubuntu26": "ubuntu-26.04", "ubuntu26.04": "ubuntu-26.04", "ubuntu-26.04": "ubuntu-26.04",
     "ubuntu24": "ubuntu-24.04", "ubuntu24.04": "ubuntu-24.04", "ubuntu-24.04": "ubuntu-24.04",
     "ubuntu22": "ubuntu-22.04", "ubuntu22.04": "ubuntu-22.04", "ubuntu-22.04": "ubuntu-22.04",
-    "debian": "debian-12", "debian12": "debian-12", "debian-12": "debian-12",
+    "debian": "debian-13", "debian13": "debian-13", "debian-13": "debian-13",
+    "debian12": "debian-12", "debian-12": "debian-12",
     "debian11": "debian-11", "debian-11": "debian-11",
 }
 
@@ -1214,6 +1228,14 @@ def db_get_snapshot(vps_id: int, name: str) -> sqlite3.Row | None:
         conn.close()
 
 
+def db_delete_all_snapshots(vps_id: int) -> None:
+    conn = db_connect()
+    try:
+        conn.execute("DELETE FROM vps_snapshots WHERE vps_id=?", (int(vps_id),))
+    finally:
+        conn.close()
+
+
 def db_delete_snapshot(vps_id: int, name: str) -> None:
     conn = db_connect()
     try:
@@ -1293,12 +1315,566 @@ async def spawn_detached(*args: str) -> tuple[int | None, str]:
         return None, str(exc)
 
 
+# ================================================================
+# QEMU real VM backend — TCG only, no KVM required
+# ================================================================
+
+def qemu_vm_dir(vm_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(vm_id)).strip("-._") or "vm"
+    return QEMU_VM_ROOT / safe
+
+
+def qemu_meta_path(vm_id: str) -> Path:
+    return qemu_vm_dir(vm_id) / "vm.json"
+
+
+def qemu_load_meta(vm_id: str) -> dict[str, Any] | None:
+    try:
+        data = json.loads(qemu_meta_path(vm_id).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def qemu_save_meta(vm_id: str, data: dict[str, Any]) -> None:
+    directory = qemu_vm_dir(vm_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    temp = directory / "vm.json.tmp"
+    temp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    temp.replace(qemu_meta_path(vm_id))
+
+
+def qemu_process_alive(pid: int | str | None) -> bool:
+    try:
+        number = int(pid or 0)
+        if number <= 1:
+            return False
+        os.kill(number, 0)
+        cmdline = Path(f"/proc/{number}/cmdline")
+        if cmdline.exists():
+            text = cmdline.read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+            if "qemu-system" not in text.lower():
+                return False
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def qemu_binary() -> str | None:
+    return shutil.which("qemu-system-x86_64")
+
+
+def qemu_seed_builder() -> str | None:
+    return shutil.which("cloud-localds") or shutil.which("genisoimage") or shutil.which("xorriso")
+
+
+def qemu_os_from_image(image: str) -> str | None:
+    value = str(image or "").lower()
+    mapping = {
+        "ubuntu-22.04": ("ubuntu:22.04", "jammy"),
+        "ubuntu-24.04": ("ubuntu:24.04", "noble"),
+        "ubuntu-26.04": ("ubuntu:26.04", "resolute"),
+        "debian-11": ("debian:11", "bullseye"),
+        "debian-12": ("debian:12", "bookworm"),
+        "debian-13": ("debian:13", "trixie"),
+    }
+    for os_name, tokens in mapping.items():
+        if any(token in value for token in tokens):
+            return os_name
+    return None
+
+
+async def qemu_host_prepare(progress: Callable[[str], Awaitable[None]] | None = None) -> tuple[bool, str]:
+    QEMU_VM_ROOT.mkdir(parents=True, exist_ok=True)
+    QEMU_IMAGE_CACHE.mkdir(parents=True, exist_ok=True)
+
+    def missing_tools() -> list[str]:
+        missing: list[str] = []
+        if not qemu_binary():
+            missing.append("qemu-system-x86_64")
+        if not shutil.which("qemu-img"):
+            missing.append("qemu-img")
+        if not qemu_seed_builder():
+            missing.append("cloud-localds/genisoimage/xorriso")
+        if not shutil.which("ssh"):
+            missing.append("ssh client")
+        if not shutil.which("ssh-keygen"):
+            missing.append("ssh-keygen")
+        return missing
+
+    missing = missing_tools()
+    if not missing:
+        return True, "QEMU TCG host tools are ready; KVM is disabled and never used."
+
+    if progress is not None:
+        with contextlib.suppress(Exception):
+            await progress("Installing missing QEMU host tools")
+
+    if not QEMU_AUTO_INSTALL_HOST_TOOLS:
+        return False, "Missing QEMU host tools: " + ", ".join(missing) + "."
+
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return False, (
+            "Missing QEMU host tools: " + ", ".join(missing) +
+            ". Automatic installation requires root; install QEMU system emulator, "
+            "qemu-img, a NoCloud ISO builder (cloud-localds/genisoimage/xorriso), "
+            "and OpenSSH client on the host."
+        )
+
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+
+    async def install_with(manager: str, packages: list[str]) -> bool:
+        try:
+            if manager == "apt-get":
+                rc, _, _ = await run_process(
+                    "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update", "-y", timeout=300
+                )
+                if rc != 0:
+                    return False
+                rc, _, _ = await run_process(
+                    "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
+                    "-o", "Dpkg::Options::=--force-confdef",
+                    "-o", "Dpkg::Options::=--force-confold",
+                    "--no-install-recommends", *packages, timeout=900
+                )
+                return rc == 0
+            if manager in {"dnf", "yum"}:
+                rc, _, _ = await run_process(manager, "-y", "install", *packages, timeout=900)
+                return rc == 0
+            if manager == "apk":
+                rc, _, _ = await run_process(manager, "add", "--no-cache", *packages, timeout=900)
+                return rc == 0
+            if manager == "pacman":
+                rc, _, _ = await run_process(manager, "-Sy", "--noconfirm", *packages, timeout=900)
+                return rc == 0
+        except Exception as exc:
+            logger.warning("QEMU host package installation failed via %s: %s", manager, safe_log(exc))
+        return False
+
+    if progress is not None:
+        with contextlib.suppress(Exception):
+            await progress("Detecting host package manager")
+
+    if shutil.which("apt-get"):
+        await install_with("apt-get", [
+            "qemu-system-x86", "qemu-utils", "cloud-image-utils", "genisoimage", "xorriso", "openssh-client",
+        ])
+    elif shutil.which("dnf"):
+        await install_with("dnf", ["qemu-system-x86-core", "qemu-img", "xorriso", "openssh-clients"])
+    elif shutil.which("yum"):
+        await install_with("yum", ["qemu-system-x86-core", "qemu-img", "xorriso", "openssh-clients"])
+    elif shutil.which("apk"):
+        await install_with("apk", ["qemu-system-x86_64", "qemu-img", "xorriso", "openssh-client"])
+    elif shutil.which("pacman"):
+        await install_with("pacman", ["qemu-desktop", "qemu-img", "xorriso", "openssh"])
+
+    missing = missing_tools()
+    if missing:
+        return False, "Missing QEMU host tools after installation attempt: " + ", ".join(missing) + "."
+    return True, "QEMU TCG host tools are ready; KVM is disabled and never used."
+
+
+async def qemu_download_base(os_type: str) -> tuple[bool, str, Path | None]:
+    url = QEMU_IMAGE_URLS.get(os_type)
+    if not url:
+        return False, f"No official QEMU image is configured for {os_type}.", None
+    target = QEMU_IMAGE_CACHE / re.sub(r"[^A-Za-z0-9_.-]+", "-", url.rsplit("/", 1)[-1])
+    if target.exists() and target.stat().st_size > 1024 * 1024:
+        rc, _, _ = await run_process("qemu-img", "info", str(target), timeout=30)
+        if rc == 0:
+            return True, "", target
+    partial = target.with_suffix(target.suffix + ".part")
+    with contextlib.suppress(OSError):
+        partial.unlink()
+    rc, _, err = await run_process(
+        "curl", "-fL", "--retry", "3", "--retry-delay", "2",
+        "--connect-timeout", "20", "--max-time", "900", "-o", str(partial),
+        url, timeout=930,
+    )
+    if rc != 0:
+        with contextlib.suppress(OSError):
+            partial.unlink()
+        return False, safe_log(err.decode("utf-8", "replace").strip() or "QEMU image download failed."), None
+    rc, _, err = await run_process("qemu-img", "info", str(partial), timeout=30)
+    if rc != 0:
+        with contextlib.suppress(OSError):
+            partial.unlink()
+        return False, safe_log(err.decode("utf-8", "replace").strip() or "Downloaded QEMU image is invalid."), None
+    partial.replace(target)
+    return True, "", target
+
+
+def qemu_free_port() -> int | None:
+    reserved: set[int] = set()
+    with contextlib.suppress(OSError):
+        for child in QEMU_VM_ROOT.iterdir():
+            if not child.is_dir() or child.name == "_images":
+                continue
+            meta = qemu_load_meta(child.name)
+            if meta and qemu_process_alive(meta.get("pid")):
+                with contextlib.suppress(TypeError, ValueError):
+                    reserved.add(int(meta.get("ssh_port", 0)))
+    for port in range(QEMU_SSH_PORT_START, QEMU_SSH_PORT_END + 1):
+        if port in reserved:
+            continue
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(("127.0.0.1", port))
+            return port
+        except OSError:
+            continue
+    return None
+
+
+def qemu_cloud_config(hostname: str, pubkey: str) -> str:
+    return f"""#cloud-config
+users:
+  - default
+  - name: {QEMU_SSH_USER}
+    gecos: RGNODES
+    groups: [sudo]
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - {pubkey.strip()}
+ssh_pwauth: false
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-rgnodes.conf
+    permissions: '0644'
+    content: |
+      PasswordAuthentication no
+      PubkeyAuthentication yes
+      PermitRootLogin prohibit-password
+      UseDNS no
+  - path: /usr/local/sbin/rgnodes-firstboot.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set +e
+      mkdir -p /etc/rgnodes /var/lib/rgnodes
+      export DEBIAN_FRONTEND=noninteractive
+      if [ -f /etc/debian_version ]; then
+        . /etc/os-release
+        if [ "${{VERSION_CODENAME:-}}" = "bullseye" ]; then
+          sed -i -E 's#https?://[^ ]*debian.org/debian#http://archive.debian.org/debian#g; s#https?://security.debian.org/debian-security#http://archive.debian.org/debian-security#g' /etc/apt/sources.list 2>/dev/null || true
+          printf '%s\\n' 'Acquire::Check-Valid-Until "false";' >/etc/apt/apt.conf.d/99rgnodes-bullseye
+        fi
+      fi
+      dpkg --configure -a -D777 >/var/log/rgnodes-dpkg.log 2>&1 || true
+      apt-get update -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold >/var/log/rgnodes-apt-update.log 2>&1 || true
+      apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold curl ca-certificates sudo openssh-server bash coreutils procps >/var/log/rgnodes-base.log 2>&1 || true
+      mkdir -p /run/sshd /var/run/sshd
+      sshd -t >/var/log/rgnodes-sshd-test.log 2>&1 || true
+      systemctl enable ssh.service >/dev/null 2>&1 || systemctl enable sshd.service >/dev/null 2>&1 || true
+      systemctl restart ssh.service >/dev/null 2>&1 || systemctl restart sshd.service >/dev/null 2>&1 || true
+      printf '%s\\n' 'ready=1' >/etc/rgnodes/.system-ready
+      printf '%s\\n' 'accelerator=tcg' >/etc/rgnodes/virtualization
+      touch /var/lib/rgnodes/cloud-init-complete
+runcmd:
+  - [bash, /usr/local/sbin/rgnodes-firstboot.sh]
+final_message: 'RGNODES QEMU TCG VPS is ready.'
+"""
+
+
+async def qemu_build_seed(vm_id: str, hostname: str, pubkey: str) -> tuple[bool, str, Path | None]:
+    directory = qemu_vm_dir(vm_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    user_data = directory / "user-data"
+    meta_data = directory / "meta-data"
+    seed = directory / "seed.iso"
+    user_data.write_text(qemu_cloud_config(hostname, pubkey), encoding="utf-8")
+    meta_data.write_text(f"instance-id: rgnodes-{vm_id}\nlocal-hostname: {hostname}\n", encoding="utf-8")
+    builder = qemu_seed_builder()
+    if not builder:
+        return False, "No cloud-init seed builder is installed.", None
+    if Path(builder).name == "cloud-localds":
+        rc, _, err = await run_process(builder, str(seed), str(user_data), str(meta_data), timeout=60)
+    elif Path(builder).name == "genisoimage":
+        rc, _, err = await run_process(builder, "-quiet", "-output", str(seed), "-volid", "CIDATA", "-joliet", "-rock", str(user_data), str(meta_data), timeout=60)
+    else:
+        rc, _, err = await run_process(builder, "-as", "mkisofs", "-quiet", "-o", str(seed), "-V", "CIDATA", "-J", "-R", str(user_data), str(meta_data), timeout=60)
+    if rc != 0 or not seed.exists() or seed.stat().st_size < 4096:
+        return False, safe_log(err.decode("utf-8", "replace").strip() or "Cloud-init seed creation failed."), None
+    return True, "", seed
+
+
+def qemu_command(meta: dict[str, Any], port_forwards: list[tuple[int, int]] | None = None, *, legacy_tcg: bool = False, machine: str | None = None) -> list[str]:
+    net = f"user,id=net0,hostfwd=tcp:127.0.0.1:{int(meta['ssh_port'])}-:22"
+    for host_port, guest_port in port_forwards or []:
+        net += f",hostfwd=tcp:0.0.0.0:{int(host_port)}-:{int(guest_port)}"
+    accel_args = ["-accel", "tcg"] if legacy_tcg else ["-accel", "tcg,thread=multi"]
+    return [
+        qemu_binary() or "qemu-system-x86_64",
+        "-name", str(meta.get("name") or "rgnodes-vm"),
+        "-machine", machine or str(meta.get("machine") or "q35"),
+        *accel_args,
+        "-cpu", "max",
+        "-m", str(meta.get("ram") or "1G"),
+        "-smp", str(meta.get("cpu") or "1"),
+        "-boot", "order=c,menu=off",
+        "-drive", f"file={meta['disk_path']},if=virtio,format=qcow2,cache=writeback,aio=threads",
+        "-drive", f"file={meta['seed_path']},media=cdrom,readonly=on",
+        "-netdev", net,
+        "-device", "virtio-net-pci,netdev=net0",
+        "-display", "none",
+        "-serial", f"file:{meta['log_path']}",
+        "-monitor", "none",
+        "-no-reboot",
+        "-daemonize",
+        "-pidfile", str(meta["pid_path"]),
+    ]
+
+
+async def qemu_launch(vm_id: str, port_forwards: list[tuple[int, int]] | None = None) -> tuple[bool, str]:
+    meta = qemu_load_meta(vm_id)
+    if not meta:
+        return False, "QEMU VM metadata is missing."
+    if qemu_process_alive(meta.get("pid")):
+        return True, ""
+    with contextlib.suppress(OSError):
+        Path(str(meta["pid_path"])).unlink()
+
+    last_error = "QEMU failed to start."
+    variants = [
+        (False, str(meta.get("machine") or "q35")),
+        (True, str(meta.get("machine") or "q35")),
+        (True, "pc"),
+    ]
+    for legacy_tcg, machine in variants:
+        rc, out, err = await run_process(
+            *qemu_command(meta, port_forwards, legacy_tcg=legacy_tcg, machine=machine), timeout=60
+        )
+        combined = (err + out).decode("utf-8", "replace").strip()
+        if rc != 0:
+            last_error = safe_log(combined or "QEMU failed to start.")
+            text = last_error.lower()
+            if "address already in use" in text or "could not set up host forwarding" in text or "bind() failed" in text:
+                return False, last_error
+            continue
+        await asyncio.sleep(1)
+        try:
+            pid = int(Path(str(meta["pid_path"])).read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            last_error = "QEMU started without producing a valid PID file."
+            continue
+        meta["pid"] = pid
+        meta["machine"] = machine
+        meta["tcg_legacy"] = legacy_tcg
+        qemu_save_meta(vm_id, meta)
+        if qemu_process_alive(pid):
+            return True, ""
+        last_error = "QEMU exited immediately; inspect the VM serial log."
+    return False, last_error
+
+
+async def qemu_create_vm(*, os_type: str, hostname: str, ram: str, cpu: str, disk: str, name: str, persistent_key: str | None = None) -> tuple[str | None, str]:
+    normalized = normalize_os(os_type) or qemu_os_from_image(os_type)
+    if not normalized:
+        return None, f"Unsupported QEMU operating system: {os_type}"
+    ok, detail = await qemu_host_prepare()
+    if not ok:
+        return None, detail
+    base_ok, base_detail, base = await qemu_download_base(normalized)
+    if not base_ok or base is None:
+        return None, base_detail
+    # qemu-img resolves a relative backing-file path relative to the new
+    # overlay's directory. Always pass the canonical absolute path so an
+    # overlay under <vm>/ does not accidentally become <vm>/<cache>/... .
+    base = base.expanduser().resolve()
+    if not base.is_file():
+        return None, f"Base QEMU image is missing after download: {base}"
+
+    vm_id = "qemu-" + uuid.uuid4().hex[:24]
+    directory = qemu_vm_dir(vm_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        ssh_port = qemu_free_port()
+        if not ssh_port:
+            raise RuntimeError("No free local SSH forwarding port is available.")
+
+        priv = directory / "id_ed25519"
+        pub = directory / "id_ed25519.pub"
+        rc, _, err = await run_process(
+            "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(priv), timeout=30
+        )
+        if rc != 0 or not pub.exists():
+            raise RuntimeError(safe_log(err.decode("utf-8", "replace").strip() or "SSH key generation failed."))
+        os.chmod(priv, 0o600)
+
+        seed_ok, seed_detail, seed = await qemu_build_seed(
+            vm_id, hostname, pub.read_text(encoding="utf-8").strip()
+        )
+        if not seed_ok or seed is None:
+            raise RuntimeError(seed_detail or "Cloud-init seed creation failed.")
+
+        disk_path = directory / "disk.qcow2"
+        rc_info, out_info, _ = await run_process(
+            "qemu-img", "info", "--output=json", str(base), timeout=30
+        )
+        backing_format = "qcow2"
+        if rc_info == 0:
+            with contextlib.suppress(ValueError, TypeError, json.JSONDecodeError):
+                image_info = json.loads(out_info.decode("utf-8", "replace"))
+                candidate = str(image_info.get("format") or "").strip().lower()
+                if re.fullmatch(r"[a-z0-9_-]+", candidate):
+                    backing_format = candidate
+        rc, _, err = await run_process(
+            "qemu-img", "create", "-f", "qcow2", "-F", backing_format, "-b", str(base),
+            str(disk_path.resolve()), str(disk), timeout=120
+        )
+        if rc != 0:
+            raise RuntimeError(safe_log(err.decode("utf-8", "replace").strip() or "VM disk creation failed."))
+
+        # Validate the newly-created overlay before booting it.
+        rc, _, err = await run_process("qemu-img", "check", "-f", "qcow2", str(disk_path.resolve()), timeout=120)
+        if rc != 0:
+            raise RuntimeError(safe_log(err.decode("utf-8", "replace").strip() or "VM disk validation failed."))
+
+        meta = {
+            "name": name, "hostname": hostname, "os_type": normalized,
+            "ram": ram, "cpu": cpu, "disk": disk, "ssh_port": ssh_port,
+            "ssh_user": QEMU_SSH_USER, "ssh_private_key": str(priv),
+            "ssh_public_key": str(pub.resolve()), "disk_path": str(disk_path.resolve()),
+            "seed_path": str(seed.resolve()), "log_path": str((directory / "serial.log").resolve()),
+            "pid_path": str((directory / "qemu.pid").resolve()), "base_path": str(base),
+            "accelerator": "tcg", "kvm": False,
+            "persistent_key": str(persistent_key or name),
+            "created_at": utc_now(), "pid": None, "machine": "q35",
+        }
+        qemu_save_meta(vm_id, meta)
+        started, start_detail = await qemu_launch(vm_id)
+        if not started:
+            raise RuntimeError(start_detail or "QEMU VM failed to start.")
+        return vm_id, ""
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            await qemu_stop_vm(vm_id)
+        with contextlib.suppress(OSError):
+            shutil.rmtree(directory)
+        return None, safe_log(exc)
+
+
+async def qemu_ssh(vm_id: str, command: str, timeout: float = ACCESS_TIMEOUT) -> tuple[int, bytes, bytes]:
+    meta = qemu_load_meta(vm_id)
+    if not meta:
+        return 1, b"", b"QEMU VM metadata is missing."
+    port = int(meta.get("ssh_port", 0))
+    priv = Path(str(meta.get("ssh_private_key", "")))
+    user = str(meta.get("ssh_user") or QEMU_SSH_USER)
+    if not port or not priv.exists():
+        return 1, b"", b"QEMU VM SSH configuration is missing."
+    return await run_process(
+        "ssh", "-i", str(priv), "-p", str(port), "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=2",
+        "-o", "IdentitiesOnly=yes", "-o", "PreferredAuthentications=publickey",
+        "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+        f"{user}@127.0.0.1", "bash", "-lc", command, timeout=timeout,
+    )
+
+
+async def qemu_state(vm_id: str) -> str | None:
+    meta = qemu_load_meta(vm_id)
+    if not meta:
+        return None
+    return "running" if qemu_process_alive(meta.get("pid")) else "stopped"
+
+
+async def qemu_stop_vm(vm_id: str) -> bool:
+    meta = qemu_load_meta(vm_id)
+    if not meta:
+        return False
+    pid = meta.get("pid")
+    if not qemu_process_alive(pid):
+        meta["pid"] = None
+        qemu_save_meta(vm_id, meta)
+        return True
+    with contextlib.suppress(OSError, ValueError):
+        os.kill(int(pid), signal.SIGTERM)
+    for _ in range(30):
+        if not qemu_process_alive(pid):
+            meta["pid"] = None
+            qemu_save_meta(vm_id, meta)
+            return True
+        await asyncio.sleep(0.5)
+    with contextlib.suppress(OSError, ValueError):
+        os.kill(int(pid), signal.SIGKILL)
+    meta["pid"] = None
+    qemu_save_meta(vm_id, meta)
+    return True
+
+
+async def qemu_remove_vm(vm_id: str) -> bool:
+    await qemu_stop_vm(vm_id)
+    try:
+        shutil.rmtree(qemu_vm_dir(vm_id))
+        return True
+    except OSError:
+        return False
+
+
+def qemu_running_forwards(vps_id: int | None) -> list[tuple[int, int]]:
+    if vps_id is None:
+        return []
+    forwards: list[tuple[int, int]] = []
+    try:
+        rows = db_list_ports(int(vps_id))
+    except Exception:
+        return forwards
+    for row in rows:
+        try:
+            if str(row["protocol"]).lower() != "tcp":
+                continue
+            if str(row["status"]).lower() != "running":
+                continue
+            host_port = int(row["host_port"])
+            guest_port = int(row["container_port"])
+            if 1 <= host_port <= 65535 and 1 <= guest_port <= 65535:
+                forwards.append((host_port, guest_port))
+        except (TypeError, ValueError, KeyError):
+            continue
+    # Stable de-duplication protects QEMU from duplicate hostfwd definitions.
+    return list(dict.fromkeys(forwards))
+
+
+async def qemu_restart_vm(vm_id: str, vps_id: int | None = None) -> tuple[bool, str]:
+    await qemu_stop_vm(vm_id)
+    return await qemu_launch(vm_id, qemu_running_forwards(vps_id))
+
+
+async def _wait_qemu_ready(container: str) -> tuple[bool, str]:
+    deadline = asyncio.get_running_loop().time() + QEMU_BOOT_TIMEOUT
+    last = "Waiting for the real VM to boot and cloud-init to finish."
+    while asyncio.get_running_loop().time() < deadline:
+        if await qemu_state(container) != "running":
+            meta = qemu_load_meta(container) or {}
+            log_path = Path(str(meta.get("log_path", "")))
+            text = ""
+            if log_path.exists():
+                with contextlib.suppress(OSError):
+                    text = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:])
+            return False, "QEMU VM stopped during boot." + (("\nSerial log:\n" + safe_log(text, 3000)) if text else "")
+        ok, detail = await guest_system_ready(container)
+        if ok:
+            return True, detail
+        last = detail
+        await asyncio.sleep(3)
+    return False, f"QEMU VPS readiness timed out after {QEMU_BOOT_TIMEOUT}s. Last check: {last}"
+
+
 async def docker_exists(container: str) -> bool:
+    if qemu_load_meta(container):
+        return True
     rc, _, _ = await docker_cli("inspect", container, timeout=20, retries=1)
     return rc == 0
 
 
 async def docker_state(container: str) -> str | None:
+    if qemu_load_meta(container):
+        return await qemu_state(container)
     rc, out, _ = await docker_cli("inspect", "-f", "{{.State.Status}}", container, timeout=20, retries=1)
     if rc != 0:
         return None
@@ -1393,7 +1969,9 @@ async def _start_docker_daemon() -> tuple[bool, str]:
 
 
 async def docker_info() -> tuple[bool, str]:
-    """Return Docker readiness without silently changing host service state."""
+    """Return readiness for the active VM backend."""
+    if active_backend() == "qemu":
+        return await qemu_host_prepare()
     if not command_available("docker"):
         return False, (
             "Docker CLI is not installed. Run `/install-system confirm:true` "
@@ -1418,6 +1996,23 @@ async def docker_info() -> tuple[bool, str]:
 
 
 async def docker_running_count() -> tuple[bool, int]:
+    if active_backend() == "qemu":
+        count = 0
+        try:
+            for child in QEMU_VM_ROOT.iterdir():
+                if child.is_dir() and child.name != "_images":
+                    meta_path = child / "vm.json"
+                    if not meta_path.exists():
+                        continue
+                    try:
+                        data = json.loads(meta_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                        continue
+                    if qemu_process_alive(data.get("pid")):
+                        count += 1
+            return True, count
+        except OSError as exc:
+            return False, db_running_count()
     # Do not depend only on labels: older Docker clients may not advertise --label.
     # The RGNODES namespace is the canonical container-name prefix as well.
     rc, out, _ = await docker_cli("ps", "--format", "{{.ID}}\t{{.Names}}", timeout=20, retries=1)
@@ -1432,6 +2027,12 @@ async def docker_running_count() -> tuple[bool, int]:
 
 
 async def docker_pull(image: str) -> tuple[bool, str]:
+    if active_backend() == "qemu":
+        os_name = qemu_os_from_image(image)
+        if not os_name:
+            return False, f"Unsupported QEMU image mapping: {image}"
+        ok, detail, _ = await qemu_download_base(os_name)
+        return ok, detail
     rc, _, err = await docker_cli("pull", image, timeout=IMAGE_PULL_TIMEOUT, retries=2)
     if rc == 0:
         return True, ""
@@ -1458,7 +2059,14 @@ async def docker_run_features() -> set[str]:
         rc, out, _ = await docker_cli("run", "--help", timeout=20, retries=0)
         if rc == 0:
             text = out.decode("utf-8", "replace")
-            for flag in ("--init", "--pids-limit", "--storage-opt", "--cpus", "--memory", "--memory-reservation", "--memory-swap", "--memory-swappiness", "--restart", "--hostname", "--name", "--label", "--log-driver", "--log-opt", "--privileged", "--tmpfs", "--cgroupns", "--stop-signal"):
+            for flag in (
+                "--init", "--pids-limit", "--storage-opt", "--cpus",
+                "--memory", "--memory-reservation", "--memory-swap",
+                "--memory-swappiness", "--restart", "--hostname", "--name",
+                "--label", "--log-driver", "--log-opt", "--privileged",
+                "--tmpfs", "--mount", "--device", "--cgroupns",
+                "--security-opt", "--stop-signal",
+            ):
                 if flag in text:
                     features.add(flag)
         DOCKER_RUN_FEATURES = features
@@ -1476,18 +2084,23 @@ def feature_error(text: str) -> bool:
 
 GUEST_BOOTSTRAP_SCRIPT = r"""#!/bin/bash
 set -Eeuo pipefail
+BOOTSTRAP_LOG=/var/lib/rgnodes/bootstrap.log
+mkdir -p /var/lib/rgnodes
+exec 3>>"$BOOTSTRAP_LOG"
+log_bootstrap_error() { rc=$?; printf '[RGNODES guest] bootstrap command failed rc=%s line=%s\n' "$rc" "${BASH_LINENO[0]:-0}" >&3; }
+trap log_bootstrap_error ERR
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 # Prevent apt helper calls from trying to control services before PID 1 is
 # systemd. This variable must never be inherited by the final systemd process.
 export SYSTEMD_OFFLINE=1
 
-MARKER=/var/lib/rgnodes/.system-ready
-BOOTSTRAP_MARKER=/var/lib/rgnodes/.bootstrap-installed
+MARKER=/etc/rgnodes/.system-ready
+BOOTSTRAP_MARKER=/etc/rgnodes/.bootstrap-installed
 # Persistent VPS data lives in named Docker volumes. docker rm (without -v)
 # does not delete these volumes, allowing reinstall/recreate to reattach them.
 PERSISTENCE_POLICY=/var/lib/rgnodes/persistence-policy
-mkdir -p /var/lib/rgnodes /etc/ssh /etc/systemd/system
+mkdir -p /var/lib/rgnodes /etc/rgnodes /etc/ssh /etc/systemd/system
 printf 'named-volumes=enabled\ncontainer-delete=preserve-volumes\n' >"$PERSISTENCE_POLICY"
 
 log() { printf '[RGNODES guest] %s\\n' "$*"; }
@@ -1503,71 +2116,192 @@ EOF
 }
 remove_policy() { rm -f /usr/sbin/policy-rc.d; }
 
-apt_install_base() {
-    apt-get update -y
-    apt-get full-upgrade -y
-    apt-get install -y --no-install-recommends \
-        systemd systemd-sysv dbus dbus-user-session init-system-helpers \
-        ca-certificates curl wget gnupg lsb-release software-properties-common \
-        bash coreutils procps psmisc iproute2 iputils-ping iptables nftables \
-        util-linux net-tools netcat-openbsd socat sudo jq git \
-        tar gzip bzip2 unzip xz-utils zip rsync acl openssl \
-        build-essential pkg-config make gcc g++ python3 python3-pip python3-venv \
-        openssh-client openssh-server systemd-container dbus-x11 \
-        systemd-timesyncd systemd-resolved lsof htop tmux screen \
-        bash-completion locales logrotate
+prepare_apt_sources() {
+    local id codename backup_dir f
+    id="$(. /etc/os-release && printf '%s' "${ID:-}")"
+    codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
+
+    # A single non-interactive APT/Dpkg policy applies to every supported OS.
+    # This is critical when /etc contains persistent files from an earlier
+    # installation: dpkg must never wait for stdin on a conffile question.
+    cat >/etc/apt/apt.conf.d/99rgnodes-noninteractive <<'EOF'
+Dpkg::Options {
+  "--force-confdef";
+  "--force-confold";
+};
+Dpkg::Use-Pty "0";
+APT::Get::Assume-Yes "true";
+Acquire::Retries "3";
+EOF
+    export APT_LISTCHANGES_FRONTEND=none
+    export UCF_FORCE_CONFOLD=1
+    export UCF_FORCE_CONFFNEW=0
+
+    # Override apt-get inside this bootstrap so every package operation receives
+    # the same conffile policy, including operations in later helper functions.
+    apt-get() {
+        command apt-get \
+            -o Dpkg::Options::=--force-confdef \
+            -o Dpkg::Options::=--force-confold \
+            -o Dpkg::Use-Pty=0 \
+            "$@"
+    }
+
+    # Debian 11 is archived. Disable stale third-party sources and use the
+    # coherent Bullseye archive snapshot instead of mixing repositories.
+    if [ "$id" = "debian" ] && [ "$codename" = "bullseye" ]; then
+        backup_dir=/etc/apt/rgnodes-disabled-sources
+        mkdir -p "$backup_dir"
+        if [ -f /etc/apt/sources.list ]; then
+            cp -an /etc/apt/sources.list "$backup_dir/sources.list.base" || true
+        fi
+        for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] || continue
+            mv -f "$f" "$backup_dir/$(basename "$f").disabled" || true
+        done
+        # Bullseye base repositories are archived. Do not use Bullseye security
+        # metadata here: it became inconsistent after Bullseye LTS ended in 2026
+        # and can advertise package files that are no longer published. The base
+        # Debian 11.11 image already contains a coherent root filesystem; this
+        # source is used only for packages that are still present in the archive.
+        cat >/etc/apt/sources.list <<'EOF'
+deb http://archive.debian.org/debian bullseye main contrib non-free
+deb http://archive.debian.org/debian bullseye-updates main contrib non-free
+EOF
+        cat >/etc/apt/apt.conf.d/99rgnodes-bullseye-archive <<'EOF'
+Acquire::Check-Valid-Until "false";
+Acquire::AllowInsecureRepositories "true";
+Acquire::Retries "5";
+APT::Get::Update::Error-Mode "any";
+EOF
+        log 'Debian 11 detected: using coherent archived Bullseye base/update repositories only.'
+    fi
+
+    # Never let stale package lists from a previous image win over the current
+    # OS repositories. This keeps Ubuntu/Debian upgrades coherent as well.
+    rm -rf /var/lib/apt/lists/*
+    apt-get update -y || return 1
 }
 
-install_web_and_database_stack() {
-    [ "__WEB_STACK__" = "1" ] || return 0
+apt_install_base() {
+    apt_retry() {
+        local tries=0
+        while :; do
+            tries=$((tries + 1))
+            if "$@"; then return 0; fi
+            if [ "$tries" -ge 4 ]; then return 1; fi
+            log "APT operation failed; retry $tries/3"
+            sleep $((tries * 2))
+        done
+    }
+
+    prepare_apt_sources || {
+        echo 'Guest APT repository setup failed.' >&2
+        return 1
+    }
 
     local id codename
     id="$(. /etc/os-release && printf '%s' "${ID:-}")"
     codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
 
-    # Pterodactyl Panel currently requires PHP 8.2 or 8.3. Ubuntu 22.04
-    # needs an additional PHP repository; Debian 11/12 use packages.sury.org.
+    # Finish interrupted unpack/configure operations, but never let dpkg ask for
+    # a conffile answer from stdin. This matters with persistent /etc/ssh data.
+    dpkg --force-confdef --force-confold --configure -a || true
+    dpkg --audit >&2 || true
+
+    # Debian 11 can enter bootstrap with an old gnupg package paired with a newer
+    # gpgv package. Because Bullseye's post-LTS security metadata is inconsistent,
+    # trying to repair that pair through the security repository can make the
+    # dependency graph strictly worse. The VPS does not need the gnupg frontend to
+    # boot systemd, and all repository helpers below can use ASCII-armored keys.
+    if [ "$id" = "debian" ] && [ "$codename" = "bullseye" ]; then
+        # The failing Bullseye state seen in the field is a mixed gnupg/gpgv pair.
+        # Keep gpgv because APT needs it, but remove only the optional GnuPG
+        # front-end packages. No systemd boot dependency requires them, and all
+        # third-party repository helpers below use signed ASCII/binary key files
+        # directly instead of invoking the gpg frontend.
+        for pkg in gnupg gnupg2 gpg gpg-agent gpgconf gpgsm dirmngr gnupg-utils gnupg-l10n gpg-wks-client gpg-wks-server; do
+            dpkg --remove --force-depends --force-remove-reinstreq "$pkg" >/dev/null 2>&1 || true
+        done
+        log 'Debian 11: removed potentially inconsistent GnuPG frontend packages; retaining gpgv for APT.'
+    fi
+
+    local essential="systemd systemd-sysv libsystemd0 dbus dbus-user-session init-system-helpers ca-certificates curl wget gpgv lsb-release bash coreutils procps psmisc iproute2 iputils-ping util-linux sudo openssh-client openssh-server tar gzip unzip xz-utils zip rsync acl openssl locales logrotate"
+    # Avoid a broad full-upgrade during guest creation. It is unnecessary for a
+    # fresh OS image and can introduce cross-suite dependency conflicts.
+    if ! apt_retry apt-get install -y --no-install-recommends --allow-downgrades --allow-change-held-packages $essential; then
+        dpkg --force-confdef --force-confold --configure -a || true
+        apt_retry apt-get -f install -y --allow-downgrades --allow-change-held-packages || true
+        apt_retry apt-get install -y --no-install-recommends --allow-downgrades --allow-change-held-packages \
+            systemd systemd-sysv libsystemd0 dbus dbus-user-session init-system-helpers \
+            ca-certificates curl wget gpgv openssh-client openssh-server || {
+            echo 'Essential guest package installation failed: systemd/SSH could not be installed.' >&2
+            apt-cache policy systemd systemd-sysv libsystemd0 gnupg gpgv >&2 || true
+            return 1
+        }
+    fi
+
+    command -v systemctl >/dev/null 2>&1 || {
+        echo 'systemctl is still unavailable after APT repair.' >&2
+        return 1
+    }
+    [ -x /lib/systemd/systemd ] || [ -x /usr/lib/systemd/systemd ] || {
+        echo 'systemd binary is missing after APT repair.' >&2
+        return 1
+    }
+
+    apt_retry apt-get install -y --no-install-recommends --allow-downgrades \
+        iptables nftables net-tools netcat-openbsd socat jq git \
+        build-essential pkg-config make gcc g++ python3 python3-pip python3-venv \
+        systemd-container dbus-x11 systemd-timesyncd systemd-resolved \
+        lsof htop tmux screen bash-completion || \
+        log 'Optional base utilities were not all installed.'
+}
+
+
+install_web_and_database_stack() {
+    [ "__WEB_STACK__" = "1" ] || return 0
+    set +e
+    local id codename
+    id="$(. /etc/os-release && printf '%s' "${ID:-}")"
+    codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
+
     if [ "$id" = "ubuntu" ]; then
-        # Pterodactyl 1.12+ requires PHP 8.2 or 8.3. Prefer Ondrej's PHP
-        # packages on Ubuntu so supported PHP versions are available even on
-        # newer Ubuntu releases such as 26.04 when the PPA provides them.
-        LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php || true
+        case "$codename" in
+            jammy|noble) LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php >/dev/null 2>&1 || true ;;
+            *) log "Using distro PHP packages on Ubuntu $codename" ;;
+        esac
     elif [ "$id" = "debian" ]; then
         install -m 0755 -d /etc/apt/keyrings
-        if curl -fsSL https://packages.sury.org/php/apt.gpg \
-            -o /etc/apt/keyrings/sury-php.gpg; then
+        if curl -fsSL https://packages.sury.org/php/apt.gpg -o /etc/apt/keyrings/sury-php.gpg; then
             chmod 0644 /etc/apt/keyrings/sury-php.gpg
-            printf 'deb [signed-by=/etc/apt/keyrings/sury-php.gpg] https://packages.sury.org/php/ %s main\n' \
-                "$codename" >/etc/apt/sources.list.d/php-sury.list
+            printf 'deb [signed-by=/etc/apt/keyrings/sury-php.gpg] https://packages.sury.org/php/ %s main\n' "$codename" >/etc/apt/sources.list.d/php-sury.list
         fi
     fi
 
-    # Redis repository for Debian 11/12; Debian 13 has a suitable distro
-    # package according to the current Pterodactyl dependency guide.
-    if [ "$id" = "debian" ] && { [ "$codename" = "bullseye" ] || [ "$codename" = "bookworm" ]; }; then
-        if curl -fsSL https://packages.redis.io/gpg |
-            gpg --dearmor --yes -o /etc/apt/keyrings/redis-archive-keyring.gpg; then
-            chmod 0644 /etc/apt/keyrings/redis-archive-keyring.gpg
-            printf 'deb [signed-by=/etc/apt/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb %s main\n' \
-                "$codename" >/etc/apt/sources.list.d/redis.list
+    if [ "$id" = "debian" ] && [ "$codename" = "bookworm" ]; then
+        if curl -fsSL https://packages.redis.io/gpg -o /etc/apt/keyrings/redis-archive-keyring.asc; then
+            chmod 0644 /etc/apt/keyrings/redis-archive-keyring.asc
+            printf 'deb [signed-by=/etc/apt/keyrings/redis-archive-keyring.asc] https://packages.redis.io/deb %s main\n' "$codename" >/etc/apt/sources.list.d/redis.list
         fi
-    fi
-
-    # MariaDB repo for Debian 11/12. If the external setup is unavailable,
-    # keep the distro package as a safe fallback and fail later only if its
-    # resulting version is genuinely incompatible.
-    if [ "$id" = "debian" ] && { [ "$codename" = "bullseye" ] || [ "$codename" = "bookworm" ]; }; then
         if curl -fsSL https://r.mariadb.com/downloads/mariadb_repo_setup -o /tmp/mariadb_repo_setup; then
             chmod 0755 /tmp/mariadb_repo_setup
             /tmp/mariadb_repo_setup --skip-maxscale --skip-tools || true
             rm -f /tmp/mariadb_repo_setup
         fi
+    elif [ "$id" = "debian" ] && [ "$codename" = "bullseye" ]; then
+        # Stay entirely on archived Bullseye package metadata here. Debian 11's
+        # distro MariaDB/Redis are preferable to introducing another repository
+        # into a release whose security metadata is no longer maintained.
+        rm -f /etc/apt/sources.list.d/php-sury.list /etc/apt/sources.list.d/redis.list 2>/dev/null || true
     fi
 
-    apt-get update -y
-    apt-get install -y --no-install-recommends \
-        nginx certbot python3-certbot-nginx tar unzip git \
-        mariadb-server mariadb-client redis-server
+    apt-get update -y || {
+        rm -f /etc/apt/sources.list.d/php-sury.list /etc/apt/sources.list.d/redis.list
+        apt-get update -y || true
+    }
+    apt-get install -y --no-install-recommends nginx certbot python3-certbot-nginx \
+        mariadb-server mariadb-client redis-server || log 'Web/database base packages were not fully installed.'
 
     if ! apt-get install -y --no-install-recommends \
         php8.3 php8.3-common php8.3-cli php8.3-gd php8.3-mysql \
@@ -1577,12 +2311,15 @@ install_web_and_database_stack() {
             php8.2 php8.2-common php8.2-cli php8.2-gd php8.2-mysql \
             php8.2-mbstring php8.2-bcmath php8.2-xml php8.2-tokenizer \
             php8.2-fpm php8.2-curl php8.2-zip; then
-            apt-get install -y --no-install-recommends \
-                php php-common php-cli php-gd php-mysql php-mbstring \
-                php-bcmath php-xml php-fpm php-curl php-zip
+            apt-get install -y --no-install-recommends php php-common php-cli php-gd \
+                php-mysql php-mbstring php-bcmath php-xml php-fpm php-curl php-zip \
+                || log 'Compatible PHP package set could not be installed.'
         fi
     fi
+    set -e
+    return 0
 }
+
 
 install_docker_debian_ubuntu() {
     local id codename arch repo_url compose_arch
@@ -1664,15 +2401,15 @@ install_node_pm2_yarn() {
     esac
 
     if [ -n "$node_arch" ] && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-        | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg; then
-        chmod 0644 /etc/apt/keyrings/nodesource.gpg
+        -o /etc/apt/keyrings/nodesource.asc; then
+        chmod 0644 /etc/apt/keyrings/nodesource.asc
         cat >/etc/apt/sources.list.d/nodesource.sources <<EOF
 Types: deb
 URIs: https://deb.nodesource.com/node_20.x
 Suites: nodistro
 Components: main
 Architectures: $arch
-Signed-By: /etc/apt/keyrings/nodesource.gpg
+Signed-By: /etc/apt/keyrings/nodesource.asc
 EOF
         apt-get update -y || true
     fi
@@ -1727,21 +2464,73 @@ install_composer() {
 
 install_kvm_stack() {
     [ "__KVM_ENABLED__" = "1" ] || return 0
-    log 'Installing KVM/QEMU/libvirt userspace support'
-    local arch
-    arch="$(dpkg --print-architecture)"
+    log 'Installing QEMU/KVM/libvirt virtualization stack'
+    set +e
+    local arch qemu_pkg
+    arch="$(dpkg --print-architecture 2>/dev/null || true)"
+    qemu_pkg=""
+    case "$arch" in
+        amd64|i386) qemu_pkg='qemu-system-x86 qemu-kvm ovmf' ;;
+        arm64|armhf) qemu_pkg='qemu-system-arm' ;;
+        armel) qemu_pkg='qemu-system-arm' ;;
+        ppc64el) qemu_pkg='qemu-system-ppc' ;;
+        s390x) qemu_pkg='qemu-system-s390x' ;;
+        riscv64) qemu_pkg='qemu-system-misc' ;;
+        *) qemu_pkg='qemu-system-misc' ;;
+    esac
+
     apt-get install -y --no-install-recommends \
-        qemu-utils qemu-system-common libvirt-daemon-system \
-        libvirt-clients cpu-checker bridge-utils cloud-image-utils \
-        swtpm swtpm-tools
+        qemu-utils qemu-system-common qemu-system-data libvirt-daemon-system \
+        libvirt-clients cloud-image-utils swtpm swtpm-tools cpu-checker \
+        bridge-utils "$qemu_pkg" >/tmp/rgnodes-qemu-install.log 2>&1 || true
+
+    command -v modprobe >/dev/null 2>&1 && modprobe kvm >/dev/null 2>&1 || true
     if [ "$arch" = "amd64" ] || [ "$arch" = "i386" ]; then
-        apt-get install -y --no-install-recommends qemu-kvm qemu-system-x86 ovmf
-    elif [ "$arch" = "arm64" ]; then
-        apt-get install -y --no-install-recommends qemu-system-arm ovmf || true
+        command -v modprobe >/dev/null 2>&1 && \
+            (modprobe kvm_intel >/dev/null 2>&1 || modprobe kvm_amd >/dev/null 2>&1 || true)
     fi
-    modprobe kvm >/dev/null 2>&1 || true
-    modprobe kvm_intel >/dev/null 2>&1 || modprobe kvm_amd >/dev/null 2>&1 || true
+
+    mkdir -p /var/lib/rgnodes
+    printf 'qemu_arch=%s\n' "$arch" >/var/lib/rgnodes/qemu-status
+    if command -v qemu-img >/dev/null 2>&1; then
+        tmp_qcow="/var/lib/rgnodes/.qemu-selftest.qcow2"
+        if qemu-img create -f qcow2 "$tmp_qcow" 1M >/dev/null 2>&1; then
+            printf 'qemu-img=selftest-ok\n' >>/var/lib/rgnodes/qemu-status
+            rm -f "$tmp_qcow"
+        else
+            printf 'qemu-img=selftest-failed\n' >>/var/lib/rgnodes/qemu-status
+        fi
+    else
+        printf 'qemu-img=missing\n' >>/var/lib/rgnodes/qemu-status
+    fi
+    if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        printf 'kvm-device=available\n' >>/var/lib/rgnodes/qemu-status
+        if command -v kvm-ok >/dev/null 2>&1 && kvm-ok >/tmp/rgnodes-kvm-ok.log 2>&1; then
+            printf 'kvm-acceleration=available\n' >>/var/lib/rgnodes/qemu-status
+        else
+            printf 'kvm-acceleration=unverified\n' >>/var/lib/rgnodes/qemu-status
+        fi
+    else
+        printf 'kvm-device=unavailable\n' >>/var/lib/rgnodes/qemu-status
+        printf 'kvm-acceleration=unavailable\n' >>/var/lib/rgnodes/qemu-status
+    fi
+
+    # Enable libvirt only when the container really has /dev/kvm. Package
+    # installation itself must not make the VPS fail on providers without KVM.
+    if [ -e /dev/kvm ]; then
+        systemctl enable libvirtd.service >/dev/null 2>&1 || true
+        systemctl enable virtlogd.socket >/dev/null 2>&1 || true
+        systemctl enable virtlockd.socket >/dev/null 2>&1 || true
+        systemctl enable virtqemud.socket >/dev/null 2>&1 || true
+    fi
+
+    if [ -f /tmp/rgnodes-qemu-install.log ]; then
+        tail -n 12 /tmp/rgnodes-qemu-install.log >&2 || true
+    fi
+    set -e
+    return 0
 }
+
 
 install_wings() {
     [ "__INSTALL_WINGS__" = "1" ] || return 0
@@ -1754,7 +2543,7 @@ install_wings() {
     esac
     mkdir -p /etc/pterodactyl /var/lib/pterodactyl /var/log/pterodactyl
     url="https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${suffix}"
-    if curl -fsSL "$url" -o /usr/local/bin/wings; then
+    if curl -fsSL --retry 3 --retry-delay 2 "$url" -o /usr/local/bin/wings; then
         chmod 0755 /usr/local/bin/wings
         cat >/etc/systemd/system/wings.service <<'EOF'
 [Unit]
@@ -1805,7 +2594,8 @@ install_firstboot_unit() {
     cat >/usr/local/sbin/rgnodes-firstboot-verify <<'EOF'
 #!/bin/bash
 set -Eeuo pipefail
-READY=/var/lib/rgnodes/.system-ready
+mkdir -p /etc/rgnodes /var/lib/rgnodes
+READY=/etc/rgnodes/.system-ready
 rm -f "$READY"
 systemctl daemon-reload
 
@@ -1865,21 +2655,28 @@ if command -v wings >/dev/null 2>&1; then
     wings --version >/dev/null 2>&1 || true
 fi
 
-# KVM userspace may be installed even when the provider does not expose /dev/kvm.
-# Never fake KVM availability: expose the real capability in the marker only.
-if [ -e /dev/kvm ]; then
-    printf 'kvm=available\n' >/var/lib/rgnodes/kvm-status
-    if systemctl list-unit-files 'libvirtd.service' >/dev/null 2>&1; then
-        systemctl enable --now libvirtd.service || true
-    fi
-    if systemctl list-unit-files 'virtqemud.socket' >/dev/null 2>&1; then
-        systemctl enable --now virtqemud.socket || true
+# KVM is an optional acceleration capability. QEMU userspace is mandatory, but
+# absence of /dev/kvm must not brick a VPS on hosts that do not expose nesting.
+if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    printf 'kvm=device-present\n' >/var/lib/rgnodes/kvm-status
+    if command -v kvm-ok >/dev/null 2>&1 && kvm-ok >/dev/null 2>&1; then
+        printf 'acceleration=kvm\n' >>/var/lib/rgnodes/kvm-status
+    else
+        printf 'acceleration=unverified\n' >>/var/lib/rgnodes/kvm-status
     fi
 else
-    printf 'kvm=unavailable\n' >/var/lib/rgnodes/kvm-status
+    printf 'kvm=device-unavailable\n' >/var/lib/rgnodes/kvm-status
+    printf 'acceleration=tcg\n' >>/var/lib/rgnodes/kvm-status
 fi
-command -v qemu-system-x86_64 >/dev/null 2>&1 || command -v qemu-system-aarch64 >/dev/null 2>&1 || {
-    echo 'No QEMU system emulator was installed.' >&2
+qemu_ok=0
+for qemu_bin in qemu-system-x86_64 qemu-system-aarch64 qemu-system-ppc64 qemu-system-ppc qemu-system-s390x qemu-system-riscv64; do
+    if command -v "$qemu_bin" >/dev/null 2>&1 && "$qemu_bin" --version >/dev/null 2>&1; then
+        qemu_ok=1
+        break
+    fi
+done
+[ "$qemu_ok" -eq 1 ] || {
+    echo 'No working QEMU system emulator was installed.' >&2
     exit 27
 }
 
@@ -1892,7 +2689,7 @@ EOF
 Description=RGNODES Guest First Boot Verification
 Wants=docker.service ssh.service network-online.target
 After=docker.service ssh.service network-online.target
-ConditionPathExists=!/var/lib/rgnodes/.system-ready
+ConditionPathExists=!/etc/rgnodes/.system-ready
 
 [Service]
 Type=oneshot
@@ -1912,19 +2709,19 @@ if command -v apt-get >/dev/null 2>&1; then
         trap remove_policy EXIT
         log 'Installing base Linux/systemd/SSH dependencies'
         apt_install_base
-        install_docker_debian_ubuntu
-        install_node_pm2_yarn
-        install_web_and_database_stack
-        install_composer
-        install_kvm_stack
-        repair_ssh
-        install_wings
+        if ! install_docker_debian_ubuntu; then log 'Docker installation failed; systemd will still boot for recovery.'; fi
+        if ! install_node_pm2_yarn; then log 'Node.js/PM2/Yarn installation failed; continuing to systemd.'; fi
+        install_web_and_database_stack || log 'Web/database stack provisioning failed; continuing to systemd.'
+        if ! install_composer; then log 'Composer installation failed; continuing to systemd.'; fi
+        install_kvm_stack || log 'KVM/QEMU package installation was incomplete; continuing to systemd.'
+        if ! repair_ssh; then log 'SSH repair failed; continuing to systemd.'; fi
+        install_wings || log 'Wings installation failed; continuing to systemd.'
         install_firstboot_unit
         touch "$BOOTSTRAP_MARKER"
         remove_policy
         trap - EXIT
     else
-        repair_ssh
+        repair_ssh || log 'SSH repair failed on subsequent boot; preserving systemd startup.'
         install_firstboot_unit
     fi
 elif command -v apk >/dev/null 2>&1; then
@@ -1946,6 +2743,7 @@ fi
 # actual systemd boot and only then publish .system-ready. SYSTEMD_OFFLINE must
 # not leak into PID 1, otherwise later `systemctl` calls may operate offline.
 unset SYSTEMD_OFFLINE 2>/dev/null || true
+printf 'bootstrap=complete\n' >/var/lib/rgnodes/bootstrap-state 2>/dev/null || true
 if [ -x /sbin/init ]; then
     exec /sbin/init
 fi
@@ -1957,140 +2755,30 @@ if [ -x /usr/lib/systemd/systemd ]; then
 fi
 
 echo 'systemd binary was not installed correctly.' >&2
-exit 41
+printf 'bootstrap_failed=systemd-missing\n' > /var/lib/rgnodes/bootstrap-failure 2>/dev/null || true
+# Keep the guest alive for diagnosis/recovery instead of silently exiting.
+exec tail -f /dev/null
 """
 
 async def docker_run(*, image: str, hostname: str, ram: str, cpu: str, disk: str, container_name: str, location: str, persistent_key: str | None = None) -> tuple[str | None, str]:
-    # Build the command from the flags this particular Docker CLI actually
-    # advertises. This avoids noisy failed variants on older/lightweight Docker
-    # clients where --init and --pids-limit are unavailable.
-    features = await docker_run_features()
-    command = ["run", "--detach"]
-
-    if "--restart" in features:
-        command += ["--restart", "unless-stopped"]
-    if "--memory" in features:
-        command += ["--memory", ram]
-        try:
-            ram_bytes = parse_size_bytes(ram)
-            if "--memory-reservation" in features and MEMORY_RESERVATION_PERCENT:
-                reservation_bytes = max(6 * 1024**2, int(ram_bytes * MEMORY_RESERVATION_PERCENT / 100))
-                command += ["--memory-reservation", str(reservation_bytes)]
-            if DISABLE_CONTAINER_SWAP and "--memory-swap" in features:
-                command += ["--memory-swap", ram]
-            if DISABLE_CONTAINER_SWAP and "--memory-swappiness" in features:
-                command += ["--memory-swappiness", "0"]
-        except ValueError:
-            pass
-    if "--cpus" in features:
-        command += ["--cpus", cpu]
-    if "--hostname" in features:
-        command += ["--hostname", hostname]
-    if "--name" in features:
-        command += ["--name", container_name]
-    if "--label" in features:
-        command += ["--label", "com.rgnodes.managed=true", "--label", f"com.rgnodes.location={location}"]
-    if "--log-driver" in features and "--log-opt" in features:
-        command += ["--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3"]
-
-    if "--init" in features and not GUEST_SYSTEMD_ENABLED:
-        command.append("--init")
-    if "--pids-limit" in features and not GUEST_SYSTEMD_ENABLED:
-        command += ["--pids-limit", "1024"]
-
-    if GUEST_PERSISTENT_DATA and "--mount" in features:
-        volume_key = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(persistent_key or container_name)).strip("-._") or "vps"
-        volume_key = volume_key[:48]
-        persistent_mounts = {
-            "root": "/root",
-            "home": "/home",
-            "srv": "/srv",
-            "www": "/var/www",
-            "nginx": "/etc/nginx",
-            "ssh": "/etc/ssh",
-            "ptero": "/etc/pterodactyl",
-            "ptero-data": "/var/lib/pterodactyl",
-            "mysql": "/var/lib/mysql",
-            "redis": "/var/lib/redis",
-            "docker": "/var/lib/docker",
-            "containerd": "/var/lib/containerd",
-            "docker-etc": "/etc/docker",
-            "rgnodes": "/var/lib/rgnodes",
-        }
-        for suffix, target in persistent_mounts.items():
-            volume_name = f"rgnodes-{volume_key}-{suffix}"[:120]
-            command += ["--mount", f"type=volume,src={volume_name},dst={target}"]
-
-    guest_command = [image, "tail", "-f", "/dev/null"]
-    if GUEST_SYSTEMD_ENABLED:
-        if GUEST_SYSTEMD_PRIVILEGED:
-            if "--privileged" not in features:
-                return None, "This Docker daemon does not support --privileged; a systemd VPS cannot be created safely."
-            command.append("--privileged")
-        if GUEST_CGROUPNS_HOST and "--cgroupns" in features:
-            command += ["--cgroupns", "host"]
-        # KVM userspace can be installed in the guest, but actual acceleration
-        # exists only when the Docker host exposes /dev/kvm. Never claim KVM if
-        # the underlying provider does not expose it.
-        if GUEST_KVM_ENABLED and Path("/dev/kvm").exists() and "--device" in features:
-            command += ["--device", "/dev/kvm:/dev/kvm"]
-        if "--tmpfs" in features:
-            command += ["--tmpfs", "/run", "--tmpfs", "/run/lock"]
-        if "--stop-signal" in features:
-            command += ["--stop-signal", "SIGRTMIN+3"]
-        if "--security-opt" in features:
-            command += ["--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined"]
-        bootstrap = GUEST_BOOTSTRAP_SCRIPT.replace("__NESTED_DOCKER__", "1" if GUEST_NESTED_DOCKER else "0")
-        bootstrap = bootstrap.replace("__DOCKER_PACKAGE__", GUEST_DOCKER_PACKAGE)
-        bootstrap = bootstrap.replace("__KVM_ENABLED__", "1" if GUEST_KVM_ENABLED else "0")
-        bootstrap = bootstrap.replace("__INSTALL_WINGS__", "1" if GUEST_INSTALL_WINGS else "0")
-        bootstrap = bootstrap.replace("__WEB_STACK__", "1" if GUEST_INSTALL_WEB_STACK else "0")
-        bootstrap = bootstrap.replace("__DB_STACK__", "1" if GUEST_INSTALL_DATABASE_STACK else "0")
-        guest_command = [image, "/bin/bash", "-lc", bootstrap]
-
-    # Docker syntax requires IMAGE after all options. Never execute an
-    # options-only `docker run`, because Docker rejects that with:
-    # "docker run requires at least 1 argument".
-    image = str(image or "").strip()
-    if not image:
-        return None, "Docker image is empty; deployment configuration is invalid."
-
-    run_command = command + guest_command
-    if len(run_command) < 3 or not run_command[2]:
-        return None, "Docker run command construction failed before execution."
-
-    quota_requested = ENABLE_HARD_DISK_QUOTA and "--storage-opt" in features
-    quota_attempt = (
-        command + ["--storage-opt", f"size={disk}"] + guest_command
-        if quota_requested
-        else run_command
+    if active_backend() == "qemu":
+        return await qemu_create_vm(
+            os_type=qemu_os_from_image(image) or image, hostname=hostname, ram=ram, cpu=cpu,
+            disk=disk, name=container_name, persistent_key=persistent_key,
+        )
+    rc, out, err = await docker_cli(
+        "run", "--detach", "--name", container_name, "--hostname", hostname,
+        "--memory", ram, "--cpus", cpu, image, "tail", "-f", "/dev/null",
+        timeout=DOCKER_TIMEOUT, retries=0,
     )
-    attempts = [quota_attempt]
-    if quota_requested and QUOTA_FALLBACK:
-        attempts.append(run_command)
-
-    last_error = "Docker container creation failed."
-    for index, attempt in enumerate(attempts):
-        if len(attempt) < 3 or not attempt[2]:
-            last_error = "Docker run command was incomplete; refusing to execute it."
-            continue
-        attempt_timeout = GUEST_BOOTSTRAP_TIMEOUT if GUEST_SYSTEMD_ENABLED else 120
-        rc, out, err = await docker_cli(*attempt, timeout=attempt_timeout, retries=0)
-        if rc == 0:
-            container_id = out.decode("utf-8", "replace").strip().splitlines()[0] if out else ""
-            if container_id:
-                return container_id, ""
-            last_error = "Docker returned no container ID."
-            continue
-        last_error = safe_log(err.decode("utf-8", "replace").strip() or "unknown Docker error")
-        if index + 1 < len(attempts) and (quota_error(last_error) or feature_error(last_error)):
-            logger.warning("Docker hard-quota create failed; retrying without storage quota: %s", last_error)
-            continue
-        break
-    return None, last_error
+    if rc == 0:
+        return out.decode("utf-8", "replace").strip().splitlines()[0], ""
+    return None, safe_log(err.decode("utf-8", "replace").strip() or "Docker container creation failed.")
 
 
 async def docker_start(container: str) -> tuple[bool, str]:
+    if qemu_load_meta(container):
+        return await qemu_launch(container)
     rc, _, err = await docker_cli("start", container, timeout=60, retries=1)
     return rc == 0, safe_log(err.decode("utf-8", "replace").strip())
 
@@ -2110,77 +2798,174 @@ async def ensure_docker_running(container: str) -> tuple[bool, str]:
 
 
 async def guest_system_ready(container: str) -> tuple[bool, str]:
-    """Verify that a native-Docker guest booted systemd and all core tooling."""
+    """Verify a real QEMU guest booted with systemd; KVM is never used."""
+    if qemu_load_meta(container):
+        rc, out, err = await qemu_ssh(container, "pid1=$(cat /proc/1/comm 2>/dev/null || true); [ \"$pid1\" = systemd ] || { echo \"PID 1 is $pid1, not systemd\" >&2; exit 1; }; command -v systemctl >/dev/null 2>&1 || exit 2; command -v sshd >/dev/null 2>&1 || exit 3; sshd -t >/dev/null 2>&1 || exit 4; test -f /etc/rgnodes/.system-ready", timeout=30)
+        if rc == 0:
+            return True, "Real QEMU VPS is ready (systemd + SSH, accelerator=TCG, KVM disabled)."
+        return False, err.decode("utf-8", "replace").strip() or out.decode("utf-8", "replace").strip() or "QEMU guest is still booting."
     if not GUEST_SYSTEMD_ENABLED:
         return True, "systemd guest mode is disabled."
     nested = "1" if GUEST_NESTED_DOCKER else "0"
     kvm = "1" if GUEST_KVM_ENABLED else "0"
     wings = "1" if GUEST_INSTALL_WINGS else "0"
     script = f"""
-set -e
+set -u
+fail() {{ echo "$*" >&2; exit 1; }}
 pid1="$(cat /proc/1/comm 2>/dev/null || true)"
-[ "$pid1" = "systemd" ] || exit 11
-[ -f /var/lib/rgnodes/.system-ready ] || exit 12
-command -v systemctl >/dev/null 2>&1 || exit 13
-command -v curl >/dev/null 2>&1 || exit 14
-command -v sshd >/dev/null 2>&1 || exit 15
-sshd -t >/dev/null 2>&1 || exit 16
-command -v node >/dev/null 2>&1 || exit 21
-command -v npm >/dev/null 2>&1 || exit 22
-command -v yarn >/dev/null 2>&1 || exit 23
-command -v pm2 >/dev/null 2>&1 || exit 24
-node -e 'process.exit(process.versions.node.startsWith("20.") ? 0 : 25)'
+[ "$pid1" = "systemd" ] || fail "PID 1 is '$pid1', not systemd"
+command -v systemctl >/dev/null 2>&1 || fail "systemctl is missing"
+command -v curl >/dev/null 2>&1 || fail "curl is missing"
+command -v sshd >/dev/null 2>&1 || fail "sshd is missing"
+sshd -t >/dev/null 2>&1 || fail "sshd configuration validation failed"
+command -v node >/dev/null 2>&1 || fail "node is missing"
+command -v npm >/dev/null 2>&1 || fail "npm is missing"
+command -v yarn >/dev/null 2>&1 || fail "yarn is missing"
+command -v pm2 >/dev/null 2>&1 || fail "pm2 is missing"
+node -e 'process.exit(process.versions.node.startsWith("20.") ? 0 : 1)' || fail "Node.js 20 is not active"
 if [ "{nested}" = "1" ]; then
-    command -v docker >/dev/null 2>&1 || exit 17
-    docker info >/dev/null 2>&1 || exit 19
-    docker compose version >/dev/null 2>&1 || exit 20
-    systemctl is-active --quiet docker.service || exit 18
+    command -v docker >/dev/null 2>&1 || fail "Docker CLI is missing"
+    command -v containerd >/dev/null 2>&1 || fail "containerd is missing"
+    docker info >/dev/null 2>&1 || fail "Docker daemon is not reachable"
+    docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is unavailable"
+    systemctl is-active --quiet docker.service || fail "docker.service is not active"
 fi
-command -v qemu-img >/dev/null 2>&1 || exit 28
-if command -v qemu-system-x86_64 >/dev/null 2>&1; then
-    qemu-system-x86_64 --version >/dev/null 2>&1 || exit 29
-elif command -v qemu-system-aarch64 >/dev/null 2>&1; then
-    qemu-system-aarch64 --version >/dev/null 2>&1 || exit 29
-else
-    exit 30
-fi
+command -v qemu-img >/dev/null 2>&1 || fail "qemu-img is missing"
+qemu-img --version >/dev/null 2>&1 || fail "qemu-img is broken"
+qemu_bin=""
+for candidate in qemu-system-x86_64 qemu-system-aarch64 qemu-system-ppc64 qemu-system-s390x qemu-system-riscv64; do
+    if command -v "$candidate" >/dev/null 2>&1; then qemu_bin="$candidate"; break; fi
+done
+[ -n "$qemu_bin" ] || fail "No QEMU system emulator is installed"
+"$qemu_bin" --version >/dev/null 2>&1 || fail "QEMU system emulator is broken"
 if [ "{kvm}" = "1" ]; then
-    if [ -e /dev/kvm ]; then
-        printf 'kvm=available\n' >/var/lib/rgnodes/kvm-status
+    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        if command -v kvm-ok >/dev/null 2>&1 && kvm-ok >/dev/null 2>&1; then
+            printf 'kvm=available\n' >/var/lib/rgnodes/kvm-status
+            printf 'acceleration=kvm\n' >>/var/lib/rgnodes/kvm-status
+        else
+            printf 'kvm=present-but-unverified\n' >/var/lib/rgnodes/kvm-status
+        fi
     else
         printf 'kvm=unavailable\n' >/var/lib/rgnodes/kvm-status
     fi
 fi
 if [ "{wings}" = "1" ]; then
-    command -v wings >/dev/null 2>&1 || exit 31
-    wings --version >/dev/null 2>&1 || true
+    command -v wings >/dev/null 2>&1 || fail "Wings binary is missing"
 fi
+[ -f /etc/rgnodes/.system-ready ] || fail "first-boot verification has not completed"
 """
-    rc, _, err = await docker_exec_shell(container, script, timeout=40)
+    rc, _, err = await docker_exec_shell(container, script, timeout=25)
     if rc == 0:
         return True, "systemd, Docker, Compose, SSH, Node.js, npm, Yarn, PM2, QEMU and guest Pterodactyl prerequisites are ready."
     detail = err.decode("utf-8", "replace").strip()
     return False, detail or f"guest readiness check exited with code {rc}"
 
 
+async def _repair_guest_services(container: str) -> str:
+    """Perform bounded in-guest service repair while systemd is PID 1."""
+    script = r'''set +e
+unset SYSTEMD_OFFLINE
+mkdir -p /run/sshd /var/run/sshd
+sshd -t >/dev/null 2>&1 || true
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl reset-failed docker.service ssh.service sshd.service >/dev/null 2>&1 || true
+systemctl start docker.service >/dev/null 2>&1 || true
+systemctl start ssh.service >/dev/null 2>&1 || systemctl start sshd.service >/dev/null 2>&1 || true
+if command -v docker >/dev/null 2>&1 && ! docker info >/dev/null 2>&1 && command -v dockerd >/dev/null 2>&1; then
+  if ! pgrep -x dockerd >/dev/null 2>&1; then
+    nohup dockerd --host=unix:///var/run/docker.sock >/var/log/rgnodes-dockerd-fallback.log 2>&1 </dev/null &
+  fi
+fi
+sleep 2
+if docker info >/dev/null 2>&1; then echo docker=ready; else echo docker=not-ready; fi
+if systemctl is-active --quiet ssh.service || systemctl is-active --quiet sshd.service; then echo ssh=ready; else echo ssh=not-ready; fi
+if docker info >/dev/null 2>&1 && { systemctl is-active --quiet ssh.service || systemctl is-active --quiet sshd.service; }; then
+  if [ -x /usr/local/sbin/rgnodes-firstboot-verify ]; then
+    timeout 75 /usr/local/sbin/rgnodes-firstboot-verify >/var/log/rgnodes-firstboot-retry.log 2>&1 || true
+  fi
+fi
+'''
+    rc, out, err = await docker_exec_shell(container, script, timeout=25)
+    text = (out + err).decode("utf-8", "replace").strip()
+    return text[-1200:] if text else f"guest service repair exit={rc}"
+
+
 async def wait_for_guest_ready(
-    container: str, timeout: float = GUEST_BOOTSTRAP_TIMEOUT
+    container: str,
+    timeout: float = GUEST_BOOTSTRAP_TIMEOUT,
+    progress: OperationCallback | None = None,
+    *,
+    os_type: str = "unknown",
+    location: str = "SG",
+    ram: str = DEFAULT_RAM,
+    cpu: str = DEFAULT_CPU,
+    disk: str = DEFAULT_DISK,
+    name: str = "vps",
 ) -> tuple[bool, str]:
-    """Wait for first-boot provisioning without blocking forever."""
-    deadline = asyncio.get_running_loop().time() + max(30.0, float(timeout))
+    """Wait for provisioning with bounded retries; never leave Discord stuck at 60%."""
+    if qemu_load_meta(container):
+        return await _wait_qemu_ready(container)
+    budget = min(max(45.0, float(timeout)), 300.0)
+    deadline = asyncio.get_running_loop().time() + budget
     last = "guest bootstrap is still running"
+    attempt = 0
     while asyncio.get_running_loop().time() < deadline:
-        if await docker_state(container) != "running":
-            return False, "The guest container stopped during system bootstrap."
+        state = await docker_state(container)
+        if state != "running":
+            rc_i, out_i, _ = await docker_cli(
+                "inspect", "--format", "{{.State.Status}}|{{.State.ExitCode}}|{{.State.OOMKilled}}",
+                container, timeout=15, retries=0,
+            )
+            state_diag = out_i.decode("utf-8", "replace").strip() if rc_i == 0 else state
+            rc_l, out_l, err_l = await docker_cli(
+                "logs", "--tail", "120", container, timeout=20, retries=0,
+            )
+            logs = (out_l or err_l).decode("utf-8", "replace").strip() if rc_l == 0 else ""
+            detail = "Guest stopped during bootstrap. The container exited before system services became ready."
+            if state_diag:
+                detail += f" Diagnostic: {state_diag}"
+            if logs:
+                detail += "\nLast guest logs:\n" + safe_log(logs, 3000)
+            return False, detail
         ok, detail = await guest_system_ready(container)
         if ok:
             return True, detail
         last = detail
+        attempt += 1
+        if progress and attempt % 3 == 0:
+            stage_title = {
+                3: "Starting Linux services",
+                6: "Checking Docker service",
+                9: "Checking SSH service",
+                12: "Checking Node.js and PM2",
+                15: "Checking QEMU and KVM",
+            }.get(min(15, attempt), "Finalizing Linux services")
+            await update_progress(
+                progress, 6, stage_title, os_type=os_type, location=location,
+                ram=ram, cpu=cpu, disk=disk, name=name
+            )
+        if attempt in {2, 6, 12}:
+            repair = await _repair_guest_services(container)
+            logger.warning("Guest service repair for %s: %s", clean(container, 32), safe_log(repair))
         await asyncio.sleep(2)
-    return False, f"Guest system bootstrap timed out: {last}"
+    diag_script = (
+        "set +e; "
+        "echo '--- systemd ---'; systemctl is-system-running 2>&1; "
+        "echo '--- docker ---'; systemctl status docker.service --no-pager -l 2>&1 | tail -n 35; "
+        "echo '--- ssh ---'; systemctl status ssh.service --no-pager -l 2>&1 | tail -n 20; "
+        "echo '--- recent journal ---'; journalctl -u docker.service -u rgnodes-firstboot.service -n 45 --no-pager 2>&1 | tail -n 70"
+    )
+    rc, out, err = await docker_exec_shell(container, diag_script, timeout=30)
+    diag = (out + err).decode("utf-8", "replace").strip()
+    if rc != 0 and not diag:
+        diag = f"diagnostic command failed with exit={rc}"
+    return False, f"Guest readiness timed out after {int(budget)}s. Last check: {last}.\n{safe_log(diag, 3500)}"
 
 
 async def docker_stop(container: str) -> bool:
+    if qemu_load_meta(container):
+        return await qemu_stop_vm(container)
     rc, _, _ = await docker_cli("stop", "--time", "20", container, timeout=40, retries=1)
     if rc == 0:
         return True
@@ -2189,11 +2974,15 @@ async def docker_stop(container: str) -> bool:
 
 
 async def docker_restart(container: str) -> tuple[bool, str]:
+    if qemu_load_meta(container):
+        return await qemu_restart_vm(container)
     rc, _, err = await docker_cli("restart", "--time", "20", container, timeout=60, retries=1)
     return rc == 0, safe_log(err.decode("utf-8", "replace").strip())
 
 
 async def docker_remove(container: str) -> bool:
+    if qemu_load_meta(container):
+        return await qemu_remove_vm(container)
     rc, _, _ = await docker_cli("rm", "--force", container, timeout=60, retries=1)
     if rc == 0:
         return True
@@ -2206,17 +2995,51 @@ async def docker_exec(
     timeout: float = 120,
     retries: int = 1,
 ) -> tuple[int, bytes, bytes]:
+    if qemu_load_meta(container):
+        text = " ".join(shlex.quote(str(part)) for part in command)
+        return await qemu_ssh(container, text, timeout=timeout)
     return await docker_cli("exec", container, *command, timeout=timeout, retries=max(0, int(retries)))
 
 
 async def docker_exec_shell(container: str, script: str, timeout: float = ACCESS_TIMEOUT) -> tuple[int, bytes, bytes]:
+    if qemu_load_meta(container):
+        return await qemu_ssh(container, script, timeout=timeout)
     # Shell scripts may have side effects. Never let the generic transient-error
     # retry mechanism execute the same script a second time.
     return await docker_exec(container, "sh", "-c", script, timeout=timeout, retries=0)
 
 
 async def docker_stats(container: str) -> dict[str, str]:
-    """Live CPU/network plus a cache-adjusted working-set estimate. Never hides a live 0.00%% CPU reading."""
+    """Live resource data for either Docker legacy records or real QEMU VMs."""
+    if qemu_load_meta(container):
+        script = (
+            "free -b 2>/dev/null | awk '/Mem:/ {print $3, $2}'; "
+            "awk 'NR>2 {rx+=$2; tx+=$10} END {printf \"%d %d\\n\", rx+0, tx+0}' "
+            "/proc/net/dev 2>/dev/null || true"
+        )
+        rc, out, _ = await qemu_ssh(container, script, timeout=15)
+        parts = out.decode("utf-8", "replace").splitlines()
+        used = total = 0
+        rx = tx = 0
+        if parts:
+            try:
+                a = parts[0].split()
+                if len(a) >= 2:
+                    used, total = int(a[0]), int(a[1])
+            except ValueError:
+                pass
+        if len(parts) > 1:
+            try:
+                a = parts[1].split()
+                if len(a) >= 2:
+                    rx, tx = int(a[0]), int(a[1])
+            except ValueError:
+                pass
+        return {
+            "cpu": "N/A (TCG)",
+            "memory": f"{format_bytes(used)} / {format_bytes(total)}" if total else "N/A",
+            "network": f"{format_bytes(rx)} / {format_bytes(tx)}",
+        }
     memory_text = "N/A"
     cgroup_script = r'''set -u
 if [ -r /sys/fs/cgroup/memory.current ]; then
@@ -2278,6 +3101,18 @@ exit 1
 
 
 async def docker_uptime(container: str) -> str:
+    if qemu_load_meta(container):
+        rc, out, _ = await qemu_ssh(container, "awk '{print int($1)}' /proc/uptime", timeout=10)
+        if rc == 0:
+            try:
+                seconds = max(0, int(out.decode("utf-8", "replace").strip()))
+                days, rem = divmod(seconds, 86400)
+                hours, rem = divmod(rem, 3600)
+                minutes, _ = divmod(rem, 60)
+                return f"{days}d {hours}h {minutes}m"
+            except ValueError:
+                pass
+        return "N/A"
     rc, out, _ = await docker_cli("inspect", "-f", "{{.State.StartedAt}}", container, timeout=20, retries=1)
     if rc != 0:
         return "N/A"
@@ -2294,6 +3129,15 @@ async def docker_uptime(container: str) -> str:
 
 
 async def docker_disk_usage(container: str) -> dict[str, str]:
+    if qemu_load_meta(container):
+        rc, out, _ = await qemu_ssh(container, "df -B1 / 2>/dev/null | awk 'NR==2 {print $2, $3, $5}'", timeout=15)
+        parts = out.decode("utf-8", "replace").strip().split()
+        if rc == 0 and len(parts) >= 3:
+            try:
+                return {"used": format_bytes(int(parts[1])), "total": format_bytes(int(parts[0])), "percent": parts[2]}
+            except ValueError:
+                pass
+        return {"used": "N/A", "total": "N/A", "percent": "N/A"}
     """Return container disk usage while always using the VPS allocation as the dashboard limit.
 
     Hard disk quotas are optional in RGNODES, so Docker may not expose a real per-container
@@ -2335,6 +3179,15 @@ async def docker_disk_usage(container: str) -> dict[str, str]:
 
 async def docker_logs(container: str, lines: int = 50) -> str:
     safe_lines = max(1, min(int(lines), 200))
+    if qemu_load_meta(container):
+        meta = qemu_load_meta(container) or {}
+        log_path = Path(str(meta.get("log_path", "")))
+        if not log_path.exists():
+            return "No QEMU serial log is available yet."
+        try:
+            return "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-safe_lines:])[-3800:] or "No recent QEMU serial logs."
+        except OSError as exc:
+            return f"Unable to read QEMU serial log: {safe_log(exc)}"
     rc, out, err = await docker_cli("logs", "--tail", str(safe_lines), container, timeout=30, retries=1)
     if rc != 0:
         return "Unable to fetch container logs."
@@ -2681,7 +3534,7 @@ rm -f /var/lib/rgnodes/sshx/sshx.pid /var/lib/rgnodes/sshx/sshx.url
 
 EMBED_COLOR = discord.Color.from_rgb(43, 45, 49)
 FOOTER = "⚡ RGNODES™ • VPS Management"
-RGNODES_BUILD = "2026.09.08-stable-deepfix-sshx-async"
+RGNODES_BUILD = "2026.09.11-real-qemu-tcg-final-audit"
 
 
 def make_embed(title: str, description: str | None = None) -> discord.Embed:
@@ -2885,6 +3738,32 @@ def ipv4_dm_embed(vps: sqlite3.Row, network: dict[str, str]) -> discord.Embed:
     return embed
 
 
+def vps_ready_dm_embed(vps: sqlite3.Row, network: dict[str, str], console_url: str | None) -> discord.Embed:
+    embed = make_embed(
+        "✅ RGNODES™ • VPS Ready",
+        "Your VPS has been created successfully and is online.",
+    )
+    embed.add_field(name="🖥️ VPS", value=f"`{clean(vps['container_name'])}` • ID `{vps['id']}`", inline=False)
+    embed.add_field(name="💿 OS", value=os_label(vps['os_type']), inline=True)
+    embed.add_field(name="🌍 Location", value=location_label(vps['location']), inline=True)
+    embed.add_field(name="⚙️ Resources", value=f"RAM `{clean(vps['ram'])}` • CPU `{clean(vps['cpu'])}` • Disk `{clean(vps['disk'])}`", inline=False)
+    if console_url:
+        embed.add_field(name="🌐 Console", value="Your private SSHx console is ready. Use **Open Console** below.", inline=False)
+    else:
+        embed.add_field(name="🌐 Console", value="SSHx is temporarily unavailable. Use the Console action from your VPS dashboard to retry.", inline=False)
+    ip = network.get("ip")
+    if valid_public_ipv4(ip):
+        embed.add_field(name="🌐 Verified IPv4", value=f"`{clean(ip, 64)}`", inline=False)
+    embed.add_field(name="🔒 Security", value="Keep console links and private network details secret.", inline=False)
+    return embed
+
+
+async def send_vps_ready_dm(user: discord.User | discord.Member, vps: sqlite3.Row, network: dict[str, str]) -> bool:
+    console_url = normalize_sshx_url(vps["sshx_url"]) if vps["sshx_url"] else None
+    view = sshx_view(console_url) if console_url else None
+    return await safe_dm(user, vps_ready_dm_embed(vps, network, console_url), view)
+
+
 async def send_private_ipv4(user: discord.User | discord.Member, vps: sqlite3.Row) -> bool:
     network = await detect_public_network(force=True)
     ip = network.get("ip")
@@ -2907,15 +3786,21 @@ async def host_uptime() -> str:
 
 
 async def backend_state(vps: sqlite3.Row) -> str | None:
-    if str(vps["backend"] or "docker").lower() == "pterodactyl":
+    backend = str(vps["backend"] or "qemu").lower()
+    if backend == "pterodactyl":
         return await ptero_status(vps)
-    return await docker_state(vps["container_id"])
+    if backend == "qemu":
+        return await qemu_state(str(vps["container_id"]))
+    return await docker_state(str(vps["container_id"]))
 
 
 async def backend_stats(vps: sqlite3.Row) -> dict[str, str]:
-    if str(vps["backend"] or "docker").lower() == "pterodactyl":
+    backend = str(vps["backend"] or "qemu").lower()
+    if backend == "pterodactyl":
         return await ptero_utilization(vps)
-    return await docker_stats(vps["container_id"])
+    if backend == "qemu":
+        return await docker_stats(str(vps["container_id"]))
+    return await docker_stats(str(vps["container_id"]))
 
 
 def format_duration_ms(ms: int | float | str | None) -> str:
@@ -2984,7 +3869,7 @@ async def refresh_vps_record_state(vps: sqlite3.Row) -> sqlite3.Row:
             db_update_vps(
                 vps["container_id"],
                 status="stopped",
-                sshx_url=None if backend == "docker" else vps["sshx_url"],
+                sshx_url=None if backend in {"docker", "qemu"} else vps["sshx_url"],
                 sshx_pid=None,
             )
     except Exception as exc:
@@ -3018,7 +3903,7 @@ def dashboard_embed(vps: sqlite3.Row, stats: dict[str, str], uptime: str, disk: 
         inline=True,
     )
 
-    runtime_label = "Docker: **:whale:** Ready" if backend == "docker" else "Pterodactyl: Ready"
+    runtime_label = "QEMU TCG: **✅ Ready**" if backend == "qemu" else ("Docker: **:whale:** Ready" if backend == "docker" else "Pterodactyl: Ready")
     embed.add_field(
         name="⚙️ Configuration",
         value=(
@@ -3299,17 +4184,22 @@ def vps_lock(vps_id: int) -> asyncio.Lock:
 
 
 async def next_container_name() -> str:
-    rc, out, _ = await docker_cli("ps", "--all", "--format", "{{.Names}}", timeout=20, retries=1)
     used: set[int] = set()
-    if rc == 0:
-        for raw in out.decode("utf-8", "replace").splitlines():
-            m = re.fullmatch(r"rgnodes-(\d+)", raw.strip(), flags=re.I)
-            if m:
-                used.add(int(m.group(1)))
     for row in db_get_all_vps():
         m = re.fullmatch(r"rgnodes-(\d+)", str(row["container_name"]), flags=re.I)
         if m:
             used.add(int(m.group(1)))
+    with contextlib.suppress(OSError):
+        QEMU_VM_ROOT.mkdir(parents=True, exist_ok=True)
+        for child in QEMU_VM_ROOT.iterdir():
+            if not child.is_dir() or child.name == "_images":
+                continue
+            meta = qemu_load_meta(child.name)
+            if not meta:
+                continue
+            m = re.fullmatch(r"rgnodes-(\d+)", str(meta.get("name", "")), flags=re.I)
+            if m:
+                used.add(int(m.group(1)))
     n = 1
     while n in used:
         n += 1
@@ -3352,169 +4242,129 @@ async def create_vps(
         ram, cpu, disk = validate_resources(ram, cpu, disk)
     except ValueError as exc:
         return False, str(exc), None
-    # New VPS creation is always local. Pterodactyl is guest software, not the
-    # creation backend. Keep legacy Pterodactyl records controllable elsewhere,
-    # but never create a new VPS through the Pterodactyl API.
-    backend = "docker"
-    if backend == "docker":
-        capacity_error = resource_capacity_error(ram, cpu, disk)
-        if capacity_error:
-            return False, capacity_error, None
+    backend = "qemu"
     if db_is_banned(user.id):
         return False, "You are not allowed to create VPS instances.", None
-
-    # Public IPv4 detection is intentionally deferred until after the VPS is
-    # durable. External IP providers can be slow/unreachable and must never
-    # delay or abort the actual provisioning transaction.
-    verified_ipv4 = None
+    capacity_error = resource_capacity_error(ram, cpu, disk)
+    if capacity_error:
+        return False, capacity_error, None
 
     async with CREATE_LOCK:
         is_admin_user = ADMIN_BYPASS_LIMITS and ADMIN_ID > 0 and int(user.id) == int(ADMIN_ID)
         slot_limit = db_effective_slots(user.id)
         slot_used = db_vps_count(user.id)
         if not is_admin_user and slot_used >= slot_limit:
-            return False, f"SLOTS FULL — you are using `{slot_used}/{slot_limit}` VPS slots. Additional slots will be available soon. Ask an administrator to add slots.", None
+            return False, f"SLOTS FULL — you are using `{slot_used}/{slot_limit}` VPS slots.", None
 
         async with CAPACITY_LOCK:
-            if backend == "docker":
-                live_ok, live_running = await docker_running_count()
-                if not live_ok:
-                    live_running = db_running_count()
-            else:
-                live_running = sum(
-                    1 for row in db_get_all_vps()
-                    if str(row["backend"] or "docker").lower() == "pterodactyl"
-                    and str(row["status"]).lower() == "running"
-                    and not row["suspended"]
-                )
+            live_ok, live_running = await docker_running_count()
+            if not live_ok:
+                live_running = db_running_count()
             if not is_admin_user and live_running >= TOTAL_RUNNING_LIMIT:
                 return False, f"Global running VPS limit reached ({TOTAL_RUNNING_LIMIT}).", None
 
         name = await next_container_name()
         hostname = f"{VPS_HOSTNAME_PREFIX}-{user.id}"[:63]
-        image = OS_CONFIG[normalized_os]["image"]
         resource_id: str | None = None
-        ptero_server_id: int | None = None
-        ptero_identifier: str | None = None
+
+        async def qemu_progress(stage: int, title: str) -> None:
+            await update_progress(
+                progress, stage, title, os_type=normalized_os, location=normalized_location,
+                ram=ram, cpu=cpu, disk=disk, name=name,
+            )
 
         try:
-            await update_progress(progress, 1, f"Validating {backend} backend", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+            await qemu_progress(1, "Checking QEMU host tools")
 
-            # Pterodactyl API creation is intentionally disabled for new VPSes.
-            await update_progress(progress, 2, "Preparing Docker", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
-            ok, docker_error = await docker_info()
-            if not ok:
-                logger.warning("Docker preflight failed: %s", safe_log(docker_error))
-                return False, (
-                    "Docker is required to create this VPS but the daemon is not reachable. "
-                    f"{safe_log(docker_error)}"
-                ), None
-            await update_progress(progress, 3, "Pulling official image", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
-            pulled, pull_error = await docker_pull(image)
-            if not pulled:
-                return False, f"Could not pull `{image}`. {pull_error}", None
-            await update_progress(progress, 4, "Creating isolated VPS", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
-            resource_id, create_error = await docker_run(image=image, hostname=hostname, ram=ram, cpu=cpu, disk=disk, container_name=name, location=normalized_location)
+            async def host_progress(title: str) -> None:
+                await qemu_progress(2, title)
+
+            host_ok, host_detail = await asyncio.wait_for(
+                qemu_host_prepare(host_progress), timeout=max(60, QEMU_HOST_PREP_TIMEOUT)
+            )
+            if not host_ok:
+                return False, f"QEMU host is not ready: {host_detail}", None
+
+            await qemu_progress(2, "Preparing QEMU TCG")
+            await qemu_progress(3, "Preparing official VM image")
+            base_ok, base_detail, _ = await qemu_download_base(normalized_os)
+            if not base_ok:
+                return False, f"Could not prepare `{os_label(normalized_os)}` VM image: {base_detail}", None
+
+            await qemu_progress(4, "Creating real QEMU VPS")
+            resource_id, create_error = await qemu_create_vm(
+                os_type=normalized_os, hostname=hostname, ram=ram, cpu=cpu, disk=disk,
+                name=name, persistent_key=name,
+            )
             if not resource_id:
-                return False, f"Docker container creation failed: {create_error}", None
-            await update_progress(progress, 5, "Starting VPS", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
-            # `docker run --detach` already starts the container. Only call
-            # `docker start` when the runtime reports that it is not running;
-            # this avoids the common "container is already running" failure.
-            running, start_error = await ensure_docker_running(resource_id)
-            if not running:
-                raise RuntimeError(start_error or "Container could not be started.")
-            ready = False
-            for _ in range(20):
-                if await docker_state(resource_id) == "running":
-                    ready = True
-                    break
-                await asyncio.sleep(0.5)
-            if not ready:
-                raise RuntimeError("Container started but did not reach running state.")
-            if GUEST_SYSTEMD_ENABLED:
-                await update_progress(progress, 6, "Initializing Linux services", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
-                guest_ready, guest_error = await wait_for_guest_ready(resource_id)
-                if not guest_ready:
-                    raise RuntimeError(guest_error or "Guest Linux services failed to initialize.")
-            # Persist the VPS immediately after Docker reports it as running.
-            # Console access is strictly optional and must NEVER be allowed to
-            # turn a successful VPS creation into a failure/rollback.
-            await update_progress(progress, 7, "Saving VPS record", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+                return False, f"Real QEMU VM creation failed: {create_error}", None
+
+            await qemu_progress(5, "Booting real Linux VM")
+            if await qemu_state(resource_id) != "running":
+                raise RuntimeError("QEMU VM was created but did not remain running.")
+
+            await qemu_progress(6, "Waiting for systemd and SSH")
+            guest_ready, guest_error = await _wait_qemu_ready(resource_id)
+            if not guest_ready:
+                meta = qemu_load_meta(resource_id) or {}
+                diag = ""
+                log_path = Path(str(meta.get("log_path", "")))
+                if log_path.exists():
+                    with contextlib.suppress(OSError):
+                        diag = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-100:])
+                raise RuntimeError((guest_error or "QEMU guest readiness failed.") + (f"\nSerial log:\n{safe_log(diag, 4000)}" if diag else ""))
+
+            await qemu_progress(7, "Saving VPS record")
             db_upsert_user(user.id, str(user))
             db_insert_vps(
-                user_id=user.id,
-                container_id=resource_id,
-                container_name=name,
-                os_type=normalized_os,
-                location=normalized_location,
-                hostname=hostname,
-                ram=ram,
-                cpu=cpu,
-                disk=disk,
-                sshx_url=None,
-                sshx_pid=None,
-                public_ipv4=verified_ipv4 if valid_public_ipv4(verified_ipv4) else None,
-                ipv4_verified_at=utc_now() if valid_public_ipv4(verified_ipv4) else None,
-                backend="docker",
-                ptero_server_id=None,
-                ptero_identifier=None,
-                ptero_user_id=None,
+                user_id=user.id, container_id=resource_id, container_name=name,
+                os_type=normalized_os, location=normalized_location, hostname=hostname,
+                ram=ram, cpu=cpu, disk=disk, sshx_url=None, sshx_pid=None,
+                public_ipv4=None, ipv4_verified_at=None, backend="qemu",
+                ptero_server_id=None, ptero_identifier=None, ptero_user_id=None,
             )
             row = db_find_vps(user.id, resource_id)
             if not row:
-                # At this point the container exists but there is no durable
-                # record, so cleanup is appropriate and the outer handler will
-                # remove the orphan safely.
                 raise RuntimeError("VPS was created but could not be saved to SQLite.")
 
-            # Best-effort background-style console setup. Every exception is
-            # contained here; SSHx availability is NOT part of VPS readiness.
             console = None
-            await update_progress(progress, 8, "Preparing optional console access", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+            await qemu_progress(8, "Preparing optional console access")
             try:
-                console = await asyncio.wait_for(install_and_start_sshx(resource_id), timeout=max(20, SSHX_TOTAL_TIMEOUT + 5))
+                console = await asyncio.wait_for(
+                    install_and_start_sshx(resource_id), timeout=max(20, SSHX_TOTAL_TIMEOUT + 5)
+                )
             except Exception as exc:
                 logger.warning("Optional SSHx setup failed for %s; VPS remains healthy: %s", clean(resource_id, 32), safe_log(exc))
-                console = None
 
             if console and console.get("pid"):
-                db_update_vps(resource_id, sshx_url=normalize_sshx_url(console.get("url")) if console.get("url") else None, sshx_pid=console.get("pid"))
+                db_update_vps(
+                    resource_id,
+                    sshx_url=normalize_sshx_url(console.get("url")) if console.get("url") else None,
+                    sshx_pid=console.get("pid"),
+                )
 
-            # Port supervision is useful but is also non-fatal during first boot.
-            try:
+            with contextlib.suppress(Exception):
                 await supervise_vps_ports(db_get_vps(row["id"]) or row)
-            except Exception as exc:
-                logger.warning("Initial VPS port supervision failed for %s: %s", clean(resource_id, 32), safe_log(exc))
 
             final_row = db_get_vps(row["id"]) or row
-            await update_progress(progress, 10, "VPS Ready", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
-            return True, (
-                "Docker VPS created successfully."
-                + (" Console is ready." if console else " Console is temporarily unavailable; the VPS is online. Use Console/sshx to retry.")
-            ), final_row
+            await qemu_progress(10, "VPS Ready")
+            return True, "Real QEMU VPS created successfully (TCG, no KVM).", final_row
 
         except asyncio.CancelledError:
-            logger.error("VPS creation cancelled for user %s", user.id)
-            if resource_id and backend == "docker":
+            logger.warning("QEMU VPS creation cancelled for user %s", user.id)
+            if resource_id:
                 with contextlib.suppress(Exception):
                     await stop_sshx(resource_id)
                 with contextlib.suppress(Exception):
-                    await docker_remove(resource_id)
-            elif ptero_server_id:
-                with contextlib.suppress(Exception):
-                    await ptero_delete_server(ptero_server_id, force=True)
+                    await qemu_remove_vm(resource_id)
             raise
         except Exception as exc:
-            logger.error("VPS creation failed: %s", safe_log(exc))
-            if resource_id and backend == "docker":
+            logger.error("QEMU VPS creation failed: %s", safe_log(exc))
+            if resource_id:
                 with contextlib.suppress(Exception):
                     await stop_sshx(resource_id)
                 with contextlib.suppress(Exception):
-                    await docker_remove(resource_id)
-            elif ptero_server_id:
-                with contextlib.suppress(Exception):
-                    await ptero_delete_server(ptero_server_id, force=True)
+                    await qemu_remove_vm(resource_id)
             return False, f"VPS creation failed safely: {safe_log(exc)}", None
 
 
@@ -3535,95 +4385,72 @@ async def ptero_suspend_server(server_id: int, suspended: bool) -> tuple[bool, s
 
 
 async def docker_reinstall_vps(vps: sqlite3.Row, os_type: str) -> tuple[bool, str]:
-    """Replace a Docker VPS container with a clean container using the selected OS.
-
-    The VPS database row, ID, allocation and user ownership are preserved. The
-    container itself is recreated from the selected image.
-    """
+    """Reinstall a real QEMU VPS while preserving its database identity."""
     normalized = normalize_os(os_type)
     if not normalized:
         return False, "Unsupported operating system."
-    old_container = str(vps["container_id"])
-    image = str(OS_CONFIG[normalized]["image"])
-    new_container = f"{str(vps['container_name'])[:48]}-reinstall-{int(time.time()) % 100000}"[:63]
-    old_exists = await docker_exists(old_container)
-    new_exists = await docker_exists(new_container)
-    if new_exists:
-        with contextlib.suppress(Exception):
-            await docker_remove(new_container)
-    if old_exists:
-        await stop_sshx(old_container)
+    old_vm = str(vps["container_id"])
+    new_name = f"{str(vps['container_name'])[:42]}-reinstall-{int(time.time()) % 100000}"[:63]
+    new_vm: str | None = None
+    try:
+        await stop_sshx(old_vm)
         for p_row in db_list_ports(vps["id"]):
             await stop_port_forward(p_row)
-        if not await docker_stop(old_container):
-            state_now = await docker_state(old_container)
-            if state_now not in {"exited", "stopped", None}:
-                return False, "Could not stop the current VPS before reinstall."
-    try:
-        created_id, err = await docker_run(
-            image=image,
-            container_name=new_container,
-            ram=str(vps["ram"]),
-            cpu=str(vps["cpu"]),
-            disk=str(vps["disk"]),
-            hostname=str(vps["hostname"]),
-            location=str(vps["location"]),
+        if await qemu_state(old_vm) == "running":
+            await qemu_stop_vm(old_vm)
+
+        new_vm, error = await qemu_create_vm(
+            os_type=normalized, hostname=str(vps["hostname"]), ram=str(vps["ram"]),
+            cpu=str(vps["cpu"]), disk=str(vps["disk"]), name=new_name,
             persistent_key=str(vps["container_name"]),
         )
-        if not created_id:
-            # Roll the old VPS back to running state so a failed reinstall does
-            # not unnecessarily leave the user's service offline.
-            if old_exists:
-                with contextlib.suppress(Exception):
-                    await docker_start(old_container)
-            return False, f"Reinstall failed while creating the new container: {err or 'Docker run failed.'}"
-        # Keep the old container until the replacement passes the full
-        # readiness gate. It remains stopped, so persistent volumes are not
-        # written by two containers at the same time.
-        container_ref = str(created_id)
-        for _ in range(30):
-            if await docker_state(container_ref) == "running":
-                break
-            await asyncio.sleep(0.5)
-        else:
+        if not new_vm:
             with contextlib.suppress(Exception):
-                await docker_remove(container_ref)
-            if old_exists:
-                with contextlib.suppress(Exception):
-                    await docker_start(old_container)
-            return False, "Reinstall container did not reach running state; the previous VPS was restored."
-        if GUEST_SYSTEMD_ENABLED:
-            guest_ready, guest_error = await wait_for_guest_ready(container_ref)
-            if not guest_ready:
-                with contextlib.suppress(Exception):
-                    await docker_remove(container_ref)
-                if old_exists:
-                    with contextlib.suppress(Exception):
-                        await docker_start(old_container)
-                return False, f"Reinstall guest bootstrap failed: {guest_error}"
-        console = await install_and_start_sshx(container_ref)
-        if old_exists:
-            if not await docker_remove(old_container):
-                logger.warning(
-                    "Old reinstall container %s could not be removed after successful readiness; keeping it stopped.",
-                    clean(old_container, 48),
-                )
-        conn = db_connect()
-        try:
-            conn.execute(
-                "UPDATE vps SET container_id=?, container_name=?, os_type=?, status='running', suspended=0, sshx_url=?, sshx_pid=?, updated_at=? WHERE id=?",
-                (container_ref, new_container, normalized, console.get("url") if console else None, console.get("pid") if console else None, utc_now(), int(vps["id"])),
-            )
-        finally:
-            conn.close()
+                await qemu_launch(old_vm)
+            return False, f"Reinstall failed while creating the replacement VM: {error or 'QEMU failed.'}"
+
+        ready, detail = await _wait_qemu_ready(new_vm)
+        if not ready:
+            with contextlib.suppress(Exception):
+                await qemu_remove_vm(new_vm)
+            with contextlib.suppress(Exception):
+                await qemu_launch(old_vm)
+            return False, f"Replacement VM failed readiness: {detail}"
+
+        console = await install_and_start_sshx(new_vm)
+        new_url = normalize_sshx_url(console.get("url")) if console and console.get("url") else None
+        new_pid = console.get("pid") if console else None
+
+        if await qemu_state(old_vm) in {"running", "stopped"}:
+            with contextlib.suppress(Exception):
+                await qemu_remove_vm(old_vm)
+
+        # Snapshots are internal to the old qcow2 overlay and cannot safely
+        # reference the replacement disk. Preserve the VPS, not stale snapshots.
+        with contextlib.suppress(Exception):
+            db_delete_all_snapshots(vps["id"])
+        db_update_vps(
+            old_vm,
+            container_id=new_vm,
+            container_name=new_name,
+            os_type=normalized,
+            status="running",
+            suspended=0,
+            sshx_url=new_url,
+            sshx_pid=new_pid,
+            backend="qemu",
+        )
         latest = db_get_vps(vps["id"])
         if latest:
             await supervise_vps_ports(latest)
         return True, f"VPS reinstalled successfully with **{os_label(normalized)}**."
     except Exception as exc:
-        logger.exception("Docker reinstall failed for VPS #%s", vps["id"])
+        logger.exception("QEMU reinstall failed for VPS #%s", vps["id"])
+        if new_vm:
+            with contextlib.suppress(Exception):
+                await qemu_remove_vm(new_vm)
         with contextlib.suppress(Exception):
-            await docker_remove(locals().get("container_ref", new_container))
+            await qemu_launch(old_vm)
         return False, f"Reinstall failed safely: {safe_log(exc)}"
 
 
@@ -3694,65 +4521,70 @@ async def lifecycle_action(vps: sqlite3.Row, action: str) -> tuple[bool, str]:
 
             return False, "Unsupported Pterodactyl VPS action."
 
-        container = vps["container_id"]
-        exists = await docker_exists(container)
+        container = str(vps["container_id"])
+        if backend != "qemu":
+            return False, "Unsupported local VPS backend."
+        exists = qemu_load_meta(container) is not None
+
         if action == "start":
             if vps["suspended"]:
                 return False, "This VPS is suspended by an administrator."
             if not exists:
-                return False, "The Docker container no longer exists. Ask an administrator to recreate this VPS."
+                return False, "The QEMU VM metadata no longer exists. Ask an administrator to recreate this VPS."
             async with CAPACITY_LOCK:
                 _, current = await docker_running_count()
-                already_running = (await docker_state(container)) == "running"
+                already_running = (await qemu_state(container)) == "running"
                 if not already_running and current >= TOTAL_RUNNING_LIMIT:
                     return False, f"Global running VPS limit reached ({TOTAL_RUNNING_LIMIT})."
-                ok, error = await docker_start(container)
+                ok, error = await qemu_launch(container, qemu_running_forwards(int(vps["id"])))
             if not ok:
                 return False, error or "Failed to start the VPS."
-            for _ in range(20):
-                if await docker_state(container) == "running":
-                    break
-                await asyncio.sleep(0.5)
-            else:
-                return False, "The VPS start command returned, but the container is not running."
+            if not already_running:
+                ready, detail = await _wait_qemu_ready(container)
+                if not ready:
+                    return False, f"VPS started but readiness failed: {detail}"
             console = await install_and_start_sshx(container)
             existing = db_get_vps(vps["id"]) or vps
-            db_update_vps(container, status="running", sshx_url=console["url"] if console else existing["sshx_url"], sshx_pid=console.get("pid") if console else existing["sshx_pid"])
-            await supervise_vps_ports(vps)
-            return True, "VPS started. Console refreshed." if console else "VPS started; press Console to retry SSHx."
+            db_update_vps(
+                container, status="running",
+                sshx_url=normalize_sshx_url(console.get("url")) if console and console.get("url") else existing["sshx_url"],
+                sshx_pid=console.get("pid") if console and console.get("pid") else existing["sshx_pid"],
+            )
+            latest = db_get_vps(vps["id"]) or vps
+            await supervise_vps_ports(latest)
+            return True, "VPS started successfully." + (" Console refreshed." if console else " Press Console to retry SSHx.")
 
         if action == "stop":
             if exists:
                 await stop_sshx(container)
                 for p_row in db_list_ports(vps["id"]):
                     await stop_port_forward(p_row)
-                if not await docker_stop(container) and await docker_state(container) not in {"exited", "stopped"}:
+                if not await qemu_stop_vm(container) and await qemu_state(container) == "running":
                     return False, "Failed to stop the VPS."
             db_update_vps(container, status="stopped", sshx_url=None, sshx_pid=None)
             return True, "VPS stopped successfully."
 
         if action == "restart":
             if not exists:
-                return False, "The Docker container no longer exists."
+                return False, "The QEMU VM metadata no longer exists."
             async with CAPACITY_LOCK:
-                _, current = await docker_running_count()
-                if current >= TOTAL_RUNNING_LIMIT and (await docker_state(container)) != "running":
-                    return False, f"Global running VPS limit reached ({TOTAL_RUNNING_LIMIT})."
                 await stop_sshx(container)
-                ok, error = await docker_restart(container)
+                ok, error = await qemu_restart_vm(container, int(vps["id"]))
             if not ok:
                 return False, error or "Failed to restart the VPS."
-            for _ in range(20):
-                if await docker_state(container) == "running":
-                    break
-                await asyncio.sleep(0.5)
-            else:
-                return False, "The VPS restart command returned, but the container is not running."
+            ready, detail = await _wait_qemu_ready(container)
+            if not ready:
+                return False, f"VPS restarted but readiness failed: {detail}"
             console = await install_and_start_sshx(container)
             existing = db_get_vps(vps["id"]) or vps
-            db_update_vps(container, status="running", sshx_url=console["url"] if console else existing["sshx_url"], sshx_pid=console.get("pid") if console else existing["sshx_pid"])
-            await supervise_vps_ports(vps)
-            return True, "VPS restarted successfully." if console else "VPS restarted; press Console to retry SSHx."
+            db_update_vps(
+                container, status="running",
+                sshx_url=normalize_sshx_url(console.get("url")) if console and console.get("url") else existing["sshx_url"],
+                sshx_pid=console.get("pid") if console and console.get("pid") else existing["sshx_pid"],
+            )
+            latest = db_get_vps(vps["id"]) or vps
+            await supervise_vps_ports(latest)
+            return True, "VPS restarted successfully."
 
         if action == "reinstall":
             return False, "Select an operating system from the Reinstall menu first."
@@ -3762,8 +4594,8 @@ async def lifecycle_action(vps: sqlite3.Row, action: str) -> tuple[bool, str]:
                 await stop_port_forward(p_row)
             if exists:
                 await stop_sshx(container)
-                if not await docker_remove(container):
-                    return False, "Docker cleanup failed; the VPS record was kept."
+                if not await qemu_remove_vm(container):
+                    return False, "QEMU cleanup failed; the VPS record was kept."
             db_delete_vps(container)
             return True, "VPS deleted successfully."
 
@@ -3772,11 +4604,7 @@ async def lifecycle_action(vps: sqlite3.Row, action: str) -> tuple[bool, str]:
                 await stop_sshx(container)
                 for p_row in db_list_ports(vps["id"]):
                     await stop_port_forward(p_row)
-                stopped = await docker_stop(container)
-                if not stopped:
-                    state_now = await docker_state(container)
-                    if state_now not in {"exited", "stopped", None}:
-                        return False, "Failed to stop the VPS before suspension."
+                await qemu_stop_vm(container)
             db_update_vps(container, status="stopped", suspended=1, sshx_url=None, sshx_pid=None)
             return True, "VPS stopped and suspended."
 
@@ -3800,7 +4628,8 @@ async def create_console_access(vps: sqlite3.Row, user: discord.User | discord.M
         sent = await safe_dm(user, make_embed("✨ RGNODES™ • 🦖 Pterodactyl Panel", "Open your VPS panel from the button below."), sshx_view(url))
         return True, "Pterodactyl panel access link sent by DM." if sent else "Pterodactyl panel is ready, but your DM is closed."
 
-    state = await docker_state(vps["container_id"])
+    backend = str(vps["backend"] or "qemu").lower()
+    state = await qemu_state(str(vps["container_id"])) if backend == "qemu" else await docker_state(str(vps["container_id"]))
     if state != "running":
         db_update_vps(vps["container_id"], status="stopped", sshx_url=None, sshx_pid=None)
         return False, "Start the VPS before opening Console."
@@ -4088,6 +4917,34 @@ async def verify_host_listener(port: int) -> bool:
 async def start_port_forward(port_row: sqlite3.Row, vps: sqlite3.Row) -> tuple[bool, str]:
     if str(port_row["protocol"]).lower() != "tcp":
         return False, "Only TCP forwarding is enabled."
+    if str(vps["backend"] or "docker").lower() == "qemu":
+        if await qemu_state(vps["container_id"]) != "running":
+            db_update_port(port_row["id"], status="stopped", pid=None, target_ip=None)
+            return False, "VPS is not running. Start it first."
+        host_port = int(port_row["host_port"])
+        if str(port_row["status"]).lower() == "running":
+            desired = [
+                (int(row["host_port"]), int(row["container_port"]))
+                for row in db_list_ports(vps["id"])
+                if str(row["protocol"]).lower() == "tcp" and str(row["status"]).lower() == "running"
+            ]
+            if (host_port, int(port_row["container_port"])) in desired and await qemu_state(vps["container_id"]) == "running":
+                return True, f"QEMU forwarding is already online on public port `{host_port}`."
+        if not port_bindable(host_port) and str(port_row["status"]).lower() != "running":
+            db_update_port(port_row["id"], status="error", pid=None, target_ip=None)
+            return False, f"Public port `{host_port}` is already in use."
+        desired = [
+            (int(row["host_port"]), int(row["container_port"]))
+            for row in db_list_ports(vps["id"])
+            if str(row["protocol"]).lower() == "tcp" and (int(row["id"]) == int(port_row["id"]) or str(row["status"]).lower() == "running")
+        ]
+        await qemu_stop_vm(vps["container_id"])
+        ok, detail = await qemu_launch(vps["container_id"], desired)
+        if not ok:
+            db_update_port(port_row["id"], status="error", pid=None, target_ip=None)
+            return False, detail or "QEMU network reconfiguration failed."
+        db_update_port(port_row["id"], status="running", pid=None, target_ip="127.0.0.1")
+        return True, f"QEMU forwarding is online on public port `{host_port}`."
     if await docker_state(vps["container_id"]) != "running":
         db_update_port(port_row["id"], status="stopped", pid=None, target_ip=None)
         return False, "VPS is not running. Start it first."
@@ -4180,99 +5037,77 @@ SNAPSHOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 async def docker_snapshot_create(vps: sqlite3.Row, name: str) -> tuple[bool, str]:
-    if str(vps["backend"] or "docker").lower() != "docker":
-        return False, "Snapshots are currently available for Docker VPS instances only. Pterodactyl backups are managed by the panel."
+    if str(vps["backend"] or "qemu").lower() != "qemu":
+        return False, "Snapshots are available for real QEMU VPS instances."
     name = name.strip()
     if not SNAPSHOT_NAME_RE.fullmatch(name):
         return False, "Snapshot name must be 1–64 characters and use only letters, numbers, `.`, `_`, or `-`."
     if db_get_snapshot(vps["id"], name):
         return False, "A snapshot with that name already exists."
-    if await docker_state(vps["container_id"]) != "running":
+    vm_id = str(vps["container_id"])
+    if await qemu_state(vm_id) != "running":
         return False, "Start the VPS before creating a snapshot."
-    image_ref = f"rgnodes-snapshot:{int(vps['id'])}-{name.lower()}"
-    rc, out, err = await docker_cli("commit", vps["container_id"], image_ref, timeout=180, retries=1)
-    if rc != 0:
-        return False, f"Docker snapshot failed: {safe_log(err.decode('utf-8', 'replace'))}"
-    if not out.decode("utf-8", "replace").strip():
-        return False, "Docker did not return a snapshot image ID."
+    meta = qemu_load_meta(vm_id) or {}
+    disk = Path(str(meta.get("disk_path", "")))
+    if not disk.exists():
+        return False, "The QEMU disk image is missing."
+    snap_dir = disk.parent / "snapshots"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    snap_path = snap_dir / f"{name}.qcow2"
+    was_running = await qemu_state(vm_id) == "running"
+    if was_running:
+        await qemu_stop_vm(vm_id)
     try:
-        db_insert_snapshot(vps["id"], name, image_ref)
-    except sqlite3.IntegrityError:
-        return False, "Snapshot record already exists."
-    return True, f"Snapshot `{name}` created successfully."
+        rc, _, err = await run_process("qemu-img", "snapshot", "-c", name, str(disk), timeout=180)
+        if rc != 0:
+            return False, safe_log(err.decode("utf-8", "replace").strip() or "QEMU snapshot failed.")
+        db_insert_snapshot(vps["id"], name, str(disk))
+        return True, f"Snapshot `{name}` created successfully."
+    finally:
+        if was_running:
+            with contextlib.suppress(Exception):
+                await qemu_launch(vm_id)
 
 
 async def docker_snapshot_restore(vps: sqlite3.Row, name: str) -> tuple[bool, str]:
-    if str(vps["backend"] or "docker").lower() != "docker":
-        return False, "Snapshot restore is currently available for Docker VPS instances only."
+    if str(vps["backend"] or "qemu").lower() != "qemu":
+        return False, "Snapshot restore is currently available for real QEMU VPS instances."
     snap = db_get_snapshot(vps["id"], name.strip())
     if not snap:
         return False, "Snapshot not found."
-    container = vps["container_id"]
-    snapshot_image = str(snap["image_ref"])
-    rc, _, err = await docker_cli("image", "inspect", snapshot_image, timeout=30, retries=1)
+    vm_id = str(vps["container_id"])
+    meta = qemu_load_meta(vm_id) or {}
+    disk = Path(str(meta.get("disk_path", "")))
+    if not disk.exists():
+        return False, "The QEMU disk image is missing."
+    await qemu_stop_vm(vm_id)
+    rc, _, err = await run_process("qemu-img", "snapshot", "-a", str(name).strip(), str(disk), timeout=180)
     if rc != 0:
-        db_delete_snapshot(vps["id"], name.strip())
-        return False, "Snapshot image no longer exists; its stale database record was removed."
-    new_name = str(vps["container_name"])
-    async with vps_lock(vps["id"]):
-        await stop_sshx(container)
-        for p_row in db_list_ports(vps["id"]):
-            await stop_port_forward(p_row)
-        if await docker_exists(container) and not await docker_remove(container):
-            return False, "Could not remove the current container safely, so restore was aborted."
-        new_container, create_error = await docker_run(
-            image=snapshot_image,
-            hostname=str(vps["hostname"]),
-            ram=str(vps["ram"]),
-            cpu=str(vps["cpu"]),
-            disk=str(vps["disk"]),
-            container_name=new_name,
-            location=str(vps["location"]),
-            persistent_key=str(vps["container_name"]),
-        )
-        if not new_container:
-            return False, f"Restore failed while recreating the container: {create_error}"
-        # `docker run --detach` starts the restored container already.
-        # Only start it explicitly when it is not running.
-        ok, error = await ensure_docker_running(new_container)
-        if not ok:
-            await docker_remove(new_container)
-            return False, f"Restore created a container but could not start it: {error}"
-        for _ in range(20):
-            if await docker_state(new_container) == "running":
-                break
-            await asyncio.sleep(0.5)
-        else:
-            await docker_remove(new_container)
-            return False, "Restored container did not reach running state."
-        console = await install_and_start_sshx(new_container)
-        # Atomically update the existing VPS record to the restored container.
-        conn = db_connect()
-        try:
-            conn.execute(
-                "UPDATE vps SET container_id=?, status='running', suspended=0, sshx_url=?, sshx_pid=?, updated_at=? WHERE id=?",
-                (new_container, console["url"] if console else None, console.get("pid") if console else None, utc_now(), int(vps["id"])),
-            )
-        finally:
-            conn.close()
-        latest = db_get_vps(vps["id"])
-        if latest:
-            await supervise_vps_ports(latest)
+        return False, safe_log(err.decode("utf-8", "replace").strip() or "QEMU snapshot restore failed.")
+    ok, detail = await qemu_launch(vm_id)
+    if not ok:
+        return False, detail or "QEMU could not restart after snapshot restore."
+    ready, detail = await _wait_qemu_ready(vm_id)
+    if not ready:
+        return False, detail
     return True, f"Snapshot `{name}` restored successfully."
 
 
 async def snapshot_delete_image(vps: sqlite3.Row, name: str) -> tuple[bool, str]:
+    if str(vps["backend"] or "qemu").lower() != "qemu":
+        return False, "Snapshot deletion is currently available for real QEMU VPS instances."
     snap = db_get_snapshot(vps["id"], name.strip())
     if not snap:
         return False, "Snapshot not found."
-    image_ref = str(snap["image_ref"])
-    rc, _, err = await docker_cli("image", "rm", "-f", image_ref, timeout=60, retries=1)
-    if rc != 0 and "No such image" not in err.decode("utf-8", "replace"):
-        return False, f"Could not remove snapshot image: {safe_log(err.decode('utf-8', 'replace'))}"
+    vm_id = str(vps["container_id"])
+    meta = qemu_load_meta(vm_id) or {}
+    disk = Path(str(meta.get("disk_path", "")))
+    if disk.exists():
+        rc, _, err = await run_process("qemu-img", "snapshot", "-d", str(name).strip(), str(disk), timeout=120)
+        if rc != 0:
+            return False, safe_log(err.decode("utf-8", "replace").strip() or "QEMU snapshot deletion failed.")
     db_delete_snapshot(vps["id"], name.strip())
-    return True, f"Snapshot `{name}` deleted."
-
+    return True, f"Snapshot `{name}` deleted successfully."
 
 # ================================================================
 # Host/system bootstrap
@@ -4516,8 +5351,8 @@ class ReinstallView(discord.ui.View):
             if not vps:
                 await safe_edit_original(interaction, embed=make_embed("❌ VPS Not Found", "This VPS no longer exists."), view=None)
                 return
-            backend = str(vps["backend"] or "docker").lower()
-            if backend == "docker":
+            backend = str(vps["backend"] or "qemu").lower()
+            if backend in {"docker", "qemu"}:
                 async with vps_lock(self.vps_id):
                     ok, message = await docker_reinstall_vps(vps, selected)
             elif backend == "pterodactyl":
@@ -4604,7 +5439,7 @@ class ManageView(discord.ui.View):
                 await safe_edit_original(interaction, embed=make_embed("🗑️ VPS Removed", f"`{clean(vps['container_name'])}` and its forwarding rules were removed successfully."), view=None)
                 return
             latest = await refresh_vps_record_state(db_get_vps(self.vps_id) or vps)
-            if str(latest["backend"] or "docker").lower() == "docker":
+            if str(latest["backend"] or "qemu").lower() in {"docker", "qemu"}:
                 await asyncio.gather(supervise_vps_ports(latest), detect_public_network(), return_exceptions=True)
                 ports = db_list_ports(latest["id"])
             else:
@@ -4727,7 +5562,7 @@ async def _dashboard_live_data(vps: sqlite3.Row) -> tuple[dict[str, str], str, d
     backend = str(vps["backend"] or "docker").lower()
     network = NETWORK_CACHE
     ports: list[sqlite3.Row] = []
-    if backend == "docker":
+    if backend in {"docker", "qemu"}:
         await asyncio.gather(
             supervise_vps_ports(vps),
             detect_public_network(),
@@ -4811,7 +5646,7 @@ async def deploy_flow(interaction: discord.Interaction, *, user: discord.User | 
             interaction,
             embed=make_embed(
                 "❌ VPS Creation Timed Out",
-                "Docker took too long to complete the deployment. Any partially created container was cleaned up when possible. Please retry.",
+                "QEMU took too long to complete the real VM deployment. Any partial VM was cleaned up when possible. Please retry.",
             ),
         )
         return
@@ -4832,17 +5667,7 @@ async def deploy_flow(interaction: discord.Interaction, *, user: discord.User | 
             db_set_vps_ipv4(vps["container_id"], network["ip"])
 
     console_url = normalize_sshx_url(vps["sshx_url"]) if vps["sshx_url"] else None
-    dm_sent = False
-    if console_url:
-        dm_sent = await safe_dm(
-            user,
-            console_embed(vps["container_name"], console_url, network.get("ip") if ip_ok else None, actual_location_label(network)),
-            sshx_view(console_url),
-        )
-        if ip_ok:
-            await safe_dm(user, ipv4_dm_embed(vps, network))
-    elif ip_ok:
-        await safe_dm(user, ipv4_dm_embed(vps, network))
+    dm_sent = await send_vps_ready_dm(user, vps, network)
 
     final = make_embed("✅ VPS Ready", f"Your **{os_label(vps['os_type'])}** VPS is online.")
     final.add_field(name="🖥️ VPS", value=f"`{clean(vps['container_name'])}` • ID `{vps['id']}`", inline=False)
@@ -4941,7 +5766,7 @@ async def vps_info_slash(interaction: discord.Interaction, vps_identifier: str |
     await show_dashboard(interaction, vps)
 
 
-@bot.tree.command(name="remove", description="Delete a VPS and its Docker container.")
+@bot.tree.command(name="remove", description="Delete a RGNODES VPS.")
 async def remove_slash(interaction: discord.Interaction, vps_identifier: str): await slash_lifecycle(interaction, vps_identifier, "delete")
 
 
@@ -5001,7 +5826,7 @@ async def restart_vps_slash(interaction: discord.Interaction, vps_identifier: st
     await slash_lifecycle(interaction, vps_identifier, "restart")
 
 
-@bot.tree.command(name="snapshot", description="Create a Docker VPS snapshot.")
+@bot.tree.command(name="snapshot", description="Create a real VPS snapshot.")
 async def snapshot_slash(interaction: discord.Interaction, vps_identifier: str, name: str | None = None):
     if not await safe_defer(interaction, ephemeral=True):
         return
@@ -5022,7 +5847,7 @@ async def list_snapshots_slash(interaction: discord.Interaction, vps_identifier:
     if not vps:
         await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found."))
         return
-    if str(vps["backend"] or "docker").lower() != "docker":
+    if str(vps["backend"] or "qemu").lower() not in {"docker", "qemu"}:
         await safe_followup(interaction, embed=make_embed("🦖 Pterodactyl Backups", "This VPS uses Pterodactyl. Use the Panel's backup system instead of local Docker snapshots."))
         return
     rows = db_list_snapshots(vps["id"])
@@ -5030,7 +5855,7 @@ async def list_snapshots_slash(interaction: discord.Interaction, vps_identifier:
     await safe_followup(interaction, embed=make_embed(f"📋 Snapshots • {clean(vps['container_name'])}", body))
 
 
-@bot.tree.command(name="restore-snapshot", description="Restore a Docker VPS snapshot.")
+@bot.tree.command(name="restore-snapshot", description="Restore a VPS snapshot.")
 async def restore_snapshot_slash(interaction: discord.Interaction, vps_identifier: str, name: str):
     if not await safe_defer(interaction, ephemeral=True):
         return
@@ -5130,7 +5955,7 @@ async def set_status_slash(interaction: discord.Interaction, status_type: str, n
 
 @bot.tree.command(name="about", description="Show RGNODES™ information.")
 async def about_slash(interaction: discord.Interaction):
-    embed = make_embed("☁️ RGNODES™ VPS Management", "Fast Docker VPS management with private SSHx access.")
+    embed = make_embed("☁️ RGNODES™ VPS Management", "Fast real QEMU VPS management with private SSHx access.")
     embed.add_field(name="🛠️ Stack", value="Python 3 • discord.py • Docker • SQLite WAL", inline=False)
     embed.add_field(name="🔐 Security", value="Console links are generated on demand and sent by DM only.", inline=False)
     await safe_respond(interaction, embed=embed)
@@ -5299,6 +6124,18 @@ async def remove_all_slash(interaction: discord.Interaction, confirm: bool = Fal
     for cid in orphans:
         with contextlib.suppress(Exception):
             await docker_remove(cid)
+    # Explicit destructive cleanup also removes orphaned QEMU metadata/VM disks
+    # that are no longer referenced by the database. Normal startup never does
+    # this automatically, so unexpected files are not silently deleted.
+    referenced_qemu = {str(row["container_id"]) for row in rows if str(row["backend"] or "").lower() == "qemu"}
+    with contextlib.suppress(OSError):
+        QEMU_VM_ROOT.mkdir(parents=True, exist_ok=True)
+        for child in QEMU_VM_ROOT.iterdir():
+            if not child.is_dir() or child.name == "_images" or child.name in referenced_qemu:
+                continue
+            if child.name.startswith("qemu-"):
+                with contextlib.suppress(Exception):
+                    await qemu_remove_vm(child.name)
     db_delete_all_vps()
     await safe_followup(interaction, embed=make_embed("✅ Remove All Complete", f"Managed VPS removed: `{removed}`\nFailures: `{failed}`\nVPS ID sequence reset to `1`.\nAll forwarding records were cleared."))
 
@@ -5422,7 +6259,7 @@ async def admin_vps_info(interaction: discord.Interaction, target_user: discord.
     if not vps: await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found.")); return
     vps = await refresh_vps_record_state(vps)
     stats, uptime, disk = await _safe_vps_live_data(vps)
-    ports = db_list_ports(vps["id"]) if str(vps["backend"] or "docker").lower() == "docker" else []
+    ports = db_list_ports(vps["id"]) if str(vps["backend"] or "qemu").lower() in {"docker", "qemu"} else []
     await safe_followup(interaction, embed=dashboard_embed(vps, stats, uptime, disk, NETWORK_CACHE, ports))
 
 
@@ -5472,7 +6309,7 @@ def confirm_value(value: str | bool | None) -> bool:
 
 @bot.tree.command(
     name="install-system",
-    description="Admin: install/repair Linux and Docker dependencies.",
+    description="Admin: install/repair QEMU VPS host dependencies.",
 )
 @app_commands.describe(confirm="Set true to actually run the system bootstrap.")
 async def install_system_slash(interaction: discord.Interaction, confirm: bool = False):
@@ -5488,8 +6325,8 @@ async def install_system_slash(interaction: discord.Interaction, confirm: bool =
         await safe_respond(interaction, embed=make_embed(
             "🛠️ RGNODES™ • Install System",
             (
-                "This command can install/repair the small Linux dependency set "
-                "and Docker when Docker is missing.\n\n"
+                "This command can install/repair the QEMU TCG host dependencies needed "
+                "for real VPS creation. KVM is not required.\n\n"
                 f"**Detected OS:** `{clean(info['name'])}`\n"
                 f"**PID 1:** `{clean(info['pid1'])}`\n"
                 f"**Root:** `{clean(info['root'])}`\n\n"
@@ -5502,7 +6339,10 @@ async def install_system_slash(interaction: discord.Interaction, confirm: bool =
     if not await safe_defer(interaction, ephemeral=True):
         return
     try:
-        ok, result = await asyncio.wait_for(install_system_dependencies(), timeout=900)
+        if active_backend() == "qemu":
+            ok, result = await asyncio.wait_for(qemu_host_prepare(), timeout=900)
+        else:
+            ok, result = await asyncio.wait_for(install_system_dependencies(), timeout=900)
         title = "✅ Install System Complete" if ok else "⚠️ Install System Finished With Issues"
         await safe_followup(interaction, embed=make_embed(title, f"```text\n{safe_log(result, 3800)}\n```"))
     except asyncio.TimeoutError:
@@ -5740,7 +6580,7 @@ async def prefix_ports(ctx: commands.Context, identifier: str = ""):
     if not vps:
         await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", f"Use `{PREFIX}ports list <vps#>` or open `{PREFIX}manage`."))
         return
-    if str(vps["backend"] or "docker").lower() != "docker":
+    if str(vps["backend"] or "qemu").lower() not in {"docker", "qemu"}:
         panel = await ptero_panel_link(vps)
         await safe_ctx_send(ctx, make_embed("🦖 Pterodactyl Ports", f"Port allocations are managed by Pterodactyl.\nPanel: {panel or 'not configured'}"))
         return
@@ -5755,7 +6595,7 @@ async def prefix_ports_add(ctx: commands.Context, identifier: str, container_por
     if not vps:
         await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
         return
-    if str(vps["backend"] or "docker").lower() != "docker":
+    if str(vps["backend"] or "qemu").lower() not in {"docker", "qemu"}:
         await safe_ctx_send(ctx, make_embed("🦖 Pterodactyl Allocations", "This VPS uses Pterodactyl. Manage ports/allocations from the panel."))
         return
     if not 1 <= container_port <= 65535:
@@ -5793,7 +6633,7 @@ async def prefix_ports_list(ctx: commands.Context, identifier: str = ""):
     if not vps:
         await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
         return
-    if str(vps["backend"] or "docker").lower() != "docker":
+    if str(vps["backend"] or "qemu").lower() not in {"docker", "qemu"}:
         panel = await ptero_panel_link(vps)
         await safe_ctx_send(ctx, make_embed("🦖 Pterodactyl Ports", f"Port allocations are managed by Pterodactyl.\nPanel: {panel or 'not configured'}"))
         return
@@ -5886,12 +6726,11 @@ async def prefix_deploy(
         with contextlib.suppress(discord.HTTPException):
             await message.edit(embed=make_embed("❌ VPS Creation Failed", reason))
         return
-    view = sshx_view(vps["sshx_url"]) if vps["sshx_url"] else None
-    dm_sent = False
-    if vps["sshx_url"]:
-        dm_sent = await safe_dm(ctx.author, console_embed(vps["container_name"], vps["sshx_url"]), view)
+    network = await detect_public_network(force=True)
+    console_url = normalize_sshx_url(vps["sshx_url"]) if vps["sshx_url"] else None
+    dm_sent = await send_vps_ready_dm(ctx.author, vps, network)
     final = make_embed("✅ VPS Ready", f"`{clean(vps['container_name'])}` is online.")
-    final.add_field(name="🌐 Console", value="✅ Link sent by DM" if dm_sent else ("⚠️ SSHx pending — use Console to retry" if not vps["sshx_url"] else "⚠️ DM unavailable"), inline=False)
+    final.add_field(name="🌐 Console", value="✅ Ready details sent by DM" if dm_sent else ("⚠️ SSHx pending — use Console to retry" if not console_url else "⚠️ DM unavailable"), inline=False)
     await message.edit(embed=final, view=ManageView(vps["id"], vps["user_id"]))
 
 
@@ -6100,8 +6939,8 @@ async def prefix_ping(ctx: commands.Context):
 
 @bot.command(name="about")
 async def prefix_about(ctx: commands.Context):
-    embed = make_embed("☁️ RGNODES™ VPS Management", "Production Discord VPS management with Docker/Pterodactyl backends.")
-    embed.add_field(name="🛠️ Stack", value="Python • discord.py • Docker • SQLite WAL", inline=False)
+    embed = make_embed("☁️ RGNODES™ VPS Management", "Production Discord VPS management with real QEMU TCG/Pterodactyl backends.")
+    embed.add_field(name="🛠️ Stack", value="Python • discord.py • QEMU TCG • SQLite WAL", inline=False)
     embed.add_field(name="⚙️ Prefix", value=f"`{PREFIX}`", inline=True)
     embed.add_field(name="🖥️ Backend", value=f"`{active_backend()}`", inline=True)
     await safe_ctx_send(ctx, embed)
@@ -6113,8 +6952,8 @@ async def prefix_logs(ctx: commands.Context, identifier: str, lines: int = 50):
     if not vps:
         await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
         return
-    if str(vps["backend"] or "docker").lower() != "docker":
-        await safe_ctx_send(ctx, make_embed("🦖 Pterodactyl Logs", "Use the Pterodactyl Panel for server logs."))
+    if str(vps["backend"] or "qemu").lower() not in {"docker", "qemu"}:
+        await safe_ctx_send(ctx, make_embed("🦖 Pterodactyl Logs", "Use the Pterodactyl Panel for server logs or the QEMU serial log for local VPS diagnostics."))
         return
     logs = (await docker_logs(vps["container_id"], lines)).replace("```", "'''")
     await safe_ctx_send(ctx, make_embed(
@@ -6149,6 +6988,51 @@ async def safe_ctx_send(ctx: commands.Context, embed: discord.Embed, view: disco
 STATUS_SEMAPHORE = asyncio.Semaphore(STATUS_CONCURRENCY)
 
 
+async def recover_qemu_vms() -> None:
+    """Recover database-marked running QEMU VMs after a bot/host restart.
+
+    Intentional stopped/deleted VMs are never started because recovery only
+    considers records whose durable database status was running before restart.
+    """
+    if active_backend() != "qemu":
+        return
+    rows = db_get_all_vps()
+    by_vm = {str(row["container_id"]): row for row in rows if str(row["backend"] or "").lower() == "qemu"}
+    if not QEMU_VM_ROOT.exists():
+        return
+    recovered = 0
+    for child in QEMU_VM_ROOT.iterdir():
+        if not child.is_dir():
+            continue
+        vm_id = child.name
+        meta = qemu_load_meta(vm_id)
+        row = by_vm.get(vm_id)
+        if not meta or not row:
+            continue
+        if str(row["status"] or "stopped").lower() not in {"running", "starting", "restarting"}:
+            continue
+        try:
+            if qemu_process_alive(meta.get("pid")):
+                continue
+            ok, detail = await qemu_launch(vm_id, qemu_running_forwards(int(row["id"])))
+            if ok:
+                ready, ready_detail = await _wait_qemu_ready(vm_id)
+                if ready:
+                    db_update_vps(vm_id, status="running")
+                    recovered += 1
+                    logger.info("Recovered QEMU VPS #%s (%s) after restart.", row["id"], vm_id)
+                else:
+                    db_update_vps(vm_id, status="stopped", sshx_url=None, sshx_pid=None)
+                    logger.warning("QEMU VPS #%s restarted but failed readiness: %s", row["id"], safe_log(ready_detail))
+            else:
+                db_update_vps(vm_id, status="stopped", sshx_url=None, sshx_pid=None)
+                logger.warning("QEMU VPS #%s could not be recovered: %s", row["id"], safe_log(detail))
+        except Exception as exc:
+            logger.warning("QEMU recovery failed for VPS #%s: %s", row["id"], safe_log(exc))
+    if recovered:
+        logger.info("Recovered %d QEMU VPS instance(s) after startup.", recovered)
+
+
 async def sync_one(row: sqlite3.Row) -> None:
     async with STATUS_SEMAPHORE:
         try:
@@ -6170,7 +7054,7 @@ async def sync_one(row: sqlite3.Row) -> None:
                 for p_row in db_list_ports(row["id"]):
                     await stop_port_forward(p_row)
             elif state is None:
-                logger.debug("Docker inspect unavailable for VPS #%s; retaining current database status.", row["id"])
+                logger.debug("Backend state unavailable for VPS #%s; retaining current database status.", row["id"])
         except Exception as exc:
             logger.warning("Status sync failed for #%s: %s", row["id"], safe_log(exc))
 
@@ -6245,6 +7129,8 @@ async def on_ready():
         if not refresh_network_identity.is_running():
             refresh_network_identity.start()
         bot.loops_started = True
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(recover_qemu_vms(), timeout=min(900, max(120, QEMU_HOST_PREP_TIMEOUT)))
         await detect_public_network()
 
     if not bot.synced:
