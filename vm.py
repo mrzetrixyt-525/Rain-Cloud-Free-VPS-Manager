@@ -13,8 +13,9 @@ import sqlite3
 import sys
 import json
 import time
-import uuid
-import shlex
+import random
+import zipfile
+import tempfile
 import aiohttp
 import secrets
 try:
@@ -88,58 +89,40 @@ TOKEN, TOKEN_SOURCE = load_discord_token()
 # Native-Docker guest bootstrap settings.
 # Kept near the top because function default arguments are evaluated when the
 # function is defined, not when it is called.
-GUEST_SYSTEMD_ENABLED = True
+GUEST_SYSTEMD_ENABLED = env_bool("GUEST_SYSTEMD_ENABLED", True)
 GUEST_NESTED_DOCKER = env_bool("GUEST_NESTED_DOCKER", True)
 GUEST_SYSTEMD_PRIVILEGED = env_bool("GUEST_SYSTEMD_PRIVILEGED", True)
 GUEST_CGROUPNS_HOST = env_bool("GUEST_CGROUPNS_HOST", True)
-GUEST_KVM_ENABLED = False
 GUEST_INSTALL_WINGS = env_bool("GUEST_INSTALL_WINGS", True)
 GUEST_INSTALL_WEB_STACK = env_bool("GUEST_INSTALL_WEB_STACK", True)
 GUEST_INSTALL_DATABASE_STACK = env_bool("GUEST_INSTALL_DATABASE_STACK", True)
 GUEST_BOOTSTRAP_TIMEOUT = env_int("GUEST_BOOTSTRAP_TIMEOUT", 1200, 120, 1800)
 GUEST_DOCKER_PACKAGE = os.getenv("GUEST_DOCKER_PACKAGE", "docker.io").strip() or "docker.io"
 GUEST_PERSISTENT_DATA = env_bool("GUEST_PERSISTENT_DATA", True)
-
-# Real VPS backend: QEMU system emulation with software TCG only. KVM is never used.
-VPS_BACKEND = "qemu"
-QEMU_ACCEL = "tcg"
-QEMU_VM_ROOT = Path(os.getenv("QEMU_VM_ROOT", "qemu-vms")).expanduser().resolve()
-QEMU_IMAGE_CACHE = Path(os.getenv("QEMU_IMAGE_CACHE", str(QEMU_VM_ROOT / "_images"))).expanduser().resolve()
-QEMU_SSH_PORT_START = env_int("QEMU_SSH_PORT_START", 41000, 1024, 65530)
-QEMU_SSH_PORT_END = env_int("QEMU_SSH_PORT_END", 45000, QEMU_SSH_PORT_START, 65535)
-QEMU_AUTO_INSTALL_HOST_TOOLS = env_bool("QEMU_AUTO_INSTALL_HOST_TOOLS", True)
-QEMU_HOST_PREP_TIMEOUT = env_int("QEMU_HOST_PREP_TIMEOUT", 900, 120, 1800)
-QEMU_BOOT_TIMEOUT = env_int("QEMU_BOOT_TIMEOUT", 900, 120, 1800)
-QEMU_SSH_USER = os.getenv("QEMU_SSH_USER", "rgnodes").strip() or "rgnodes"
-
-QEMU_IMAGE_URLS = {
-    "ubuntu-22.04": "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img",
-    "ubuntu-24.04": "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
-    "ubuntu-26.04": "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img",
-    "debian-11": "https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-generic-amd64.qcow2",
-    "debian-12": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2",
-    "debian-13": "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2",
-}
+SSH_PASSWORD_LENGTH = env_int("SSH_PASSWORD_LENGTH", 20, 12, 48)
+AUTO_CREATE_SSH_FORWARD = env_bool("AUTO_CREATE_SSH_FORWARD", True)
+SSH_FORWARD_PORT_START = env_int("SSH_FORWARD_PORT_START", 22000, 1024, 65530)
+SSH_FORWARD_PORT_END = env_int("SSH_FORWARD_PORT_END", 29999, SSH_FORWARD_PORT_START, 65535)
 
 ADMIN_ID = env_int("ADMIN_ID", 0, 0)
 DATABASE_FILE = os.getenv("DATABASE_FILE", "vps_bot.db").strip() or "vps_bot.db"
 LOG_FILE = os.getenv("LOG_FILE", "vps_bot.log").strip() or "vps_bot.log"
 BOT_STATUS_NAME = os.getenv("BOT_STATUS_NAME", "RGNODES™ VPS Management").strip() or "RGNODES™ VPS Management"
 PREFIX = (os.getenv("PREFIX") or "-").strip() or "-"
-VPS_HOSTNAME_PREFIX = os.getenv("VPS_HOSTNAME_PREFIX", "rgnodes").strip() or "rgnodes"
-DEFAULT_RAM = os.getenv("DEFAULT_RAM", "4G").strip() or "4G".strip() or "2g"
-DEFAULT_CPU = os.getenv("DEFAULT_CPU", "1").strip() or "1".strip() or "1"
-DEFAULT_DISK = os.getenv("DEFAULT_DISK", "10G").strip() or "10G".strip() or "10g"
+VPS_HOSTNAME_PREFIX = os.getenv("VPS_HOSTNAME_PREFIX", "rgnodes-vps").strip() or "rgnodes-vps"
+DEFAULT_RAM = os.getenv("DEFAULT_RAM", "8G").strip() or "4G".strip() or "2g"
+DEFAULT_CPU = os.getenv("DEFAULT_CPU", "2").strip() or "1".strip() or "1"
+DEFAULT_DISK = os.getenv("DEFAULT_DISK", "25G").strip() or "10G".strip() or "10g"
 DEFAULT_LOCATION = os.getenv("DEFAULT_LOCATION", "SG").strip().upper() or "SG"
 if DEFAULT_LOCATION not in {"SG", "IN"}:
     DEFAULT_LOCATION = "SG"
 SERVER_LIMIT = env_int("SERVER_LIMIT", 1, 1, 100)
-TOTAL_RUNNING_LIMIT = env_int("TOTAL_RUNNING_LIMIT", 50, 1, 10_000)
+TOTAL_RUNNING_LIMIT = env_int("TOTAL_RUNNING_LIMIT", 1000, 1, 10_000)
 ADMIN_BYPASS_LIMITS = env_bool("ADMIN_BYPASS_LIMITS", True)
 STATUS_INTERVAL = env_int("STATUS_INTERVAL", 45, 15, 300)
 DOCKER_TIMEOUT = env_int("DOCKER_TIMEOUT", 120, 30, 900)
 ACCESS_TIMEOUT = env_int("ACCESS_TIMEOUT", 120, 30, 300)
-DEPLOY_TIMEOUT = env_int("DEPLOY_TIMEOUT", 1200, 300, 1800)
+DEPLOY_TIMEOUT = env_int("DEPLOY_TIMEOUT", 1200, 180, 1800)
 IMAGE_PULL_TIMEOUT = env_int("IMAGE_PULL_TIMEOUT", 300, 60, 600)
 INTERACTION_LOG_UNKNOWN_AS_DEBUG = env_bool("INTERACTION_LOG_UNKNOWN_AS_DEBUG", True)
 ENABLE_HARD_DISK_QUOTA = env_bool("ENABLE_HARD_DISK_QUOTA", False)
@@ -189,6 +172,22 @@ WEB_RESERVED_PORTS = {2022, 8080, 8443}
 _requested_web_port = env_int("PORT", 247, 1, 65535) if USE_PLATFORM_PORT else env_int("WEB_PORT", 247, 1, 65535)
 WEB_PORT = 247 if _requested_web_port in WEB_RESERVED_PORTS else _requested_web_port
 WEB_PATH = os.getenv("WEB_PATH", "/").strip() or "/"
+TOTAL_CREATE_LIMIT_DEFAULT = env_int("TOTAL_CREATE_LIMIT", 1000, 1, 1000)
+DEPLOY_COST = env_int("DEPLOY_COST", 155, 0, 1000000)
+BOT_VERSION = os.getenv("BOT_VERSION", "1 Pro").strip() or "1 Pro"
+HOSTING_NAME = os.getenv("HOSTING_NAME", "RGNODES™").strip() or "RGNODES™"
+
+# VPS backend selection:
+#   docker        -> native Docker backend (default, works without Pterodactyl)
+#   pterodactyl   -> create/control servers through Pterodactyl Application API
+# VM creation is always local. Pterodactyl support means the guest is
+# provisioned so Panel/Wings can be installed INSIDE the guest; the bot never
+# redirects VM creation through the Pterodactyl Application API.
+VPS_BACKEND = "docker"
+SSHX_CUSTOM_SCRIPT_URL = os.getenv(
+    "SSHX_CUSTOM_SCRIPT_URL",
+    "https://raw.githubusercontent.com/mrzetrixyt-525/sshx/main/sshx%20by%20rgnodes.sh",
+).strip()
 
 PTERO_URL = os.getenv("PTERO_URL", "").strip().rstrip("/")
 PTERO_API_KEY = (os.getenv("PTERO_API_KEY") or os.getenv("PTERODACTYL_APPLICATION_API_KEY") or "").strip()
@@ -232,7 +231,10 @@ def ptero_configured() -> bool:
     return ptero_application_configured() and ptero_client_configured()
 
 def active_backend() -> str:
-    return "qemu"
+    # The bot creates the guest locally. Pterodactyl support means the guest
+    # is provisioned with Panel/Wings prerequisites; it must not silently
+    # switch a VM creation request into a Pterodactyl API server.
+    return "docker"
 
 if not WEB_PATH.startswith("/"):
     WEB_PATH = "/" + WEB_PATH
@@ -246,8 +248,8 @@ OS_CONFIG = {
     "ubuntu-26.04": {"label": "Ubuntu 26.04 LTS", "image": "ubuntu:26.04"},
     "ubuntu-24.04": {"label": "Ubuntu 24.04 LTS", "image": "ubuntu:24.04"},
     "ubuntu-22.04": {"label": "Ubuntu 22.04 LTS", "image": "ubuntu:22.04"},
-    "debian-13": {"label": "Debian 13", "image": "debian:13.6"},
-    "debian-12": {"label": "Debian 12", "image": "debian:12.15"},
+    "debian-13": {"label": "Debian 13", "image": "debian:13"},
+    "debian-12": {"label": "Debian 12", "image": "debian:12"},
     "debian-11": {"label": "Debian 11", "image": "debian:11.11"},
 }
 
@@ -262,7 +264,7 @@ OS_ALIASES = {
     "ubuntu": "ubuntu-24.04", "ubuntu26": "ubuntu-26.04", "ubuntu26.04": "ubuntu-26.04", "ubuntu-26.04": "ubuntu-26.04",
     "ubuntu24": "ubuntu-24.04", "ubuntu24.04": "ubuntu-24.04", "ubuntu-24.04": "ubuntu-24.04",
     "ubuntu22": "ubuntu-22.04", "ubuntu22.04": "ubuntu-22.04", "ubuntu-22.04": "ubuntu-22.04",
-    "debian": "debian-13", "debian13": "debian-13", "debian-13": "debian-13",
+    "debian": "debian-12", "debian13": "debian-13", "debian-13": "debian-13",
     "debian12": "debian-12", "debian-12": "debian-12",
     "debian11": "debian-11", "debian-11": "debian-11",
 }
@@ -697,6 +699,8 @@ def init_db() -> None:
                 suspended INTEGER NOT NULL DEFAULT 0,
                 sshx_url TEXT,
                 sshx_pid TEXT,
+                ssh_password TEXT,
+                critical INTEGER NOT NULL DEFAULT 0,
                 public_ipv4 TEXT,
                 ipv4_verified_at TEXT,
                 created_at TEXT NOT NULL,
@@ -710,6 +714,7 @@ def init_db() -> None:
                 user_id INTEGER NOT NULL,
                 shared_by INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
+                access_level TEXT NOT NULL DEFAULT 'manage',
                 PRIMARY KEY (vps_id, user_id),
                 FOREIGN KEY(vps_id) REFERENCES vps(id) ON DELETE CASCADE
             )
@@ -728,6 +733,91 @@ def init_db() -> None:
                 FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS economy (
+                user_id INTEGER PRIMARY KEY,
+                wallet INTEGER NOT NULL DEFAULT 0 CHECK(wallet >= 0),
+                bank INTEGER NOT NULL DEFAULT 0 CHECK(bank >= 0),
+                invites INTEGER NOT NULL DEFAULT 0 CHECK(invites >= 0),
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS economy_cooldowns (
+                user_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                next_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, action)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS redeem_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL UNIQUE,
+                reward_coins INTEGER NOT NULL DEFAULT 0 CHECK(reward_coins >= 0),
+                reward_slots INTEGER NOT NULL DEFAULT 0 CHECK(reward_slots >= 0),
+                max_uses INTEGER NOT NULL DEFAULT 1 CHECK(max_uses >= 0),
+                uses INTEGER NOT NULL DEFAULT 0 CHECK(uses >= 0),
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS redeem_claims (
+                code_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                claimed_at TEXT NOT NULL,
+                PRIMARY KEY(code_id, user_id),
+                FOREIGN KEY(code_id) REFERENCES redeem_codes(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                price INTEGER NOT NULL CHECK(price >= 0),
+                status TEXT NOT NULL DEFAULT 'active',
+                ram TEXT NOT NULL DEFAULT '8g',
+                cpu TEXT NOT NULL DEFAULT '2',
+                disk TEXT NOT NULL DEFAULT '25g',
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS plan_purchases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                plan_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(plan_id) REFERENCES plans(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                location TEXT NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL DEFAULT 22,
+                status TEXT NOT NULL DEFAULT 'online',
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_suspensions (
+                user_id INTEGER PRIMARY KEY,
+                until_at TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT 'Administrative suspension'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS security_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        conn.execute("INSERT OR IGNORE INTO security_settings(key,value) VALUES('anti_hacking','0')")
+        conn.execute("INSERT OR IGNORE INTO security_settings(key,value) VALUES('total_create_limit',?)", (str(TOTAL_CREATE_LIMIT_DEFAULT),))
         conn.execute("""
             CREATE TABLE IF NOT EXISTS processed_events (
                 event_id TEXT PRIMARY KEY,
@@ -771,6 +861,8 @@ def init_db() -> None:
             "location": "ALTER TABLE vps ADD COLUMN location TEXT NOT NULL DEFAULT 'SG'",
             "sshx_url": "ALTER TABLE vps ADD COLUMN sshx_url TEXT",
             "sshx_pid": "ALTER TABLE vps ADD COLUMN sshx_pid TEXT",
+            "ssh_password": "ALTER TABLE vps ADD COLUMN ssh_password TEXT",
+            "critical": "ALTER TABLE vps ADD COLUMN critical INTEGER NOT NULL DEFAULT 0",
             "public_ipv4": "ALTER TABLE vps ADD COLUMN public_ipv4 TEXT",
             "ipv4_verified_at": "ALTER TABLE vps ADD COLUMN ipv4_verified_at TEXT",
             "backend": "ALTER TABLE vps ADD COLUMN backend TEXT NOT NULL DEFAULT 'docker'",
@@ -785,13 +877,16 @@ def init_db() -> None:
         required_vps = {
             "user_id", "container_id", "container_name", "os_type", "location",
             "hostname", "status", "ram", "cpu", "disk", "sshx_url", "sshx_pid",
-            "public_ipv4", "ipv4_verified_at", "created_at", "updated_at",
+            "public_ipv4", "ipv4_verified_at", "created_at", "updated_at", "ssh_password", "critical",
             "backend", "ptero_server_id", "ptero_identifier", "ptero_user_id",
         }
         missing_vps = sorted(required_vps - vps_cols)
         if missing_vps:
             raise RuntimeError(f"SQLite VPS schema is incomplete; missing columns: {', '.join(missing_vps)}")
 
+        share_cols = cols("vps_shares")
+        if "access_level" not in share_cols:
+            conn.execute("ALTER TABLE vps_shares ADD COLUMN access_level TEXT NOT NULL DEFAULT 'manage'")
         share_cols = cols("vps_shares")
         if "shared_by" not in share_cols:
             conn.execute("ALTER TABLE vps_shares ADD COLUMN shared_by INTEGER")
@@ -857,6 +952,132 @@ def db_upsert_user(user_id: int, username: str) -> None:
         conn.close()
 
 
+def db_economy(user_id: int) -> sqlite3.Row:
+    uid = int(user_id)
+    now = utc_now()
+    conn = db_connect()
+    try:
+        conn.execute("INSERT OR IGNORE INTO users(user_id,username,created_at,updated_at) VALUES(?,?,?,?)", (uid, f"User {uid}", now, now))
+        conn.execute("INSERT OR IGNORE INTO economy(user_id,wallet,bank,invites,updated_at) VALUES(?,?,?,?,?)", (uid,0,0,0,now))
+        return conn.execute("SELECT * FROM economy WHERE user_id=?", (uid,)).fetchone()
+    finally:
+        conn.close()
+
+
+def db_balance(user_id: int) -> tuple[int,int]:
+    row = db_economy(user_id)
+    return int(row["wallet"]), int(row["bank"])
+
+
+def db_add_coins(user_id: int, amount: int, *, wallet: bool = True) -> int:
+    amount = int(amount)
+    if amount < 0:
+        raise ValueError("Coin amount cannot be negative.")
+    db_economy(user_id)
+    field = "wallet" if wallet else "bank"
+    conn = db_connect()
+    try:
+        conn.execute(f"UPDATE economy SET {field}={field}+?,updated_at=? WHERE user_id=?", (amount, utc_now(), int(user_id)))
+        return int(conn.execute("SELECT wallet+bank FROM economy WHERE user_id=?", (int(user_id),)).fetchone()[0])
+    finally:
+        conn.close()
+
+
+def db_take_coins(user_id: int, amount: int, *, wallet: bool = True) -> bool:
+    amount = int(amount)
+    if amount < 0:
+        return False
+    db_economy(user_id)
+    field = "wallet" if wallet else "bank"
+    conn = db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(f"SELECT {field} FROM economy WHERE user_id=?", (int(user_id),)).fetchone()
+        if not row or int(row[0]) < amount:
+            conn.rollback()
+            return False
+        conn.execute(f"UPDATE economy SET {field}={field}-?,updated_at=? WHERE user_id=?", (amount, utc_now(), int(user_id)))
+        conn.commit()
+        return True
+    except Exception:
+        with contextlib.suppress(Exception): conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def db_set_cooldown(user_id: int, action: str, seconds: int) -> datetime:
+    when = datetime.now(timezone.utc) + timedelta(seconds=max(0,int(seconds)))
+    conn = db_connect()
+    try:
+        conn.execute("INSERT INTO economy_cooldowns(user_id,action,next_at) VALUES(?,?,?) ON CONFLICT(user_id,action) DO UPDATE SET next_at=excluded.next_at", (int(user_id), action, when.isoformat()))
+    finally:
+        conn.close()
+    return when
+
+
+def db_cooldown_remaining(user_id: int, action: str) -> int:
+    conn = db_connect()
+    try:
+        row = conn.execute("SELECT next_at FROM economy_cooldowns WHERE user_id=? AND action=?", (int(user_id), action)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return 0
+    try:
+        return max(0, int((datetime.fromisoformat(row[0]) - datetime.now(timezone.utc)).total_seconds()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def db_total_create_limit() -> int:
+    conn = db_connect()
+    try:
+        row = conn.execute("SELECT value FROM security_settings WHERE key='total_create_limit'").fetchone()
+        return max(1, int(row[0])) if row else TOTAL_CREATE_LIMIT_DEFAULT
+    finally:
+        conn.close()
+
+
+def db_set_total_create_limit(value: int) -> int:
+    value=min(1000,max(1,int(value)))
+    conn=db_connect()
+    try:
+        conn.execute("INSERT INTO security_settings(key,value) VALUES('total_create_limit',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(value),))
+    finally:
+        conn.close()
+    return value
+
+
+def db_is_user_suspended(user_id: int) -> tuple[bool,str]:
+    conn=db_connect()
+    try:
+        row=conn.execute("SELECT until_at,reason FROM user_suspensions WHERE user_id=?",(int(user_id),)).fetchone()
+    finally: conn.close()
+    if not row: return False, ""
+    try:
+        until=datetime.fromisoformat(row[0])
+        if until <= datetime.now(timezone.utc):
+            conn=db_connect(); conn.execute("DELETE FROM user_suspensions WHERE user_id=?",(int(user_id),)); conn.close()
+            return False, ""
+        return True, f"until {until.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    except (TypeError,ValueError):
+        return False, ""
+
+
+def db_set_user_suspension(user_id: int, until: datetime, reason: str='Administrative suspension') -> None:
+    conn=db_connect()
+    try:
+        conn.execute("INSERT INTO user_suspensions(user_id,until_at,reason) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET until_at=excluded.until_at,reason=excluded.reason",(int(user_id),until.astimezone(timezone.utc).isoformat(),reason[:200]))
+    finally: conn.close()
+
+
+def db_clear_user_suspension(user_id: int) -> None:
+    conn=db_connect()
+    try: conn.execute("DELETE FROM user_suspensions WHERE user_id=?",(int(user_id),))
+    finally: conn.close()
+
+
 def db_is_banned(user_id: int) -> bool:
     conn = db_connect()
     try:
@@ -896,6 +1117,8 @@ def db_insert_vps(**data: Any) -> int:
         "disk": data["disk"],
         "sshx_url": data.get("sshx_url"),
         "sshx_pid": data.get("sshx_pid"),
+        "ssh_password": data.get("ssh_password"),
+        "critical": int(data.get("critical", 0) or 0),
         "public_ipv4": data.get("public_ipv4"),
         "ipv4_verified_at": data.get("ipv4_verified_at"),
         "created_at": data.get("created_at", now),
@@ -1095,7 +1318,7 @@ def db_find_vps(user_id: int, identifier: str | None, admin: bool = False) -> sq
     return partial[0] if len(partial) == 1 else None
 
 
-def db_share_vps(vps_id: int, user_id: int, shared_by: int) -> tuple[bool, str]:
+def db_share_vps(vps_id: int, user_id: int, shared_by: int, access_level: str = "manage") -> tuple[bool, str]:
     if int(user_id) == int(shared_by):
         return False, "You cannot share a VPS with yourself."
     conn = db_connect()
@@ -1103,8 +1326,8 @@ def db_share_vps(vps_id: int, user_id: int, shared_by: int) -> tuple[bool, str]:
         if conn.execute("SELECT 1 FROM vps WHERE id=?", (vps_id,)).fetchone() is None:
             return False, "VPS not found."
         cur = conn.execute(
-            "INSERT OR IGNORE INTO vps_shares(vps_id,user_id,shared_by,created_at) VALUES(?,?,?,?)",
-            (vps_id, user_id, shared_by, utc_now()),
+            "INSERT OR IGNORE INTO vps_shares(vps_id,user_id,shared_by,created_at,access_level) VALUES(?,?,?,?,?)",
+            (vps_id, user_id, shared_by, utc_now(), "full" if str(access_level).lower() == "full" else "manage"),
         )
         if cur.rowcount == 0:
             return False, "That user already has access to this VPS."
@@ -1144,12 +1367,26 @@ def db_find_accessible_vps(user_id: int, identifier: str | None) -> sqlite3.Row 
     return partial[0] if len(partial) == 1 else None
 
 
+def db_share_access_level(vps_id: int, user_id: int) -> str | None:
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT access_level FROM vps_shares WHERE vps_id=? AND user_id=?",
+            (int(vps_id), int(user_id)),
+        ).fetchone()
+        if not row:
+            return None
+        return "full" if str(row[0]).lower() == "full" else "manage"
+    finally:
+        conn.close()
+
+
 def db_is_owner_or_admin(user_id: int, vps: sqlite3.Row) -> bool:
     return int(user_id) == int(vps["user_id"]) or (ADMIN_ID > 0 and int(user_id) == int(ADMIN_ID))
 
 
 def db_update_vps(container_id: str, **fields: Any) -> None:
-    allowed = {"status", "suspended", "ssh_command", "sshx_url", "sshx_pid", "os_type", "location", "hostname", "public_ipv4", "ipv4_verified_at", "backend", "ptero_server_id", "ptero_identifier", "ptero_user_id"}
+    allowed = {"status", "suspended", "ssh_command", "sshx_url", "sshx_pid", "ssh_password", "critical", "os_type", "location", "hostname", "public_ipv4", "ipv4_verified_at", "backend", "ptero_server_id", "ptero_identifier", "ptero_user_id"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return
@@ -1224,14 +1461,6 @@ def db_get_snapshot(vps_id: int, name: str) -> sqlite3.Row | None:
             "SELECT * FROM vps_snapshots WHERE vps_id=? AND lower(name)=lower(?)",
             (int(vps_id), name),
         ).fetchone()
-    finally:
-        conn.close()
-
-
-def db_delete_all_snapshots(vps_id: int) -> None:
-    conn = db_connect()
-    try:
-        conn.execute("DELETE FROM vps_snapshots WHERE vps_id=?", (int(vps_id),))
     finally:
         conn.close()
 
@@ -1315,566 +1544,12 @@ async def spawn_detached(*args: str) -> tuple[int | None, str]:
         return None, str(exc)
 
 
-# ================================================================
-# QEMU real VM backend — TCG only, no KVM required
-# ================================================================
-
-def qemu_vm_dir(vm_id: str) -> Path:
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(vm_id)).strip("-._") or "vm"
-    return QEMU_VM_ROOT / safe
-
-
-def qemu_meta_path(vm_id: str) -> Path:
-    return qemu_vm_dir(vm_id) / "vm.json"
-
-
-def qemu_load_meta(vm_id: str) -> dict[str, Any] | None:
-    try:
-        data = json.loads(qemu_meta_path(vm_id).read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return None
-
-
-def qemu_save_meta(vm_id: str, data: dict[str, Any]) -> None:
-    directory = qemu_vm_dir(vm_id)
-    directory.mkdir(parents=True, exist_ok=True)
-    temp = directory / "vm.json.tmp"
-    temp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    temp.replace(qemu_meta_path(vm_id))
-
-
-def qemu_process_alive(pid: int | str | None) -> bool:
-    try:
-        number = int(pid or 0)
-        if number <= 1:
-            return False
-        os.kill(number, 0)
-        cmdline = Path(f"/proc/{number}/cmdline")
-        if cmdline.exists():
-            text = cmdline.read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
-            if "qemu-system" not in text.lower():
-                return False
-        return True
-    except (OSError, ValueError):
-        return False
-
-
-def qemu_binary() -> str | None:
-    return shutil.which("qemu-system-x86_64")
-
-
-def qemu_seed_builder() -> str | None:
-    return shutil.which("cloud-localds") or shutil.which("genisoimage") or shutil.which("xorriso")
-
-
-def qemu_os_from_image(image: str) -> str | None:
-    value = str(image or "").lower()
-    mapping = {
-        "ubuntu-22.04": ("ubuntu:22.04", "jammy"),
-        "ubuntu-24.04": ("ubuntu:24.04", "noble"),
-        "ubuntu-26.04": ("ubuntu:26.04", "resolute"),
-        "debian-11": ("debian:11", "bullseye"),
-        "debian-12": ("debian:12", "bookworm"),
-        "debian-13": ("debian:13", "trixie"),
-    }
-    for os_name, tokens in mapping.items():
-        if any(token in value for token in tokens):
-            return os_name
-    return None
-
-
-async def qemu_host_prepare(progress: Callable[[str], Awaitable[None]] | None = None) -> tuple[bool, str]:
-    QEMU_VM_ROOT.mkdir(parents=True, exist_ok=True)
-    QEMU_IMAGE_CACHE.mkdir(parents=True, exist_ok=True)
-
-    def missing_tools() -> list[str]:
-        missing: list[str] = []
-        if not qemu_binary():
-            missing.append("qemu-system-x86_64")
-        if not shutil.which("qemu-img"):
-            missing.append("qemu-img")
-        if not qemu_seed_builder():
-            missing.append("cloud-localds/genisoimage/xorriso")
-        if not shutil.which("ssh"):
-            missing.append("ssh client")
-        if not shutil.which("ssh-keygen"):
-            missing.append("ssh-keygen")
-        return missing
-
-    missing = missing_tools()
-    if not missing:
-        return True, "QEMU TCG host tools are ready; KVM is disabled and never used."
-
-    if progress is not None:
-        with contextlib.suppress(Exception):
-            await progress("Installing missing QEMU host tools")
-
-    if not QEMU_AUTO_INSTALL_HOST_TOOLS:
-        return False, "Missing QEMU host tools: " + ", ".join(missing) + "."
-
-    if not hasattr(os, "geteuid") or os.geteuid() != 0:
-        return False, (
-            "Missing QEMU host tools: " + ", ".join(missing) +
-            ". Automatic installation requires root; install QEMU system emulator, "
-            "qemu-img, a NoCloud ISO builder (cloud-localds/genisoimage/xorriso), "
-            "and OpenSSH client on the host."
-        )
-
-    env = os.environ.copy()
-    env["DEBIAN_FRONTEND"] = "noninteractive"
-
-    async def install_with(manager: str, packages: list[str]) -> bool:
-        try:
-            if manager == "apt-get":
-                rc, _, _ = await run_process(
-                    "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update", "-y", timeout=300
-                )
-                if rc != 0:
-                    return False
-                rc, _, _ = await run_process(
-                    "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
-                    "-o", "Dpkg::Options::=--force-confdef",
-                    "-o", "Dpkg::Options::=--force-confold",
-                    "--no-install-recommends", *packages, timeout=900
-                )
-                return rc == 0
-            if manager in {"dnf", "yum"}:
-                rc, _, _ = await run_process(manager, "-y", "install", *packages, timeout=900)
-                return rc == 0
-            if manager == "apk":
-                rc, _, _ = await run_process(manager, "add", "--no-cache", *packages, timeout=900)
-                return rc == 0
-            if manager == "pacman":
-                rc, _, _ = await run_process(manager, "-Sy", "--noconfirm", *packages, timeout=900)
-                return rc == 0
-        except Exception as exc:
-            logger.warning("QEMU host package installation failed via %s: %s", manager, safe_log(exc))
-        return False
-
-    if progress is not None:
-        with contextlib.suppress(Exception):
-            await progress("Detecting host package manager")
-
-    if shutil.which("apt-get"):
-        await install_with("apt-get", [
-            "qemu-system-x86", "qemu-utils", "cloud-image-utils", "genisoimage", "xorriso", "openssh-client",
-        ])
-    elif shutil.which("dnf"):
-        await install_with("dnf", ["qemu-system-x86-core", "qemu-img", "xorriso", "openssh-clients"])
-    elif shutil.which("yum"):
-        await install_with("yum", ["qemu-system-x86-core", "qemu-img", "xorriso", "openssh-clients"])
-    elif shutil.which("apk"):
-        await install_with("apk", ["qemu-system-x86_64", "qemu-img", "xorriso", "openssh-client"])
-    elif shutil.which("pacman"):
-        await install_with("pacman", ["qemu-desktop", "qemu-img", "xorriso", "openssh"])
-
-    missing = missing_tools()
-    if missing:
-        return False, "Missing QEMU host tools after installation attempt: " + ", ".join(missing) + "."
-    return True, "QEMU TCG host tools are ready; KVM is disabled and never used."
-
-
-async def qemu_download_base(os_type: str) -> tuple[bool, str, Path | None]:
-    url = QEMU_IMAGE_URLS.get(os_type)
-    if not url:
-        return False, f"No official QEMU image is configured for {os_type}.", None
-    target = QEMU_IMAGE_CACHE / re.sub(r"[^A-Za-z0-9_.-]+", "-", url.rsplit("/", 1)[-1])
-    if target.exists() and target.stat().st_size > 1024 * 1024:
-        rc, _, _ = await run_process("qemu-img", "info", str(target), timeout=30)
-        if rc == 0:
-            return True, "", target
-    partial = target.with_suffix(target.suffix + ".part")
-    with contextlib.suppress(OSError):
-        partial.unlink()
-    rc, _, err = await run_process(
-        "curl", "-fL", "--retry", "3", "--retry-delay", "2",
-        "--connect-timeout", "20", "--max-time", "900", "-o", str(partial),
-        url, timeout=930,
-    )
-    if rc != 0:
-        with contextlib.suppress(OSError):
-            partial.unlink()
-        return False, safe_log(err.decode("utf-8", "replace").strip() or "QEMU image download failed."), None
-    rc, _, err = await run_process("qemu-img", "info", str(partial), timeout=30)
-    if rc != 0:
-        with contextlib.suppress(OSError):
-            partial.unlink()
-        return False, safe_log(err.decode("utf-8", "replace").strip() or "Downloaded QEMU image is invalid."), None
-    partial.replace(target)
-    return True, "", target
-
-
-def qemu_free_port() -> int | None:
-    reserved: set[int] = set()
-    with contextlib.suppress(OSError):
-        for child in QEMU_VM_ROOT.iterdir():
-            if not child.is_dir() or child.name == "_images":
-                continue
-            meta = qemu_load_meta(child.name)
-            if meta and qemu_process_alive(meta.get("pid")):
-                with contextlib.suppress(TypeError, ValueError):
-                    reserved.add(int(meta.get("ssh_port", 0)))
-    for port in range(QEMU_SSH_PORT_START, QEMU_SSH_PORT_END + 1):
-        if port in reserved:
-            continue
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind(("127.0.0.1", port))
-            return port
-        except OSError:
-            continue
-    return None
-
-
-def qemu_cloud_config(hostname: str, pubkey: str) -> str:
-    return f"""#cloud-config
-users:
-  - default
-  - name: {QEMU_SSH_USER}
-    gecos: RGNODES
-    groups: [sudo]
-    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
-    shell: /bin/bash
-    lock_passwd: true
-    ssh_authorized_keys:
-      - {pubkey.strip()}
-ssh_pwauth: false
-write_files:
-  - path: /etc/ssh/sshd_config.d/99-rgnodes.conf
-    permissions: '0644'
-    content: |
-      PasswordAuthentication no
-      PubkeyAuthentication yes
-      PermitRootLogin prohibit-password
-      UseDNS no
-  - path: /usr/local/sbin/rgnodes-firstboot.sh
-    permissions: '0755'
-    content: |
-      #!/bin/bash
-      set +e
-      mkdir -p /etc/rgnodes /var/lib/rgnodes
-      export DEBIAN_FRONTEND=noninteractive
-      if [ -f /etc/debian_version ]; then
-        . /etc/os-release
-        if [ "${{VERSION_CODENAME:-}}" = "bullseye" ]; then
-          sed -i -E 's#https?://[^ ]*debian.org/debian#http://archive.debian.org/debian#g; s#https?://security.debian.org/debian-security#http://archive.debian.org/debian-security#g' /etc/apt/sources.list 2>/dev/null || true
-          printf '%s\\n' 'Acquire::Check-Valid-Until "false";' >/etc/apt/apt.conf.d/99rgnodes-bullseye
-        fi
-      fi
-      dpkg --configure -a -D777 >/var/log/rgnodes-dpkg.log 2>&1 || true
-      apt-get update -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold >/var/log/rgnodes-apt-update.log 2>&1 || true
-      apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold curl ca-certificates sudo openssh-server bash coreutils procps >/var/log/rgnodes-base.log 2>&1 || true
-      mkdir -p /run/sshd /var/run/sshd
-      sshd -t >/var/log/rgnodes-sshd-test.log 2>&1 || true
-      systemctl enable ssh.service >/dev/null 2>&1 || systemctl enable sshd.service >/dev/null 2>&1 || true
-      systemctl restart ssh.service >/dev/null 2>&1 || systemctl restart sshd.service >/dev/null 2>&1 || true
-      printf '%s\\n' 'ready=1' >/etc/rgnodes/.system-ready
-      printf '%s\\n' 'accelerator=tcg' >/etc/rgnodes/virtualization
-      touch /var/lib/rgnodes/cloud-init-complete
-runcmd:
-  - [bash, /usr/local/sbin/rgnodes-firstboot.sh]
-final_message: 'RGNODES QEMU TCG VPS is ready.'
-"""
-
-
-async def qemu_build_seed(vm_id: str, hostname: str, pubkey: str) -> tuple[bool, str, Path | None]:
-    directory = qemu_vm_dir(vm_id)
-    directory.mkdir(parents=True, exist_ok=True)
-    user_data = directory / "user-data"
-    meta_data = directory / "meta-data"
-    seed = directory / "seed.iso"
-    user_data.write_text(qemu_cloud_config(hostname, pubkey), encoding="utf-8")
-    meta_data.write_text(f"instance-id: rgnodes-{vm_id}\nlocal-hostname: {hostname}\n", encoding="utf-8")
-    builder = qemu_seed_builder()
-    if not builder:
-        return False, "No cloud-init seed builder is installed.", None
-    if Path(builder).name == "cloud-localds":
-        rc, _, err = await run_process(builder, str(seed), str(user_data), str(meta_data), timeout=60)
-    elif Path(builder).name == "genisoimage":
-        rc, _, err = await run_process(builder, "-quiet", "-output", str(seed), "-volid", "CIDATA", "-joliet", "-rock", str(user_data), str(meta_data), timeout=60)
-    else:
-        rc, _, err = await run_process(builder, "-as", "mkisofs", "-quiet", "-o", str(seed), "-V", "CIDATA", "-J", "-R", str(user_data), str(meta_data), timeout=60)
-    if rc != 0 or not seed.exists() or seed.stat().st_size < 4096:
-        return False, safe_log(err.decode("utf-8", "replace").strip() or "Cloud-init seed creation failed."), None
-    return True, "", seed
-
-
-def qemu_command(meta: dict[str, Any], port_forwards: list[tuple[int, int]] | None = None, *, legacy_tcg: bool = False, machine: str | None = None) -> list[str]:
-    net = f"user,id=net0,hostfwd=tcp:127.0.0.1:{int(meta['ssh_port'])}-:22"
-    for host_port, guest_port in port_forwards or []:
-        net += f",hostfwd=tcp:0.0.0.0:{int(host_port)}-:{int(guest_port)}"
-    accel_args = ["-accel", "tcg"] if legacy_tcg else ["-accel", "tcg,thread=multi"]
-    return [
-        qemu_binary() or "qemu-system-x86_64",
-        "-name", str(meta.get("name") or "rgnodes-vm"),
-        "-machine", machine or str(meta.get("machine") or "q35"),
-        *accel_args,
-        "-cpu", "max",
-        "-m", str(meta.get("ram") or "1G"),
-        "-smp", str(meta.get("cpu") or "1"),
-        "-boot", "order=c,menu=off",
-        "-drive", f"file={meta['disk_path']},if=virtio,format=qcow2,cache=writeback,aio=threads",
-        "-drive", f"file={meta['seed_path']},media=cdrom,readonly=on",
-        "-netdev", net,
-        "-device", "virtio-net-pci,netdev=net0",
-        "-display", "none",
-        "-serial", f"file:{meta['log_path']}",
-        "-monitor", "none",
-        "-no-reboot",
-        "-daemonize",
-        "-pidfile", str(meta["pid_path"]),
-    ]
-
-
-async def qemu_launch(vm_id: str, port_forwards: list[tuple[int, int]] | None = None) -> tuple[bool, str]:
-    meta = qemu_load_meta(vm_id)
-    if not meta:
-        return False, "QEMU VM metadata is missing."
-    if qemu_process_alive(meta.get("pid")):
-        return True, ""
-    with contextlib.suppress(OSError):
-        Path(str(meta["pid_path"])).unlink()
-
-    last_error = "QEMU failed to start."
-    variants = [
-        (False, str(meta.get("machine") or "q35")),
-        (True, str(meta.get("machine") or "q35")),
-        (True, "pc"),
-    ]
-    for legacy_tcg, machine in variants:
-        rc, out, err = await run_process(
-            *qemu_command(meta, port_forwards, legacy_tcg=legacy_tcg, machine=machine), timeout=60
-        )
-        combined = (err + out).decode("utf-8", "replace").strip()
-        if rc != 0:
-            last_error = safe_log(combined or "QEMU failed to start.")
-            text = last_error.lower()
-            if "address already in use" in text or "could not set up host forwarding" in text or "bind() failed" in text:
-                return False, last_error
-            continue
-        await asyncio.sleep(1)
-        try:
-            pid = int(Path(str(meta["pid_path"])).read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            last_error = "QEMU started without producing a valid PID file."
-            continue
-        meta["pid"] = pid
-        meta["machine"] = machine
-        meta["tcg_legacy"] = legacy_tcg
-        qemu_save_meta(vm_id, meta)
-        if qemu_process_alive(pid):
-            return True, ""
-        last_error = "QEMU exited immediately; inspect the VM serial log."
-    return False, last_error
-
-
-async def qemu_create_vm(*, os_type: str, hostname: str, ram: str, cpu: str, disk: str, name: str, persistent_key: str | None = None) -> tuple[str | None, str]:
-    normalized = normalize_os(os_type) or qemu_os_from_image(os_type)
-    if not normalized:
-        return None, f"Unsupported QEMU operating system: {os_type}"
-    ok, detail = await qemu_host_prepare()
-    if not ok:
-        return None, detail
-    base_ok, base_detail, base = await qemu_download_base(normalized)
-    if not base_ok or base is None:
-        return None, base_detail
-    # qemu-img resolves a relative backing-file path relative to the new
-    # overlay's directory. Always pass the canonical absolute path so an
-    # overlay under <vm>/ does not accidentally become <vm>/<cache>/... .
-    base = base.expanduser().resolve()
-    if not base.is_file():
-        return None, f"Base QEMU image is missing after download: {base}"
-
-    vm_id = "qemu-" + uuid.uuid4().hex[:24]
-    directory = qemu_vm_dir(vm_id)
-    directory.mkdir(parents=True, exist_ok=True)
-    try:
-        ssh_port = qemu_free_port()
-        if not ssh_port:
-            raise RuntimeError("No free local SSH forwarding port is available.")
-
-        priv = directory / "id_ed25519"
-        pub = directory / "id_ed25519.pub"
-        rc, _, err = await run_process(
-            "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(priv), timeout=30
-        )
-        if rc != 0 or not pub.exists():
-            raise RuntimeError(safe_log(err.decode("utf-8", "replace").strip() or "SSH key generation failed."))
-        os.chmod(priv, 0o600)
-
-        seed_ok, seed_detail, seed = await qemu_build_seed(
-            vm_id, hostname, pub.read_text(encoding="utf-8").strip()
-        )
-        if not seed_ok or seed is None:
-            raise RuntimeError(seed_detail or "Cloud-init seed creation failed.")
-
-        disk_path = directory / "disk.qcow2"
-        rc_info, out_info, _ = await run_process(
-            "qemu-img", "info", "--output=json", str(base), timeout=30
-        )
-        backing_format = "qcow2"
-        if rc_info == 0:
-            with contextlib.suppress(ValueError, TypeError, json.JSONDecodeError):
-                image_info = json.loads(out_info.decode("utf-8", "replace"))
-                candidate = str(image_info.get("format") or "").strip().lower()
-                if re.fullmatch(r"[a-z0-9_-]+", candidate):
-                    backing_format = candidate
-        rc, _, err = await run_process(
-            "qemu-img", "create", "-f", "qcow2", "-F", backing_format, "-b", str(base),
-            str(disk_path.resolve()), str(disk), timeout=120
-        )
-        if rc != 0:
-            raise RuntimeError(safe_log(err.decode("utf-8", "replace").strip() or "VM disk creation failed."))
-
-        # Validate the newly-created overlay before booting it.
-        rc, _, err = await run_process("qemu-img", "check", "-f", "qcow2", str(disk_path.resolve()), timeout=120)
-        if rc != 0:
-            raise RuntimeError(safe_log(err.decode("utf-8", "replace").strip() or "VM disk validation failed."))
-
-        meta = {
-            "name": name, "hostname": hostname, "os_type": normalized,
-            "ram": ram, "cpu": cpu, "disk": disk, "ssh_port": ssh_port,
-            "ssh_user": QEMU_SSH_USER, "ssh_private_key": str(priv),
-            "ssh_public_key": str(pub.resolve()), "disk_path": str(disk_path.resolve()),
-            "seed_path": str(seed.resolve()), "log_path": str((directory / "serial.log").resolve()),
-            "pid_path": str((directory / "qemu.pid").resolve()), "base_path": str(base),
-            "accelerator": "tcg", "kvm": False,
-            "persistent_key": str(persistent_key or name),
-            "created_at": utc_now(), "pid": None, "machine": "q35",
-        }
-        qemu_save_meta(vm_id, meta)
-        started, start_detail = await qemu_launch(vm_id)
-        if not started:
-            raise RuntimeError(start_detail or "QEMU VM failed to start.")
-        return vm_id, ""
-    except Exception as exc:
-        with contextlib.suppress(Exception):
-            await qemu_stop_vm(vm_id)
-        with contextlib.suppress(OSError):
-            shutil.rmtree(directory)
-        return None, safe_log(exc)
-
-
-async def qemu_ssh(vm_id: str, command: str, timeout: float = ACCESS_TIMEOUT) -> tuple[int, bytes, bytes]:
-    meta = qemu_load_meta(vm_id)
-    if not meta:
-        return 1, b"", b"QEMU VM metadata is missing."
-    port = int(meta.get("ssh_port", 0))
-    priv = Path(str(meta.get("ssh_private_key", "")))
-    user = str(meta.get("ssh_user") or QEMU_SSH_USER)
-    if not port or not priv.exists():
-        return 1, b"", b"QEMU VM SSH configuration is missing."
-    return await run_process(
-        "ssh", "-i", str(priv), "-p", str(port), "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=2",
-        "-o", "IdentitiesOnly=yes", "-o", "PreferredAuthentications=publickey",
-        "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-        f"{user}@127.0.0.1", "bash", "-lc", command, timeout=timeout,
-    )
-
-
-async def qemu_state(vm_id: str) -> str | None:
-    meta = qemu_load_meta(vm_id)
-    if not meta:
-        return None
-    return "running" if qemu_process_alive(meta.get("pid")) else "stopped"
-
-
-async def qemu_stop_vm(vm_id: str) -> bool:
-    meta = qemu_load_meta(vm_id)
-    if not meta:
-        return False
-    pid = meta.get("pid")
-    if not qemu_process_alive(pid):
-        meta["pid"] = None
-        qemu_save_meta(vm_id, meta)
-        return True
-    with contextlib.suppress(OSError, ValueError):
-        os.kill(int(pid), signal.SIGTERM)
-    for _ in range(30):
-        if not qemu_process_alive(pid):
-            meta["pid"] = None
-            qemu_save_meta(vm_id, meta)
-            return True
-        await asyncio.sleep(0.5)
-    with contextlib.suppress(OSError, ValueError):
-        os.kill(int(pid), signal.SIGKILL)
-    meta["pid"] = None
-    qemu_save_meta(vm_id, meta)
-    return True
-
-
-async def qemu_remove_vm(vm_id: str) -> bool:
-    await qemu_stop_vm(vm_id)
-    try:
-        shutil.rmtree(qemu_vm_dir(vm_id))
-        return True
-    except OSError:
-        return False
-
-
-def qemu_running_forwards(vps_id: int | None) -> list[tuple[int, int]]:
-    if vps_id is None:
-        return []
-    forwards: list[tuple[int, int]] = []
-    try:
-        rows = db_list_ports(int(vps_id))
-    except Exception:
-        return forwards
-    for row in rows:
-        try:
-            if str(row["protocol"]).lower() != "tcp":
-                continue
-            if str(row["status"]).lower() != "running":
-                continue
-            host_port = int(row["host_port"])
-            guest_port = int(row["container_port"])
-            if 1 <= host_port <= 65535 and 1 <= guest_port <= 65535:
-                forwards.append((host_port, guest_port))
-        except (TypeError, ValueError, KeyError):
-            continue
-    # Stable de-duplication protects QEMU from duplicate hostfwd definitions.
-    return list(dict.fromkeys(forwards))
-
-
-async def qemu_restart_vm(vm_id: str, vps_id: int | None = None) -> tuple[bool, str]:
-    await qemu_stop_vm(vm_id)
-    return await qemu_launch(vm_id, qemu_running_forwards(vps_id))
-
-
-async def _wait_qemu_ready(container: str) -> tuple[bool, str]:
-    deadline = asyncio.get_running_loop().time() + QEMU_BOOT_TIMEOUT
-    last = "Waiting for the real VM to boot and cloud-init to finish."
-    while asyncio.get_running_loop().time() < deadline:
-        if await qemu_state(container) != "running":
-            meta = qemu_load_meta(container) or {}
-            log_path = Path(str(meta.get("log_path", "")))
-            text = ""
-            if log_path.exists():
-                with contextlib.suppress(OSError):
-                    text = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:])
-            return False, "QEMU VM stopped during boot." + (("\nSerial log:\n" + safe_log(text, 3000)) if text else "")
-        ok, detail = await guest_system_ready(container)
-        if ok:
-            return True, detail
-        last = detail
-        await asyncio.sleep(3)
-    return False, f"QEMU VPS readiness timed out after {QEMU_BOOT_TIMEOUT}s. Last check: {last}"
-
-
 async def docker_exists(container: str) -> bool:
-    if qemu_load_meta(container):
-        return True
     rc, _, _ = await docker_cli("inspect", container, timeout=20, retries=1)
     return rc == 0
 
 
 async def docker_state(container: str) -> str | None:
-    if qemu_load_meta(container):
-        return await qemu_state(container)
     rc, out, _ = await docker_cli("inspect", "-f", "{{.State.Status}}", container, timeout=20, retries=1)
     if rc != 0:
         return None
@@ -1969,9 +1644,7 @@ async def _start_docker_daemon() -> tuple[bool, str]:
 
 
 async def docker_info() -> tuple[bool, str]:
-    """Return readiness for the active VM backend."""
-    if active_backend() == "qemu":
-        return await qemu_host_prepare()
+    """Return Docker readiness without silently changing host service state."""
     if not command_available("docker"):
         return False, (
             "Docker CLI is not installed. Run `/install-system confirm:true` "
@@ -1996,23 +1669,6 @@ async def docker_info() -> tuple[bool, str]:
 
 
 async def docker_running_count() -> tuple[bool, int]:
-    if active_backend() == "qemu":
-        count = 0
-        try:
-            for child in QEMU_VM_ROOT.iterdir():
-                if child.is_dir() and child.name != "_images":
-                    meta_path = child / "vm.json"
-                    if not meta_path.exists():
-                        continue
-                    try:
-                        data = json.loads(meta_path.read_text(encoding="utf-8"))
-                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                        continue
-                    if qemu_process_alive(data.get("pid")):
-                        count += 1
-            return True, count
-        except OSError as exc:
-            return False, db_running_count()
     # Do not depend only on labels: older Docker clients may not advertise --label.
     # The RGNODES namespace is the canonical container-name prefix as well.
     rc, out, _ = await docker_cli("ps", "--format", "{{.ID}}\t{{.Names}}", timeout=20, retries=1)
@@ -2027,12 +1683,6 @@ async def docker_running_count() -> tuple[bool, int]:
 
 
 async def docker_pull(image: str) -> tuple[bool, str]:
-    if active_backend() == "qemu":
-        os_name = qemu_os_from_image(image)
-        if not os_name:
-            return False, f"Unsupported QEMU image mapping: {image}"
-        ok, detail, _ = await qemu_download_base(os_name)
-        return ok, detail
     rc, _, err = await docker_cli("pull", image, timeout=IMAGE_PULL_TIMEOUT, retries=2)
     if rc == 0:
         return True, ""
@@ -2059,14 +1709,7 @@ async def docker_run_features() -> set[str]:
         rc, out, _ = await docker_cli("run", "--help", timeout=20, retries=0)
         if rc == 0:
             text = out.decode("utf-8", "replace")
-            for flag in (
-                "--init", "--pids-limit", "--storage-opt", "--cpus",
-                "--memory", "--memory-reservation", "--memory-swap",
-                "--memory-swappiness", "--restart", "--hostname", "--name",
-                "--label", "--log-driver", "--log-opt", "--privileged",
-                "--tmpfs", "--mount", "--device", "--cgroupns",
-                "--security-opt", "--stop-signal",
-            ):
+            for flag in ("--init", "--pids-limit", "--storage-opt", "--cpus", "--memory", "--memory-reservation", "--memory-swap", "--memory-swappiness", "--restart", "--hostname", "--name", "--label", "--log-driver", "--log-opt", "--privileged", "--tmpfs", "--mount", "--security-opt", "--cgroupns", "--stop-signal"):
                 if flag in text:
                     features.add(flag)
         DOCKER_RUN_FEATURES = features
@@ -2084,11 +1727,6 @@ def feature_error(text: str) -> bool:
 
 GUEST_BOOTSTRAP_SCRIPT = r"""#!/bin/bash
 set -Eeuo pipefail
-BOOTSTRAP_LOG=/var/lib/rgnodes/bootstrap.log
-mkdir -p /var/lib/rgnodes
-exec 3>>"$BOOTSTRAP_LOG"
-log_bootstrap_error() { rc=$?; printf '[RGNODES guest] bootstrap command failed rc=%s line=%s\n' "$rc" "${BASH_LINENO[0]:-0}" >&3; }
-trap log_bootstrap_error ERR
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 # Prevent apt helper calls from trying to control services before PID 1 is
@@ -2105,8 +1743,34 @@ printf 'named-volumes=enabled\ncontainer-delete=preserve-volumes\n' >"$PERSISTEN
 
 log() { printf '[RGNODES guest] %s\\n' "$*"; }
 
+prepare_os_repositories() {
+    if [ -f /etc/debian_version ] && [ -f /etc/os-release ]; then
+        . /etc/os-release
+        if [ "${VERSION_CODENAME:-}" = "bullseye" ]; then
+            find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -print -delete 2>/dev/null || true
+            sed -i -E 's#https?://(deb\.|security\.|ftp\.)?debian.org/debian#http://archive.debian.org/debian#g; s#https?://security.debian.org/debian-security#http://archive.debian.org/debian-security#g' /etc/apt/sources.list 2>/dev/null || true
+            printf '%s\n' 'Acquire::Check-Valid-Until "false";' >/etc/apt/apt.conf.d/99rgnodes-bullseye
+            printf '%s\n' 'Acquire::Retries "3";' >/etc/apt/apt.conf.d/80rgnodes-retries
+            printf '%s\n' 'APT::Get::Assume-Yes "true";' >/etc/apt/apt.conf.d/80rgnodes-noninteractive
+        fi
+    fi
+}
+
+
 # Packages are installed with service auto-start disabled. Services are started
 # later by systemd after PID 1 has actually become systemd.
+install_dpkg_policy() {
+    mkdir -p /etc/apt/apt.conf.d
+    cat >/etc/apt/apt.conf.d/99rgnodes-noninteractive <<'EOF_APT'
+Dpkg::Options {
+  "--force-confdef";
+  "--force-confold";
+};
+APT::Get::Assume-Yes "true";
+Acquire::Retries "3";
+EOF_APT
+}
+
 install_policy() {
     cat >/usr/sbin/policy-rc.d <<'EOF'
 #!/bin/sh
@@ -2116,210 +1780,100 @@ EOF
 }
 remove_policy() { rm -f /usr/sbin/policy-rc.d; }
 
-prepare_apt_sources() {
-    local id codename backup_dir f
-    id="$(. /etc/os-release && printf '%s' "${ID:-}")"
-    codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
-
-    # A single non-interactive APT/Dpkg policy applies to every supported OS.
-    # This is critical when /etc contains persistent files from an earlier
-    # installation: dpkg must never wait for stdin on a conffile question.
-    cat >/etc/apt/apt.conf.d/99rgnodes-noninteractive <<'EOF'
-Dpkg::Options {
-  "--force-confdef";
-  "--force-confold";
-};
-Dpkg::Use-Pty "0";
-APT::Get::Assume-Yes "true";
-Acquire::Retries "3";
-EOF
-    export APT_LISTCHANGES_FRONTEND=none
-    export UCF_FORCE_CONFOLD=1
-    export UCF_FORCE_CONFFNEW=0
-
-    # Override apt-get inside this bootstrap so every package operation receives
-    # the same conffile policy, including operations in later helper functions.
-    apt-get() {
-        command apt-get \
-            -o Dpkg::Options::=--force-confdef \
-            -o Dpkg::Options::=--force-confold \
-            -o Dpkg::Use-Pty=0 \
-            "$@"
-    }
-
-    # Debian 11 is archived. Disable stale third-party sources and use the
-    # coherent Bullseye archive snapshot instead of mixing repositories.
-    if [ "$id" = "debian" ] && [ "$codename" = "bullseye" ]; then
-        backup_dir=/etc/apt/rgnodes-disabled-sources
-        mkdir -p "$backup_dir"
-        if [ -f /etc/apt/sources.list ]; then
-            cp -an /etc/apt/sources.list "$backup_dir/sources.list.base" || true
-        fi
-        for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-            [ -f "$f" ] || continue
-            mv -f "$f" "$backup_dir/$(basename "$f").disabled" || true
-        done
-        # Bullseye base repositories are archived. Do not use Bullseye security
-        # metadata here: it became inconsistent after Bullseye LTS ended in 2026
-        # and can advertise package files that are no longer published. The base
-        # Debian 11.11 image already contains a coherent root filesystem; this
-        # source is used only for packages that are still present in the archive.
-        cat >/etc/apt/sources.list <<'EOF'
-deb http://archive.debian.org/debian bullseye main contrib non-free
-deb http://archive.debian.org/debian bullseye-updates main contrib non-free
-EOF
-        cat >/etc/apt/apt.conf.d/99rgnodes-bullseye-archive <<'EOF'
-Acquire::Check-Valid-Until "false";
-Acquire::AllowInsecureRepositories "true";
-Acquire::Retries "5";
-APT::Get::Update::Error-Mode "any";
-EOF
-        log 'Debian 11 detected: using coherent archived Bullseye base/update repositories only.'
-    fi
-
-    # Never let stale package lists from a previous image win over the current
-    # OS repositories. This keeps Ubuntu/Debian upgrades coherent as well.
-    rm -rf /var/lib/apt/lists/*
-    apt-get update -y || return 1
-}
-
 apt_install_base() {
-    apt_retry() {
-        local tries=0
-        while :; do
-            tries=$((tries + 1))
-            if "$@"; then return 0; fi
-            if [ "$tries" -ge 4 ]; then return 1; fi
-            log "APT operation failed; retry $tries/3"
-            sleep $((tries * 2))
-        done
-    }
-
-    prepare_apt_sources || {
-        echo 'Guest APT repository setup failed.' >&2
-        return 1
-    }
-
-    local id codename
-    id="$(. /etc/os-release && printf '%s' "${ID:-}")"
-    codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
-
-    # Finish interrupted unpack/configure operations, but never let dpkg ask for
-    # a conffile answer from stdin. This matters with persistent /etc/ssh data.
-    dpkg --force-confdef --force-confold --configure -a || true
-    dpkg --audit >&2 || true
-
-    # Debian 11 can enter bootstrap with an old gnupg package paired with a newer
-    # gpgv package. Because Bullseye's post-LTS security metadata is inconsistent,
-    # trying to repair that pair through the security repository can make the
-    # dependency graph strictly worse. The VPS does not need the gnupg frontend to
-    # boot systemd, and all repository helpers below can use ASCII-armored keys.
-    if [ "$id" = "debian" ] && [ "$codename" = "bullseye" ]; then
-        # The failing Bullseye state seen in the field is a mixed gnupg/gpgv pair.
-        # Keep gpgv because APT needs it, but remove only the optional GnuPG
-        # front-end packages. No systemd boot dependency requires them, and all
-        # third-party repository helpers below use signed ASCII/binary key files
-        # directly instead of invoking the gpg frontend.
-        for pkg in gnupg gnupg2 gpg gpg-agent gpgconf gpgsm dirmngr gnupg-utils gnupg-l10n gpg-wks-client gpg-wks-server; do
-            dpkg --remove --force-depends --force-remove-reinstreq "$pkg" >/dev/null 2>&1 || true
-        done
-        log 'Debian 11: removed potentially inconsistent GnuPG frontend packages; retaining gpgv for APT.'
-    fi
-
-    local essential="systemd systemd-sysv libsystemd0 dbus dbus-user-session init-system-helpers ca-certificates curl wget gpgv lsb-release bash coreutils procps psmisc iproute2 iputils-ping util-linux sudo openssh-client openssh-server tar gzip unzip xz-utils zip rsync acl openssl locales logrotate"
-    # Avoid a broad full-upgrade during guest creation. It is unnecessary for a
-    # fresh OS image and can introduce cross-suite dependency conflicts.
-    if ! apt_retry apt-get install -y --no-install-recommends --allow-downgrades --allow-change-held-packages $essential; then
-        dpkg --force-confdef --force-confold --configure -a || true
-        apt_retry apt-get -f install -y --allow-downgrades --allow-change-held-packages || true
-        apt_retry apt-get install -y --no-install-recommends --allow-downgrades --allow-change-held-packages \
-            systemd systemd-sysv libsystemd0 dbus dbus-user-session init-system-helpers \
-            ca-certificates curl wget gpgv openssh-client openssh-server || {
-            echo 'Essential guest package installation failed: systemd/SSH could not be installed.' >&2
-            apt-cache policy systemd systemd-sysv libsystemd0 gnupg gpgv >&2 || true
-            return 1
-        }
-    fi
-
-    command -v systemctl >/dev/null 2>&1 || {
-        echo 'systemctl is still unavailable after APT repair.' >&2
-        return 1
-    }
-    [ -x /lib/systemd/systemd ] || [ -x /usr/lib/systemd/systemd ] || {
-        echo 'systemd binary is missing after APT repair.' >&2
-        return 1
-    }
-
-    apt_retry apt-get install -y --no-install-recommends --allow-downgrades \
-        iptables nftables net-tools netcat-openbsd socat jq git \
-        build-essential pkg-config make gcc g++ python3 python3-pip python3-venv \
-        systemd-container dbus-x11 systemd-timesyncd systemd-resolved \
-        lsof htop tmux screen bash-completion || \
-        log 'Optional base utilities were not all installed.'
+    export DEBIAN_FRONTEND=noninteractive
+    export DEBCONF_NONINTERACTIVE_SEEN=true
+    dpkg --configure -a --force-confdef --force-confold -D777 >/var/log/rgnodes-dpkg-preflight.log 2>&1 || true
+    dpkg --configure -a --force-confdef --force-confold -D777 >/var/log/rgnodes-dpkg-repair.log 2>&1 || true
+    apt-get update -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+    apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold \
+        systemd systemd-sysv dbus dbus-user-session init-system-helpers \
+        ca-certificates curl wget gnupg lsb-release software-properties-common \
+        bash coreutils procps psmisc iproute2 iputils-ping iptables nftables \
+        util-linux net-tools netcat-openbsd socat sudo jq git \
+        tar gzip bzip2 unzip xz-utils zip rsync acl openssl \
+        make gcc g++ python3 python3-pip python3-venv \
+        openssh-client openssh-server systemd-container dbus-x11 \
+        systemd-timesyncd systemd-resolved locales logrotate ufw \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold
 }
-
 
 install_web_and_database_stack() {
     [ "__WEB_STACK__" = "1" ] || return 0
-    set +e
+
     local id codename
     id="$(. /etc/os-release && printf '%s' "${ID:-}")"
     codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
 
+    # Pterodactyl Panel currently requires PHP 8.2 or 8.3. Ubuntu 22.04
+    # needs an additional PHP repository; Debian 11/12 use packages.sury.org.
     if [ "$id" = "ubuntu" ]; then
-        case "$codename" in
-            jammy|noble) LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php >/dev/null 2>&1 || true ;;
-            *) log "Using distro PHP packages on Ubuntu $codename" ;;
-        esac
+        # Pterodactyl 1.12+ requires PHP 8.2 or 8.3. Prefer Ondrej's PHP
+        # packages on Ubuntu so supported PHP versions are available even on
+        # newer Ubuntu releases such as 26.04 when the PPA provides them.
+        LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php || true
     elif [ "$id" = "debian" ]; then
         install -m 0755 -d /etc/apt/keyrings
-        if curl -fsSL https://packages.sury.org/php/apt.gpg -o /etc/apt/keyrings/sury-php.gpg; then
+        if curl -fsSL https://packages.sury.org/php/apt.gpg \
+            -o /etc/apt/keyrings/sury-php.gpg; then
             chmod 0644 /etc/apt/keyrings/sury-php.gpg
-            printf 'deb [signed-by=/etc/apt/keyrings/sury-php.gpg] https://packages.sury.org/php/ %s main\n' "$codename" >/etc/apt/sources.list.d/php-sury.list
+            printf 'deb [signed-by=/etc/apt/keyrings/sury-php.gpg] https://packages.sury.org/php/ %s main\n' \
+                "$codename" >/etc/apt/sources.list.d/php-sury.list
         fi
     fi
 
-    if [ "$id" = "debian" ] && [ "$codename" = "bookworm" ]; then
-        if curl -fsSL https://packages.redis.io/gpg -o /etc/apt/keyrings/redis-archive-keyring.asc; then
-            chmod 0644 /etc/apt/keyrings/redis-archive-keyring.asc
-            printf 'deb [signed-by=/etc/apt/keyrings/redis-archive-keyring.asc] https://packages.redis.io/deb %s main\n' "$codename" >/etc/apt/sources.list.d/redis.list
+    # Redis repository for Debian 11/12; Debian 13 has a suitable distro
+    # package according to the current Pterodactyl dependency guide.
+    if [ "$id" = "debian" ] && { [ "$codename" = "bullseye" ] || [ "$codename" = "bookworm" ]; }; then
+        if curl -fsSL https://packages.redis.io/gpg |
+            gpg --dearmor --yes -o /etc/apt/keyrings/redis-archive-keyring.gpg; then
+            chmod 0644 /etc/apt/keyrings/redis-archive-keyring.gpg
+            printf 'deb [signed-by=/etc/apt/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb %s main\n' \
+                "$codename" >/etc/apt/sources.list.d/redis.list
         fi
+    fi
+
+    # MariaDB repo for Debian 11/12. If the external setup is unavailable,
+    # keep the distro package as a safe fallback and fail later only if its
+    # resulting version is genuinely incompatible.
+    if [ "$id" = "debian" ] && { [ "$codename" = "bullseye" ] || [ "$codename" = "bookworm" ]; }; then
         if curl -fsSL https://r.mariadb.com/downloads/mariadb_repo_setup -o /tmp/mariadb_repo_setup; then
             chmod 0755 /tmp/mariadb_repo_setup
             /tmp/mariadb_repo_setup --skip-maxscale --skip-tools || true
             rm -f /tmp/mariadb_repo_setup
         fi
-    elif [ "$id" = "debian" ] && [ "$codename" = "bullseye" ]; then
-        # Stay entirely on archived Bullseye package metadata here. Debian 11's
-        # distro MariaDB/Redis are preferable to introducing another repository
-        # into a release whose security metadata is no longer maintained.
-        rm -f /etc/apt/sources.list.d/php-sury.list /etc/apt/sources.list.d/redis.list 2>/dev/null || true
     fi
 
-    apt-get update -y || {
-        rm -f /etc/apt/sources.list.d/php-sury.list /etc/apt/sources.list.d/redis.list
-        apt-get update -y || true
-    }
-    apt-get install -y --no-install-recommends nginx certbot python3-certbot-nginx \
-        mariadb-server mariadb-client redis-server || log 'Web/database base packages were not fully installed.'
+    apt-get update -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+    apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold \
+        nginx certbot python3-certbot-nginx tar unzip git \
+        mariadb-server mariadb-client redis-server
 
     if ! apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold \
         php8.3 php8.3-common php8.3-cli php8.3-gd php8.3-mysql \
         php8.3-mbstring php8.3-bcmath php8.3-xml php8.3-tokenizer \
         php8.3-fpm php8.3-curl php8.3-zip; then
         if ! apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold \
             php8.2 php8.2-common php8.2-cli php8.2-gd php8.2-mysql \
             php8.2-mbstring php8.2-bcmath php8.2-xml php8.2-tokenizer \
             php8.2-fpm php8.2-curl php8.2-zip; then
-            apt-get install -y --no-install-recommends php php-common php-cli php-gd \
-                php-mysql php-mbstring php-bcmath php-xml php-fpm php-curl php-zip \
-                || log 'Compatible PHP package set could not be installed.'
+            apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold \
+                php php-common php-cli php-gd php-mysql php-mbstring \
+                php-bcmath php-xml php-fpm php-curl php-zip
         fi
     fi
-    set -e
-    return 0
 }
-
 
 install_docker_debian_ubuntu() {
     local id codename arch repo_url compose_arch
@@ -2334,7 +1888,8 @@ install_docker_debian_ubuntu() {
     esac
 
     # Remove only conflicting package names. Never remove Docker data.
-    apt-get remove -y docker.io docker-compose docker-compose-v2 docker-doc docker-buildx \
+    apt-get remove -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+        docker.io docker-compose docker-compose-v2 docker-doc docker-buildx \
         podman-docker containerd runc >/dev/null 2>&1 || true
 
     if [ -n "$repo_url" ] && [ -n "$codename" ]; then
@@ -2353,6 +1908,8 @@ Architectures: $arch
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
             if apt-get update -y && apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold \
                 docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
                 return 0
             fi
@@ -2360,14 +1917,23 @@ EOF
         rm -f /etc/apt/sources.list.d/docker.sources
     fi
 
-    apt-get update -y
-    apt-get install -y --no-install-recommends docker.io containerd runc
+    apt-get update -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+    apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold \
+        docker.io containerd runc
 
     if ! docker compose version >/dev/null 2>&1; then
-        apt-get install -y --no-install-recommends docker-compose-v2 docker-compose-plugin || true
+        apt-get install -y --no-install-recommends \
+            -o Dpkg::Options::=--force-confdef \
+            -o Dpkg::Options::=--force-confold \
+            docker-compose-v2 docker-compose-plugin || true
     fi
     if ! docker compose version >/dev/null 2>&1; then
-        apt-get install -y --no-install-recommends docker-compose-plugin || true
+        apt-get install -y --no-install-recommends \
+            -o Dpkg::Options::=--force-confdef \
+            -o Dpkg::Options::=--force-confold \
+            docker-compose-plugin || true
     fi
     if ! docker compose version >/dev/null 2>&1; then
         install -m 0755 -d /usr/local/lib/docker/cli-plugins
@@ -2401,20 +1967,23 @@ install_node_pm2_yarn() {
     esac
 
     if [ -n "$node_arch" ] && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-        -o /etc/apt/keyrings/nodesource.asc; then
-        chmod 0644 /etc/apt/keyrings/nodesource.asc
+        | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg; then
+        chmod 0644 /etc/apt/keyrings/nodesource.gpg
         cat >/etc/apt/sources.list.d/nodesource.sources <<EOF
 Types: deb
 URIs: https://deb.nodesource.com/node_20.x
 Suites: nodistro
 Components: main
 Architectures: $arch
-Signed-By: /etc/apt/keyrings/nodesource.asc
+Signed-By: /etc/apt/keyrings/nodesource.gpg
 EOF
         apt-get update -y || true
     fi
 
-    if ! apt-get install -y --no-install-recommends nodejs; then
+    if ! apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold \
+        nodejs; then
         true
     fi
 
@@ -2462,76 +2031,6 @@ install_composer() {
     composer --version --no-ansi | grep -Eq 'Composer version 2\.'
 }
 
-install_kvm_stack() {
-    [ "__KVM_ENABLED__" = "1" ] || return 0
-    log 'Installing QEMU/KVM/libvirt virtualization stack'
-    set +e
-    local arch qemu_pkg
-    arch="$(dpkg --print-architecture 2>/dev/null || true)"
-    qemu_pkg=""
-    case "$arch" in
-        amd64|i386) qemu_pkg='qemu-system-x86 qemu-kvm ovmf' ;;
-        arm64|armhf) qemu_pkg='qemu-system-arm' ;;
-        armel) qemu_pkg='qemu-system-arm' ;;
-        ppc64el) qemu_pkg='qemu-system-ppc' ;;
-        s390x) qemu_pkg='qemu-system-s390x' ;;
-        riscv64) qemu_pkg='qemu-system-misc' ;;
-        *) qemu_pkg='qemu-system-misc' ;;
-    esac
-
-    apt-get install -y --no-install-recommends \
-        qemu-utils qemu-system-common qemu-system-data libvirt-daemon-system \
-        libvirt-clients cloud-image-utils swtpm swtpm-tools cpu-checker \
-        bridge-utils "$qemu_pkg" >/tmp/rgnodes-qemu-install.log 2>&1 || true
-
-    command -v modprobe >/dev/null 2>&1 && modprobe kvm >/dev/null 2>&1 || true
-    if [ "$arch" = "amd64" ] || [ "$arch" = "i386" ]; then
-        command -v modprobe >/dev/null 2>&1 && \
-            (modprobe kvm_intel >/dev/null 2>&1 || modprobe kvm_amd >/dev/null 2>&1 || true)
-    fi
-
-    mkdir -p /var/lib/rgnodes
-    printf 'qemu_arch=%s\n' "$arch" >/var/lib/rgnodes/qemu-status
-    if command -v qemu-img >/dev/null 2>&1; then
-        tmp_qcow="/var/lib/rgnodes/.qemu-selftest.qcow2"
-        if qemu-img create -f qcow2 "$tmp_qcow" 1M >/dev/null 2>&1; then
-            printf 'qemu-img=selftest-ok\n' >>/var/lib/rgnodes/qemu-status
-            rm -f "$tmp_qcow"
-        else
-            printf 'qemu-img=selftest-failed\n' >>/var/lib/rgnodes/qemu-status
-        fi
-    else
-        printf 'qemu-img=missing\n' >>/var/lib/rgnodes/qemu-status
-    fi
-    if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-        printf 'kvm-device=available\n' >>/var/lib/rgnodes/qemu-status
-        if command -v kvm-ok >/dev/null 2>&1 && kvm-ok >/tmp/rgnodes-kvm-ok.log 2>&1; then
-            printf 'kvm-acceleration=available\n' >>/var/lib/rgnodes/qemu-status
-        else
-            printf 'kvm-acceleration=unverified\n' >>/var/lib/rgnodes/qemu-status
-        fi
-    else
-        printf 'kvm-device=unavailable\n' >>/var/lib/rgnodes/qemu-status
-        printf 'kvm-acceleration=unavailable\n' >>/var/lib/rgnodes/qemu-status
-    fi
-
-    # Enable libvirt only when the container really has /dev/kvm. Package
-    # installation itself must not make the VPS fail on providers without KVM.
-    if [ -e /dev/kvm ]; then
-        systemctl enable libvirtd.service >/dev/null 2>&1 || true
-        systemctl enable virtlogd.socket >/dev/null 2>&1 || true
-        systemctl enable virtlockd.socket >/dev/null 2>&1 || true
-        systemctl enable virtqemud.socket >/dev/null 2>&1 || true
-    fi
-
-    if [ -f /tmp/rgnodes-qemu-install.log ]; then
-        tail -n 12 /tmp/rgnodes-qemu-install.log >&2 || true
-    fi
-    set -e
-    return 0
-}
-
-
 install_wings() {
     [ "__INSTALL_WINGS__" = "1" ] || return 0
     local arch suffix url
@@ -2543,7 +2042,7 @@ install_wings() {
     esac
     mkdir -p /etc/pterodactyl /var/lib/pterodactyl /var/log/pterodactyl
     url="https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${suffix}"
-    if curl -fsSL --retry 3 --retry-delay 2 "$url" -o /usr/local/bin/wings; then
+    if curl -fsSL "$url" -o /usr/local/bin/wings; then
         chmod 0755 /usr/local/bin/wings
         cat >/etc/systemd/system/wings.service <<'EOF'
 [Unit]
@@ -2586,6 +2085,26 @@ repair_ssh() {
         || printf 'PermitRootLogin yes\n' >>/etc/ssh/sshd_config
     grep -Eq '^[[:space:]]*PasswordAuthentication[[:space:]]+' /etc/ssh/sshd_config \
         || printf 'PasswordAuthentication yes\n' >>/etc/ssh/sshd_config
+    mkdir -p /etc/ssh/sshd_config.d
+    cat >/etc/ssh/sshd_config.d/99-rgnodes.conf <<'EOF_SSH'
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+UseDNS no
+EOF_SSH
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow 22/tcp >/dev/null 2>&1 || true
+        ufw allow 443/tcp >/dev/null 2>&1 || true
+        ufw allow 8080/tcp >/dev/null 2>&1 || true
+        ufw allow 8443/tcp >/dev/null 2>&1 || true
+        ufw --force disable >/dev/null 2>&1 || true
+    fi
+    if [ -n "__SSH_PASSWORD__" ]; then
+        printf 'root:%s\n' '__SSH_PASSWORD__' | chpasswd || true
+        chmod 600 /etc/shadow 2>/dev/null || true
+        printf '%s\n' '__SSH_PASSWORD__' >/etc/rgnodes/ssh-password
+        chmod 600 /etc/rgnodes/ssh-password
+    fi
     ssh-keygen -A >/dev/null 2>&1 || true
     sshd -t
 }
@@ -2594,7 +2113,6 @@ install_firstboot_unit() {
     cat >/usr/local/sbin/rgnodes-firstboot-verify <<'EOF'
 #!/bin/bash
 set -Eeuo pipefail
-mkdir -p /etc/rgnodes /var/lib/rgnodes
 READY=/etc/rgnodes/.system-ready
 rm -f "$READY"
 systemctl daemon-reload
@@ -2622,10 +2140,11 @@ else
     exit 25
 fi
 
+# Optional web/database services remain installed for Pterodactyl/hosting
+# workloads, but are not started by default to keep the guest lightweight.
 for unit in nginx.service redis-server.service mariadb.service; do
     if systemctl cat "$unit" >/dev/null 2>&1; then
-        systemctl enable "$unit" >/dev/null 2>&1 || true
-        wait_active "$unit" 45 || true
+        systemctl disable "$unit" >/dev/null 2>&1 || true
     fi
 done
 
@@ -2641,6 +2160,16 @@ pm2 -v >/dev/null
 sshd -t
 command -v composer >/dev/null
 composer --version --no-ansi | grep -Eq 'Composer version 2\.'
+# Keep common web/Pterodactyl ports permitted for guests without enabling UFW
+# on hosts where an administrator deliberately manages firewall state elsewhere.
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow 22/tcp >/dev/null 2>&1 || true
+    ufw allow 80/tcp >/dev/null 2>&1 || true
+    ufw allow 443/tcp >/dev/null 2>&1 || true
+    ufw allow 8080/tcp >/dev/null 2>&1 || true
+    ufw allow 8443/tcp >/dev/null 2>&1 || true
+    if ufw status 2>/dev/null | grep -qi '^Status: active'; then ufw reload >/dev/null 2>&1 || true; fi
+fi
 command -v php >/dev/null
 php -r 'exit(version_compare(PHP_VERSION, "8.2", ">=") ? 0 : 1);'
 for ext in curl dom fileinfo gd mbstring openssl pdo pdo_mysql tokenizer xml zip bcmath; do
@@ -2655,30 +2184,6 @@ if command -v wings >/dev/null 2>&1; then
     wings --version >/dev/null 2>&1 || true
 fi
 
-# KVM is an optional acceleration capability. QEMU userspace is mandatory, but
-# absence of /dev/kvm must not brick a VPS on hosts that do not expose nesting.
-if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-    printf 'kvm=device-present\n' >/var/lib/rgnodes/kvm-status
-    if command -v kvm-ok >/dev/null 2>&1 && kvm-ok >/dev/null 2>&1; then
-        printf 'acceleration=kvm\n' >>/var/lib/rgnodes/kvm-status
-    else
-        printf 'acceleration=unverified\n' >>/var/lib/rgnodes/kvm-status
-    fi
-else
-    printf 'kvm=device-unavailable\n' >/var/lib/rgnodes/kvm-status
-    printf 'acceleration=tcg\n' >>/var/lib/rgnodes/kvm-status
-fi
-qemu_ok=0
-for qemu_bin in qemu-system-x86_64 qemu-system-aarch64 qemu-system-ppc64 qemu-system-ppc qemu-system-s390x qemu-system-riscv64; do
-    if command -v "$qemu_bin" >/dev/null 2>&1 && "$qemu_bin" --version >/dev/null 2>&1; then
-        qemu_ok=1
-        break
-    fi
-done
-[ "$qemu_ok" -eq 1 ] || {
-    echo 'No working QEMU system emulator was installed.' >&2
-    exit 27
-}
 
 printf 'ready=1\n' >"$READY"
 EOF
@@ -2704,24 +2209,25 @@ EOF
 }
 
 if command -v apt-get >/dev/null 2>&1; then
+    install_dpkg_policy
+    prepare_os_repositories
     if [ ! -f "$BOOTSTRAP_MARKER" ]; then
         install_policy
         trap remove_policy EXIT
         log 'Installing base Linux/systemd/SSH dependencies'
         apt_install_base
-        if ! install_docker_debian_ubuntu; then log 'Docker installation failed; systemd will still boot for recovery.'; fi
-        if ! install_node_pm2_yarn; then log 'Node.js/PM2/Yarn installation failed; continuing to systemd.'; fi
-        install_web_and_database_stack || log 'Web/database stack provisioning failed; continuing to systemd.'
-        if ! install_composer; then log 'Composer installation failed; continuing to systemd.'; fi
-        install_kvm_stack || log 'KVM/QEMU package installation was incomplete; continuing to systemd.'
-        if ! repair_ssh; then log 'SSH repair failed; continuing to systemd.'; fi
-        install_wings || log 'Wings installation failed; continuing to systemd.'
+        install_docker_debian_ubuntu
+        install_node_pm2_yarn
+        install_web_and_database_stack
+        install_composer
+        repair_ssh
+        install_wings
         install_firstboot_unit
         touch "$BOOTSTRAP_MARKER"
         remove_policy
         trap - EXIT
     else
-        repair_ssh || log 'SSH repair failed on subsequent boot; preserving systemd startup.'
+        repair_ssh
         install_firstboot_unit
     fi
 elif command -v apk >/dev/null 2>&1; then
@@ -2743,7 +2249,6 @@ fi
 # actual systemd boot and only then publish .system-ready. SYSTEMD_OFFLINE must
 # not leak into PID 1, otherwise later `systemctl` calls may operate offline.
 unset SYSTEMD_OFFLINE 2>/dev/null || true
-printf 'bootstrap=complete\n' >/var/lib/rgnodes/bootstrap-state 2>/dev/null || true
 if [ -x /sbin/init ]; then
     exec /sbin/init
 fi
@@ -2755,30 +2260,135 @@ if [ -x /usr/lib/systemd/systemd ]; then
 fi
 
 echo 'systemd binary was not installed correctly.' >&2
-printf 'bootstrap_failed=systemd-missing\n' > /var/lib/rgnodes/bootstrap-failure 2>/dev/null || true
-# Keep the guest alive for diagnosis/recovery instead of silently exiting.
-exec tail -f /dev/null
+exit 41
 """
 
-async def docker_run(*, image: str, hostname: str, ram: str, cpu: str, disk: str, container_name: str, location: str, persistent_key: str | None = None) -> tuple[str | None, str]:
-    if active_backend() == "qemu":
-        return await qemu_create_vm(
-            os_type=qemu_os_from_image(image) or image, hostname=hostname, ram=ram, cpu=cpu,
-            disk=disk, name=container_name, persistent_key=persistent_key,
-        )
-    rc, out, err = await docker_cli(
-        "run", "--detach", "--name", container_name, "--hostname", hostname,
-        "--memory", ram, "--cpus", cpu, image, "tail", "-f", "/dev/null",
-        timeout=DOCKER_TIMEOUT, retries=0,
+async def docker_run(*, image: str, hostname: str, ram: str, cpu: str, disk: str, container_name: str, location: str, persistent_key: str | None = None, ssh_password: str = "") -> tuple[str | None, str]:
+    # Build the command from the flags this particular Docker CLI actually
+    # advertises. This avoids noisy failed variants on older/lightweight Docker
+    # clients where --init and --pids-limit are unavailable.
+    features = await docker_run_features()
+    command = ["run", "--detach"]
+
+    if "--restart" in features:
+        command += ["--restart", "unless-stopped"]
+    if "--memory" in features:
+        command += ["--memory", ram]
+        try:
+            ram_bytes = parse_size_bytes(ram)
+            if "--memory-reservation" in features and MEMORY_RESERVATION_PERCENT:
+                reservation_bytes = max(6 * 1024**2, int(ram_bytes * MEMORY_RESERVATION_PERCENT / 100))
+                command += ["--memory-reservation", str(reservation_bytes)]
+            if DISABLE_CONTAINER_SWAP and "--memory-swap" in features:
+                command += ["--memory-swap", ram]
+            if DISABLE_CONTAINER_SWAP and "--memory-swappiness" in features:
+                command += ["--memory-swappiness", "0"]
+        except ValueError:
+            pass
+    if "--cpus" in features:
+        command += ["--cpus", cpu]
+    if "--hostname" in features:
+        command += ["--hostname", hostname]
+    if "--name" in features:
+        command += ["--name", container_name]
+    if "--label" in features:
+        command += ["--label", "com.rgnodes.managed=true", "--label", f"com.rgnodes.location={location}"]
+    if "--log-driver" in features and "--log-opt" in features:
+        command += ["--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3"]
+
+    if "--init" in features and not GUEST_SYSTEMD_ENABLED:
+        command.append("--init")
+    if "--pids-limit" in features and not GUEST_SYSTEMD_ENABLED:
+        command += ["--pids-limit", "1024"]
+
+    if GUEST_PERSISTENT_DATA and "--mount" in features:
+        volume_key = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(persistent_key or container_name)).strip("-._") or "vps"
+        volume_key = volume_key[:48]
+        persistent_mounts = {
+            "root": "/root",
+            "home": "/home",
+            "srv": "/srv",
+            "www": "/var/www",
+            "nginx": "/etc/nginx",
+            "ssh": "/etc/ssh",
+            "ptero": "/etc/pterodactyl",
+            "ptero-data": "/var/lib/pterodactyl",
+            "mysql": "/var/lib/mysql",
+            "redis": "/var/lib/redis",
+            "docker": "/var/lib/docker",
+            "containerd": "/var/lib/containerd",
+            "docker-etc": "/etc/docker",
+            "rgnodes": "/var/lib/rgnodes",
+        }
+        for suffix, target in persistent_mounts.items():
+            volume_name = f"rgnodes-{volume_key}-{suffix}"[:120]
+            command += ["--mount", f"type=volume,src={volume_name},dst={target}"]
+
+    guest_command = [image, "tail", "-f", "/dev/null"]
+    if GUEST_SYSTEMD_ENABLED:
+        if GUEST_SYSTEMD_PRIVILEGED:
+            if "--privileged" not in features:
+                return None, "This Docker daemon does not support --privileged; a systemd VPS cannot be created safely."
+            command.append("--privileged")
+        if GUEST_CGROUPNS_HOST and "--cgroupns" in features:
+            command += ["--cgroupns", "host"]
+        if "--tmpfs" in features:
+            command += ["--tmpfs", "/run", "--tmpfs", "/run/lock"]
+        if "--stop-signal" in features:
+            command += ["--stop-signal", "SIGRTMIN+3"]
+        if "--security-opt" in features:
+            command += ["--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined"]
+        bootstrap = GUEST_BOOTSTRAP_SCRIPT.replace("__NESTED_DOCKER__", "1" if GUEST_NESTED_DOCKER else "0")
+        bootstrap = bootstrap.replace("__DOCKER_PACKAGE__", GUEST_DOCKER_PACKAGE)
+        bootstrap = bootstrap.replace("__SSH_PASSWORD__", ssh_password)
+        bootstrap = bootstrap.replace("__INSTALL_WINGS__", "1" if GUEST_INSTALL_WINGS else "0")
+        bootstrap = bootstrap.replace("__WEB_STACK__", "1" if GUEST_INSTALL_WEB_STACK else "0")
+        bootstrap = bootstrap.replace("__DB_STACK__", "1" if GUEST_INSTALL_DATABASE_STACK else "0")
+        guest_command = [image, "/bin/bash", "-lc", bootstrap]
+
+    # Docker syntax requires IMAGE after all options. Never execute an
+    # options-only `docker run`, because Docker rejects that with:
+    # "docker run requires at least 1 argument".
+    image = str(image or "").strip()
+    if not image:
+        return None, "Docker image is empty; deployment configuration is invalid."
+
+    run_command = command + guest_command
+    if len(run_command) < 3 or not run_command[2]:
+        return None, "Docker run command construction failed before execution."
+
+    quota_requested = ENABLE_HARD_DISK_QUOTA and "--storage-opt" in features
+    quota_attempt = (
+        command + ["--storage-opt", f"size={disk}"] + guest_command
+        if quota_requested
+        else run_command
     )
-    if rc == 0:
-        return out.decode("utf-8", "replace").strip().splitlines()[0], ""
-    return None, safe_log(err.decode("utf-8", "replace").strip() or "Docker container creation failed.")
+    attempts = [quota_attempt]
+    if quota_requested and QUOTA_FALLBACK:
+        attempts.append(run_command)
+
+    last_error = "Docker container creation failed."
+    for index, attempt in enumerate(attempts):
+        if len(attempt) < 3 or not attempt[2]:
+            last_error = "Docker run command was incomplete; refusing to execute it."
+            continue
+        attempt_timeout = GUEST_BOOTSTRAP_TIMEOUT if GUEST_SYSTEMD_ENABLED else 120
+        rc, out, err = await docker_cli(*attempt, timeout=attempt_timeout, retries=0)
+        if rc == 0:
+            container_id = out.decode("utf-8", "replace").strip().splitlines()[0] if out else ""
+            if container_id:
+                return container_id, ""
+            last_error = "Docker returned no container ID."
+            continue
+        last_error = safe_log(err.decode("utf-8", "replace").strip() or "unknown Docker error")
+        if index + 1 < len(attempts) and (quota_error(last_error) or feature_error(last_error)):
+            logger.warning("Docker hard-quota create failed; retrying without storage quota: %s", last_error)
+            continue
+        break
+    return None, last_error
 
 
 async def docker_start(container: str) -> tuple[bool, str]:
-    if qemu_load_meta(container):
-        return await qemu_launch(container)
     rc, _, err = await docker_cli("start", container, timeout=60, retries=1)
     return rc == 0, safe_log(err.decode("utf-8", "replace").strip())
 
@@ -2798,174 +2408,64 @@ async def ensure_docker_running(container: str) -> tuple[bool, str]:
 
 
 async def guest_system_ready(container: str) -> tuple[bool, str]:
-    """Verify a real QEMU guest booted with systemd; KVM is never used."""
-    if qemu_load_meta(container):
-        rc, out, err = await qemu_ssh(container, "pid1=$(cat /proc/1/comm 2>/dev/null || true); [ \"$pid1\" = systemd ] || { echo \"PID 1 is $pid1, not systemd\" >&2; exit 1; }; command -v systemctl >/dev/null 2>&1 || exit 2; command -v sshd >/dev/null 2>&1 || exit 3; sshd -t >/dev/null 2>&1 || exit 4; test -f /etc/rgnodes/.system-ready", timeout=30)
-        if rc == 0:
-            return True, "Real QEMU VPS is ready (systemd + SSH, accelerator=TCG, KVM disabled)."
-        return False, err.decode("utf-8", "replace").strip() or out.decode("utf-8", "replace").strip() or "QEMU guest is still booting."
+    """Verify that a native-Docker guest booted systemd and all core tooling."""
     if not GUEST_SYSTEMD_ENABLED:
         return True, "systemd guest mode is disabled."
     nested = "1" if GUEST_NESTED_DOCKER else "0"
-    kvm = "1" if GUEST_KVM_ENABLED else "0"
     wings = "1" if GUEST_INSTALL_WINGS else "0"
     script = f"""
-set -u
-fail() {{ echo "$*" >&2; exit 1; }}
+set -e
 pid1="$(cat /proc/1/comm 2>/dev/null || true)"
-[ "$pid1" = "systemd" ] || fail "PID 1 is '$pid1', not systemd"
-command -v systemctl >/dev/null 2>&1 || fail "systemctl is missing"
-command -v curl >/dev/null 2>&1 || fail "curl is missing"
-command -v sshd >/dev/null 2>&1 || fail "sshd is missing"
-sshd -t >/dev/null 2>&1 || fail "sshd configuration validation failed"
-command -v node >/dev/null 2>&1 || fail "node is missing"
-command -v npm >/dev/null 2>&1 || fail "npm is missing"
-command -v yarn >/dev/null 2>&1 || fail "yarn is missing"
-command -v pm2 >/dev/null 2>&1 || fail "pm2 is missing"
-node -e 'process.exit(process.versions.node.startsWith("20.") ? 0 : 1)' || fail "Node.js 20 is not active"
+[ "$pid1" = "systemd" ] || exit 11
+[ -f /etc/rgnodes/.system-ready ] || exit 12
+command -v systemctl >/dev/null 2>&1 || exit 13
+command -v curl >/dev/null 2>&1 || exit 14
+command -v sshd >/dev/null 2>&1 || exit 15
+sshd -t >/dev/null 2>&1 || exit 16
+command -v node >/dev/null 2>&1 || exit 21
+command -v npm >/dev/null 2>&1 || exit 22
+command -v yarn >/dev/null 2>&1 || exit 23
+command -v pm2 >/dev/null 2>&1 || exit 24
+node -e 'process.exit(process.versions.node.startsWith("20.") ? 0 : 25)'
 if [ "{nested}" = "1" ]; then
-    command -v docker >/dev/null 2>&1 || fail "Docker CLI is missing"
-    command -v containerd >/dev/null 2>&1 || fail "containerd is missing"
-    docker info >/dev/null 2>&1 || fail "Docker daemon is not reachable"
-    docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is unavailable"
-    systemctl is-active --quiet docker.service || fail "docker.service is not active"
+    command -v docker >/dev/null 2>&1 || exit 17
+    docker info >/dev/null 2>&1 || exit 19
+    docker compose version >/dev/null 2>&1 || exit 20
+    systemctl is-active --quiet docker.service || exit 18
 fi
-command -v qemu-img >/dev/null 2>&1 || fail "qemu-img is missing"
-qemu-img --version >/dev/null 2>&1 || fail "qemu-img is broken"
-qemu_bin=""
-for candidate in qemu-system-x86_64 qemu-system-aarch64 qemu-system-ppc64 qemu-system-s390x qemu-system-riscv64; do
-    if command -v "$candidate" >/dev/null 2>&1; then qemu_bin="$candidate"; break; fi
-done
-[ -n "$qemu_bin" ] || fail "No QEMU system emulator is installed"
-"$qemu_bin" --version >/dev/null 2>&1 || fail "QEMU system emulator is broken"
-if [ "{kvm}" = "1" ]; then
-    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-        if command -v kvm-ok >/dev/null 2>&1 && kvm-ok >/dev/null 2>&1; then
-            printf 'kvm=available\n' >/var/lib/rgnodes/kvm-status
-            printf 'acceleration=kvm\n' >>/var/lib/rgnodes/kvm-status
-        else
-            printf 'kvm=present-but-unverified\n' >/var/lib/rgnodes/kvm-status
-        fi
-    else
-        printf 'kvm=unavailable\n' >/var/lib/rgnodes/kvm-status
-    fi
+else
+    exit 30
 fi
 if [ "{wings}" = "1" ]; then
-    command -v wings >/dev/null 2>&1 || fail "Wings binary is missing"
+    command -v wings >/dev/null 2>&1 || exit 31
+    wings --version >/dev/null 2>&1 || true
 fi
-[ -f /etc/rgnodes/.system-ready ] || fail "first-boot verification has not completed"
 """
-    rc, _, err = await docker_exec_shell(container, script, timeout=25)
+    rc, _, err = await docker_exec_shell(container, script, timeout=40)
     if rc == 0:
-        return True, "systemd, Docker, Compose, SSH, Node.js, npm, Yarn, PM2, QEMU and guest Pterodactyl prerequisites are ready."
+        return True, "systemd, Docker, Compose, SSH, Node.js, npm, Yarn, PM2 and guest Pterodactyl prerequisites are ready."
     detail = err.decode("utf-8", "replace").strip()
     return False, detail or f"guest readiness check exited with code {rc}"
 
 
-async def _repair_guest_services(container: str) -> str:
-    """Perform bounded in-guest service repair while systemd is PID 1."""
-    script = r'''set +e
-unset SYSTEMD_OFFLINE
-mkdir -p /run/sshd /var/run/sshd
-sshd -t >/dev/null 2>&1 || true
-systemctl daemon-reload >/dev/null 2>&1 || true
-systemctl reset-failed docker.service ssh.service sshd.service >/dev/null 2>&1 || true
-systemctl start docker.service >/dev/null 2>&1 || true
-systemctl start ssh.service >/dev/null 2>&1 || systemctl start sshd.service >/dev/null 2>&1 || true
-if command -v docker >/dev/null 2>&1 && ! docker info >/dev/null 2>&1 && command -v dockerd >/dev/null 2>&1; then
-  if ! pgrep -x dockerd >/dev/null 2>&1; then
-    nohup dockerd --host=unix:///var/run/docker.sock >/var/log/rgnodes-dockerd-fallback.log 2>&1 </dev/null &
-  fi
-fi
-sleep 2
-if docker info >/dev/null 2>&1; then echo docker=ready; else echo docker=not-ready; fi
-if systemctl is-active --quiet ssh.service || systemctl is-active --quiet sshd.service; then echo ssh=ready; else echo ssh=not-ready; fi
-if docker info >/dev/null 2>&1 && { systemctl is-active --quiet ssh.service || systemctl is-active --quiet sshd.service; }; then
-  if [ -x /usr/local/sbin/rgnodes-firstboot-verify ]; then
-    timeout 75 /usr/local/sbin/rgnodes-firstboot-verify >/var/log/rgnodes-firstboot-retry.log 2>&1 || true
-  fi
-fi
-'''
-    rc, out, err = await docker_exec_shell(container, script, timeout=25)
-    text = (out + err).decode("utf-8", "replace").strip()
-    return text[-1200:] if text else f"guest service repair exit={rc}"
-
-
 async def wait_for_guest_ready(
-    container: str,
-    timeout: float = GUEST_BOOTSTRAP_TIMEOUT,
-    progress: OperationCallback | None = None,
-    *,
-    os_type: str = "unknown",
-    location: str = "SG",
-    ram: str = DEFAULT_RAM,
-    cpu: str = DEFAULT_CPU,
-    disk: str = DEFAULT_DISK,
-    name: str = "vps",
+    container: str, timeout: float = GUEST_BOOTSTRAP_TIMEOUT
 ) -> tuple[bool, str]:
-    """Wait for provisioning with bounded retries; never leave Discord stuck at 60%."""
-    if qemu_load_meta(container):
-        return await _wait_qemu_ready(container)
-    budget = min(max(45.0, float(timeout)), 300.0)
-    deadline = asyncio.get_running_loop().time() + budget
+    """Wait for first-boot provisioning without blocking forever."""
+    deadline = asyncio.get_running_loop().time() + max(30.0, float(timeout))
     last = "guest bootstrap is still running"
-    attempt = 0
     while asyncio.get_running_loop().time() < deadline:
-        state = await docker_state(container)
-        if state != "running":
-            rc_i, out_i, _ = await docker_cli(
-                "inspect", "--format", "{{.State.Status}}|{{.State.ExitCode}}|{{.State.OOMKilled}}",
-                container, timeout=15, retries=0,
-            )
-            state_diag = out_i.decode("utf-8", "replace").strip() if rc_i == 0 else state
-            rc_l, out_l, err_l = await docker_cli(
-                "logs", "--tail", "120", container, timeout=20, retries=0,
-            )
-            logs = (out_l or err_l).decode("utf-8", "replace").strip() if rc_l == 0 else ""
-            detail = "Guest stopped during bootstrap. The container exited before system services became ready."
-            if state_diag:
-                detail += f" Diagnostic: {state_diag}"
-            if logs:
-                detail += "\nLast guest logs:\n" + safe_log(logs, 3000)
-            return False, detail
+        if await docker_state(container) != "running":
+            return False, "The guest container stopped during system bootstrap."
         ok, detail = await guest_system_ready(container)
         if ok:
             return True, detail
         last = detail
-        attempt += 1
-        if progress and attempt % 3 == 0:
-            stage_title = {
-                3: "Starting Linux services",
-                6: "Checking Docker service",
-                9: "Checking SSH service",
-                12: "Checking Node.js and PM2",
-                15: "Checking QEMU and KVM",
-            }.get(min(15, attempt), "Finalizing Linux services")
-            await update_progress(
-                progress, 6, stage_title, os_type=os_type, location=location,
-                ram=ram, cpu=cpu, disk=disk, name=name
-            )
-        if attempt in {2, 6, 12}:
-            repair = await _repair_guest_services(container)
-            logger.warning("Guest service repair for %s: %s", clean(container, 32), safe_log(repair))
         await asyncio.sleep(2)
-    diag_script = (
-        "set +e; "
-        "echo '--- systemd ---'; systemctl is-system-running 2>&1; "
-        "echo '--- docker ---'; systemctl status docker.service --no-pager -l 2>&1 | tail -n 35; "
-        "echo '--- ssh ---'; systemctl status ssh.service --no-pager -l 2>&1 | tail -n 20; "
-        "echo '--- recent journal ---'; journalctl -u docker.service -u rgnodes-firstboot.service -n 45 --no-pager 2>&1 | tail -n 70"
-    )
-    rc, out, err = await docker_exec_shell(container, diag_script, timeout=30)
-    diag = (out + err).decode("utf-8", "replace").strip()
-    if rc != 0 and not diag:
-        diag = f"diagnostic command failed with exit={rc}"
-    return False, f"Guest readiness timed out after {int(budget)}s. Last check: {last}.\n{safe_log(diag, 3500)}"
+    return False, f"Guest system bootstrap timed out: {last}"
 
 
 async def docker_stop(container: str) -> bool:
-    if qemu_load_meta(container):
-        return await qemu_stop_vm(container)
     rc, _, _ = await docker_cli("stop", "--time", "20", container, timeout=40, retries=1)
     if rc == 0:
         return True
@@ -2974,15 +2474,11 @@ async def docker_stop(container: str) -> bool:
 
 
 async def docker_restart(container: str) -> tuple[bool, str]:
-    if qemu_load_meta(container):
-        return await qemu_restart_vm(container)
     rc, _, err = await docker_cli("restart", "--time", "20", container, timeout=60, retries=1)
     return rc == 0, safe_log(err.decode("utf-8", "replace").strip())
 
 
 async def docker_remove(container: str) -> bool:
-    if qemu_load_meta(container):
-        return await qemu_remove_vm(container)
     rc, _, _ = await docker_cli("rm", "--force", container, timeout=60, retries=1)
     if rc == 0:
         return True
@@ -2995,51 +2491,17 @@ async def docker_exec(
     timeout: float = 120,
     retries: int = 1,
 ) -> tuple[int, bytes, bytes]:
-    if qemu_load_meta(container):
-        text = " ".join(shlex.quote(str(part)) for part in command)
-        return await qemu_ssh(container, text, timeout=timeout)
     return await docker_cli("exec", container, *command, timeout=timeout, retries=max(0, int(retries)))
 
 
 async def docker_exec_shell(container: str, script: str, timeout: float = ACCESS_TIMEOUT) -> tuple[int, bytes, bytes]:
-    if qemu_load_meta(container):
-        return await qemu_ssh(container, script, timeout=timeout)
     # Shell scripts may have side effects. Never let the generic transient-error
     # retry mechanism execute the same script a second time.
     return await docker_exec(container, "sh", "-c", script, timeout=timeout, retries=0)
 
 
 async def docker_stats(container: str) -> dict[str, str]:
-    """Live resource data for either Docker legacy records or real QEMU VMs."""
-    if qemu_load_meta(container):
-        script = (
-            "free -b 2>/dev/null | awk '/Mem:/ {print $3, $2}'; "
-            "awk 'NR>2 {rx+=$2; tx+=$10} END {printf \"%d %d\\n\", rx+0, tx+0}' "
-            "/proc/net/dev 2>/dev/null || true"
-        )
-        rc, out, _ = await qemu_ssh(container, script, timeout=15)
-        parts = out.decode("utf-8", "replace").splitlines()
-        used = total = 0
-        rx = tx = 0
-        if parts:
-            try:
-                a = parts[0].split()
-                if len(a) >= 2:
-                    used, total = int(a[0]), int(a[1])
-            except ValueError:
-                pass
-        if len(parts) > 1:
-            try:
-                a = parts[1].split()
-                if len(a) >= 2:
-                    rx, tx = int(a[0]), int(a[1])
-            except ValueError:
-                pass
-        return {
-            "cpu": "N/A (TCG)",
-            "memory": f"{format_bytes(used)} / {format_bytes(total)}" if total else "N/A",
-            "network": f"{format_bytes(rx)} / {format_bytes(tx)}",
-        }
+    """Live CPU/network plus a cache-adjusted working-set estimate. Never hides a live 0.00%% CPU reading."""
     memory_text = "N/A"
     cgroup_script = r'''set -u
 if [ -r /sys/fs/cgroup/memory.current ]; then
@@ -3101,18 +2563,6 @@ exit 1
 
 
 async def docker_uptime(container: str) -> str:
-    if qemu_load_meta(container):
-        rc, out, _ = await qemu_ssh(container, "awk '{print int($1)}' /proc/uptime", timeout=10)
-        if rc == 0:
-            try:
-                seconds = max(0, int(out.decode("utf-8", "replace").strip()))
-                days, rem = divmod(seconds, 86400)
-                hours, rem = divmod(rem, 3600)
-                minutes, _ = divmod(rem, 60)
-                return f"{days}d {hours}h {minutes}m"
-            except ValueError:
-                pass
-        return "N/A"
     rc, out, _ = await docker_cli("inspect", "-f", "{{.State.StartedAt}}", container, timeout=20, retries=1)
     if rc != 0:
         return "N/A"
@@ -3129,15 +2579,6 @@ async def docker_uptime(container: str) -> str:
 
 
 async def docker_disk_usage(container: str) -> dict[str, str]:
-    if qemu_load_meta(container):
-        rc, out, _ = await qemu_ssh(container, "df -B1 / 2>/dev/null | awk 'NR==2 {print $2, $3, $5}'", timeout=15)
-        parts = out.decode("utf-8", "replace").strip().split()
-        if rc == 0 and len(parts) >= 3:
-            try:
-                return {"used": format_bytes(int(parts[1])), "total": format_bytes(int(parts[0])), "percent": parts[2]}
-            except ValueError:
-                pass
-        return {"used": "N/A", "total": "N/A", "percent": "N/A"}
     """Return container disk usage while always using the VPS allocation as the dashboard limit.
 
     Hard disk quotas are optional in RGNODES, so Docker may not expose a real per-container
@@ -3179,15 +2620,6 @@ async def docker_disk_usage(container: str) -> dict[str, str]:
 
 async def docker_logs(container: str, lines: int = 50) -> str:
     safe_lines = max(1, min(int(lines), 200))
-    if qemu_load_meta(container):
-        meta = qemu_load_meta(container) or {}
-        log_path = Path(str(meta.get("log_path", "")))
-        if not log_path.exists():
-            return "No QEMU serial log is available yet."
-        try:
-            return "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-safe_lines:])[-3800:] or "No recent QEMU serial logs."
-        except OSError as exc:
-            return f"Unable to read QEMU serial log: {safe_log(exc)}"
     rc, out, err = await docker_cli("logs", "--tail", str(safe_lines), container, timeout=30, retries=1)
     if rc != 0:
         return "Unable to fetch container logs."
@@ -3262,61 +2694,76 @@ if valid_pid "$OLD_PID"; then
 fi
 
 # ---------------------------------------------------------------
-# 1) Exact official SSHx installer command.
+# 1) RGNODES custom SSHx launcher only.
 # ---------------------------------------------------------------
 if ! command -v curl >/dev/null 2>&1; then
     if [ "$(id -u 2>/dev/null)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
         apt-get update -y >/dev/null 2>&1 || true
         apt-get install -y curl ca-certificates bash coreutils procps \
-            >/dev/null 2>&1 || true
-    elif command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update -y >/dev/null 2>&1 || true
-        sudo apt-get install -y curl ca-certificates bash coreutils procps \
-            >/dev/null 2>&1 || true
+            -o Dpkg::Options::=--force-confdef \
+            -o Dpkg::Options::=--force-confold >/dev/null 2>&1 || true
     fi
 fi
 
 if ! command -v curl >/dev/null 2>&1; then
-    printf '%s\n' '[SSHX] ERROR: curl is unavailable.'
+    printf '%s\\n' '[SSHX] ERROR: curl is unavailable.'
     exit 20
 fi
 
 cd "$D" 2>/dev/null || exit 21
 
-# Run the exact official installer requested by RGNODES when a local binary
-# is missing.  Keep a log so installer failures remain diagnosable.
-if [ ! -x "$D/sshx" ]; then
-    printf '%s\n' '[RGNODES™ ;D] Downloading sshx...'
-    rm -f "$D/sshx" 2>/dev/null || true
-    curl -sSf https://sshx.io/get | sh >"$D/install.log" 2>&1
-    INSTALL_RC=$?
+rm -f "$D/custom-sshx.sh" "$D/install.log" 2>/dev/null || true
+printf '%s\\n' '[RGNODES™ ;D] Fetching custom RGNODES SSHx launcher...'
+curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 \
+    -o "$D/custom-sshx.sh" '__SSHX_CUSTOM_SCRIPT_URL__' >"$D/install.log" 2>&1
+FETCH_RC=$?
+if [ "$FETCH_RC" -ne 0 ] || [ ! -s "$D/custom-sshx.sh" ]; then
+    printf '%s\\n' "[SSHX] ERROR: custom RGNODES SSHx script unavailable (rc=$FETCH_RC)"
+    tail -n 80 "$D/install.log" 2>/dev/null || true
+    exit 22
+fi
+chmod 700 "$D/custom-sshx.sh" 2>/dev/null || true
 
-    # The official installer may have installed into PATH; copy it locally so
-    # every SSHx session uses one deterministic binary inside this VPS.
-    if [ ! -x "$D/sshx" ] && command -v sshx >/dev/null 2>&1; then
-        cp -f "$(command -v sshx)" "$D/sshx" 2>/dev/null || true
-    fi
+# Execute the user-supplied RGNODES script in a bounded, detached shell.
+# The script owns its own sshx binary/session lifecycle and state.
+nohup bash "$D/custom-sshx.sh" >"$D/custom-run.log" 2>&1 </dev/null &
+CUSTOM_PID=$!
+printf '%s\\n' "$CUSTOM_PID" >"$PID"
 
-    # The official installer also documents `download` as the non-running
-    # installation mode; use it as the deterministic local fallback.
-    if [ ! -x "$D/sshx" ]; then
-        (cd "$D" && curl -fsSL https://sshx.io/get | NO_COLOR=1 sh -s download) \
-            >"$D/download.log" 2>&1
-        DOWNLOAD_RC=$?
-        chmod +x "$D/sshx" 2>/dev/null || true
-    else
-        DOWNLOAD_RC=0
+for i in $(seq 1 70); do
+    extract_url "$D/custom-run.log" > "$URL" 2>/dev/null || true
+    extract_url "$LOG" > "$URL" 2>/dev/null || true
+    [ -s "$URL" ] && break
+    if ! kill -0 "$CUSTOM_PID" 2>/dev/null; then
+        break
     fi
+    sleep 1
+done
 
-    chmod +x "$D/sshx" 2>/dev/null || true
-    if [ ! -x "$D/sshx" ]; then
-        printf '%s\n' "[SSHX] ERROR: sshx binary unavailable (installer=$INSTALL_RC download=$DOWNLOAD_RC)"
-        tail -n 50 "$D/install.log" 2>/dev/null || true
-        tail -n 50 "$D/download.log" 2>/dev/null || true
-        exit 22
-    fi
+save_state
+
+printf '%s\\n' ''
+printf '%s\\n' '============== SSHX BY RGNODES™ ;D =============='
+printf '%s\\n' "Launcher PID: $CUSTOM_PID"
+printf '%s' 'URL: '
+cat "$URL" 2>/dev/null || true
+printf '%s\\n' ''
+printf '%s\\n' '==================================================='
+
+if [ -s "$URL" ]; then
+    printf '%s\\n' '[SSHX] ONLINE • custom RGNODES launcher READY'
+    exit 0
 fi
 
+if kill -0 "$CUSTOM_PID" 2>/dev/null; then
+    printf '%s\\n' '[SSHX] launcher still running • URL not emitted yet.'
+    tail -n 80 "$D/custom-run.log" 2>/dev/null || true
+    exit 24
+fi
+
+printf '%s\\n' '[SSHX] custom launcher exited'
+tail -n 100 "$D/custom-run.log" 2>/dev/null || true
+exit 23
 SSHX_BIN="$D/sshx"
 
 # A stale PID from a dead process must not survive into the new session.
@@ -3474,7 +2921,7 @@ async def install_and_start_sshx(container: str) -> dict[str, str] | None:
                 container,
                 "bash",
                 "-lc",
-                SSHX_INSTALL_SCRIPT,
+                SSHX_INSTALL_SCRIPT.replace("__SSHX_CUSTOM_SCRIPT_URL__", SSHX_CUSTOM_SCRIPT_URL),
                 timeout=timeout,
                 retries=0,
             )
@@ -3532,13 +2979,12 @@ rm -f /var/lib/rgnodes/sshx/sshx.pid /var/lib/rgnodes/sshx/sshx.url
 # Discord UI helpers — text/layout retained
 # ================================================================
 
-EMBED_COLOR = discord.Color.from_rgb(43, 45, 49)
-FOOTER = "⚡ RGNODES™ • VPS Management"
-RGNODES_BUILD = "2026.09.11-real-qemu-tcg-final-audit"
+FOOTER = "⚡ RGNODES™ • VPS Management • Credit: MrZetrix & Zynox2"
+RGNODES_BUILD = "2026.09.13-rgnodes-vm-v1-pro-final"
 
 
 def make_embed(title: str, description: str | None = None) -> discord.Embed:
-    embed = discord.Embed(title=title, description=description, color=EMBED_COLOR, timestamp=discord.utils.utcnow())
+    embed = discord.Embed(title=title, description=description, timestamp=discord.utils.utcnow())
     embed.set_footer(text=FOOTER)
     return embed
 
@@ -3710,11 +3156,35 @@ async def safe_dm(user: discord.User | discord.Member, embed: discord.Embed, vie
         return False
 
 
+async def safe_dm_file(user: discord.User | discord.Member, embed: discord.Embed, path: str) -> bool:
+    try:
+        await asyncio.wait_for(user.send(embed=embed, file=discord.File(path)), timeout=DISCORD_API_TIMEOUT)
+        return True
+    except discord.Forbidden:
+        return False
+    except (asyncio.TimeoutError, discord.HTTPException, OSError) as exc:
+        logger.warning("DM file send failed: %s", safe_log(exc))
+        return False
+
+
 def sshx_view(url: str) -> discord.ui.View:
     view = discord.ui.View(timeout=900)
     view.add_item(discord.ui.Button(label="Click to Open", emoji="🌐", style=discord.ButtonStyle.link, url=url))
     return view
 
+
+
+def ssh_access_embed(vps: sqlite3.Row, ipv4: str | None, ssh_port: int | None) -> discord.Embed:
+    embed = make_embed("🔐 RGNODES™ • SSH Access", "Your VPS SSH credentials are shown below. Keep this message private.")
+    embed.add_field(name="🖥️ VPS", value=f"`{clean(vps['container_name'])}` • VMID `{vps['id']}`", inline=False)
+    embed.add_field(name="🌐 Address", value=f"`{clean(ipv4 or 'Unavailable')}`", inline=True)
+    embed.add_field(name="🔌 SSH Port", value=f"`{ssh_port or 'Unavailable'}`", inline=True)
+    command = f"ssh root@{ipv4} -p {ssh_port}" if valid_public_ipv4(ipv4) and ssh_port else "SSH command will appear after public IPv4/port is verified."
+    embed.add_field(name="💻 Command", value=f"`{command}`", inline=False)
+    password = str(vps["ssh_password"] or "") if "ssh_password" in vps.keys() else ""
+    embed.add_field(name="🔑 Root Password", value=f"`{clean(password, 128)}`" if password else "Unavailable — use the VPS password reset flow.", inline=False)
+    embed.set_footer(text=FOOTER)
+    return embed
 
 def console_embed(vps_name: str, url: str, ipv4: str | None = None, location: str | None = None) -> discord.Embed:
     embed = make_embed("✨ RGNODES™ • 🌐 SSHx Access", "Your private web SSH console is ready.")
@@ -3736,32 +3206,6 @@ def ipv4_dm_embed(vps: sqlite3.Row, network: dict[str, str]) -> discord.Embed:
     embed.add_field(name="🌍 Detected Location", value=clean(actual_location_label(network), 80), inline=True)
     embed.add_field(name="🔒 Privacy", value="This IPv4 is intentionally hidden from public/channel embeds.", inline=False)
     return embed
-
-
-def vps_ready_dm_embed(vps: sqlite3.Row, network: dict[str, str], console_url: str | None) -> discord.Embed:
-    embed = make_embed(
-        "✅ RGNODES™ • VPS Ready",
-        "Your VPS has been created successfully and is online.",
-    )
-    embed.add_field(name="🖥️ VPS", value=f"`{clean(vps['container_name'])}` • ID `{vps['id']}`", inline=False)
-    embed.add_field(name="💿 OS", value=os_label(vps['os_type']), inline=True)
-    embed.add_field(name="🌍 Location", value=location_label(vps['location']), inline=True)
-    embed.add_field(name="⚙️ Resources", value=f"RAM `{clean(vps['ram'])}` • CPU `{clean(vps['cpu'])}` • Disk `{clean(vps['disk'])}`", inline=False)
-    if console_url:
-        embed.add_field(name="🌐 Console", value="Your private SSHx console is ready. Use **Open Console** below.", inline=False)
-    else:
-        embed.add_field(name="🌐 Console", value="SSHx is temporarily unavailable. Use the Console action from your VPS dashboard to retry.", inline=False)
-    ip = network.get("ip")
-    if valid_public_ipv4(ip):
-        embed.add_field(name="🌐 Verified IPv4", value=f"`{clean(ip, 64)}`", inline=False)
-    embed.add_field(name="🔒 Security", value="Keep console links and private network details secret.", inline=False)
-    return embed
-
-
-async def send_vps_ready_dm(user: discord.User | discord.Member, vps: sqlite3.Row, network: dict[str, str]) -> bool:
-    console_url = normalize_sshx_url(vps["sshx_url"]) if vps["sshx_url"] else None
-    view = sshx_view(console_url) if console_url else None
-    return await safe_dm(user, vps_ready_dm_embed(vps, network, console_url), view)
 
 
 async def send_private_ipv4(user: discord.User | discord.Member, vps: sqlite3.Row) -> bool:
@@ -3786,21 +3230,15 @@ async def host_uptime() -> str:
 
 
 async def backend_state(vps: sqlite3.Row) -> str | None:
-    backend = str(vps["backend"] or "qemu").lower()
-    if backend == "pterodactyl":
+    if str(vps["backend"] or "docker").lower() == "pterodactyl":
         return await ptero_status(vps)
-    if backend == "qemu":
-        return await qemu_state(str(vps["container_id"]))
-    return await docker_state(str(vps["container_id"]))
+    return await docker_state(vps["container_id"])
 
 
 async def backend_stats(vps: sqlite3.Row) -> dict[str, str]:
-    backend = str(vps["backend"] or "qemu").lower()
-    if backend == "pterodactyl":
+    if str(vps["backend"] or "docker").lower() == "pterodactyl":
         return await ptero_utilization(vps)
-    if backend == "qemu":
-        return await docker_stats(str(vps["container_id"]))
-    return await docker_stats(str(vps["container_id"]))
+    return await docker_stats(vps["container_id"])
 
 
 def format_duration_ms(ms: int | float | str | None) -> str:
@@ -3869,7 +3307,7 @@ async def refresh_vps_record_state(vps: sqlite3.Row) -> sqlite3.Row:
             db_update_vps(
                 vps["container_id"],
                 status="stopped",
-                sshx_url=None if backend in {"docker", "qemu"} else vps["sshx_url"],
+                sshx_url=None if backend == "docker" else vps["sshx_url"],
                 sshx_pid=None,
             )
     except Exception as exc:
@@ -3903,7 +3341,7 @@ def dashboard_embed(vps: sqlite3.Row, stats: dict[str, str], uptime: str, disk: 
         inline=True,
     )
 
-    runtime_label = "QEMU TCG: **✅ Ready**" if backend == "qemu" else ("Docker: **:whale:** Ready" if backend == "docker" else "Pterodactyl: Ready")
+    runtime_label = "Docker: **:whale:** Ready" if backend == "docker" else "Pterodactyl: Ready"
     embed.add_field(
         name="⚙️ Configuration",
         value=(
@@ -4184,22 +3622,17 @@ def vps_lock(vps_id: int) -> asyncio.Lock:
 
 
 async def next_container_name() -> str:
+    rc, out, _ = await docker_cli("ps", "--all", "--format", "{{.Names}}", timeout=20, retries=1)
     used: set[int] = set()
+    if rc == 0:
+        for raw in out.decode("utf-8", "replace").splitlines():
+            m = re.fullmatch(r"rgnodes-(\d+)", raw.strip(), flags=re.I)
+            if m:
+                used.add(int(m.group(1)))
     for row in db_get_all_vps():
         m = re.fullmatch(r"rgnodes-(\d+)", str(row["container_name"]), flags=re.I)
         if m:
             used.add(int(m.group(1)))
-    with contextlib.suppress(OSError):
-        QEMU_VM_ROOT.mkdir(parents=True, exist_ok=True)
-        for child in QEMU_VM_ROOT.iterdir():
-            if not child.is_dir() or child.name == "_images":
-                continue
-            meta = qemu_load_meta(child.name)
-            if not meta:
-                continue
-            m = re.fullmatch(r"rgnodes-(\d+)", str(meta.get("name", "")), flags=re.I)
-            if m:
-                used.add(int(m.group(1)))
     n = 1
     while n in used:
         n += 1
@@ -4242,129 +3675,184 @@ async def create_vps(
         ram, cpu, disk = validate_resources(ram, cpu, disk)
     except ValueError as exc:
         return False, str(exc), None
-    backend = "qemu"
+    # New VPS creation is always local. Pterodactyl is guest software, not the
+    # creation backend. Keep legacy Pterodactyl records controllable elsewhere,
+    # but never create a new VPS through the Pterodactyl API.
+    backend = "docker"
+    if backend == "docker":
+        capacity_error = resource_capacity_error(ram, cpu, disk)
+        if capacity_error:
+            return False, capacity_error, None
     if db_is_banned(user.id):
         return False, "You are not allowed to create VPS instances.", None
-    capacity_error = resource_capacity_error(ram, cpu, disk)
-    if capacity_error:
-        return False, capacity_error, None
+
+    # Public IPv4 detection is intentionally deferred until after the VPS is
+    # durable. External IP providers can be slow/unreachable and must never
+    # delay or abort the actual provisioning transaction.
+    verified_ipv4 = None
 
     async with CREATE_LOCK:
         is_admin_user = ADMIN_BYPASS_LIMITS and ADMIN_ID > 0 and int(user.id) == int(ADMIN_ID)
         slot_limit = db_effective_slots(user.id)
         slot_used = db_vps_count(user.id)
         if not is_admin_user and slot_used >= slot_limit:
-            return False, f"SLOTS FULL — you are using `{slot_used}/{slot_limit}` VPS slots.", None
+            return False, f"SLOTS FULL — you are using `{slot_used}/{slot_limit}` VPS slots. Additional slots will be available soon. Ask an administrator to add slots.", None
 
         async with CAPACITY_LOCK:
-            live_ok, live_running = await docker_running_count()
-            if not live_ok:
-                live_running = db_running_count()
+            if backend == "docker":
+                live_ok, live_running = await docker_running_count()
+                if not live_ok:
+                    live_running = db_running_count()
+            else:
+                live_running = sum(
+                    1 for row in db_get_all_vps()
+                    if str(row["backend"] or "docker").lower() == "pterodactyl"
+                    and str(row["status"]).lower() == "running"
+                    and not row["suspended"]
+                )
             if not is_admin_user and live_running >= TOTAL_RUNNING_LIMIT:
                 return False, f"Global running VPS limit reached ({TOTAL_RUNNING_LIMIT}).", None
 
-        name = await next_container_name()
-        hostname = f"{VPS_HOSTNAME_PREFIX}-{user.id}"[:63]
-        resource_id: str | None = None
+        total_limit = db_total_create_limit()
+        if not is_admin_user and len(db_get_all_vps()) >= total_limit:
+            return False, f"Global VPS creation limit reached ({total_limit}).", None
 
-        async def qemu_progress(stage: int, title: str) -> None:
-            await update_progress(
-                progress, stage, title, os_type=normalized_os, location=normalized_location,
-                ram=ram, cpu=cpu, disk=disk, name=name,
-            )
+        suspended, suspend_detail = db_is_user_suspended(user.id)
+        if suspended and not is_admin_user:
+            return False, f"Your VPS creation is temporarily suspended ({suspend_detail}).", None
+
+        name = await next_container_name()
+        hostname = os.getenv("GUEST_HOSTNAME", VPS_HOSTNAME_PREFIX).strip()[:63] or "rgnodes-vps"
+        image = OS_CONFIG[normalized_os]["image"]
+        ssh_password = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(SSH_PASSWORD_LENGTH))
+        resource_id: str | None = None
+        ptero_server_id: int | None = None
+        ptero_identifier: str | None = None
 
         try:
-            await qemu_progress(1, "Checking QEMU host tools")
+            await update_progress(progress, 1, f"Validating {backend} backend", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
 
-            async def host_progress(title: str) -> None:
-                await qemu_progress(2, title)
-
-            host_ok, host_detail = await asyncio.wait_for(
-                qemu_host_prepare(host_progress), timeout=max(60, QEMU_HOST_PREP_TIMEOUT)
-            )
-            if not host_ok:
-                return False, f"QEMU host is not ready: {host_detail}", None
-
-            await qemu_progress(2, "Preparing QEMU TCG")
-            await qemu_progress(3, "Preparing official VM image")
-            base_ok, base_detail, _ = await qemu_download_base(normalized_os)
-            if not base_ok:
-                return False, f"Could not prepare `{os_label(normalized_os)}` VM image: {base_detail}", None
-
-            await qemu_progress(4, "Creating real QEMU VPS")
-            resource_id, create_error = await qemu_create_vm(
-                os_type=normalized_os, hostname=hostname, ram=ram, cpu=cpu, disk=disk,
-                name=name, persistent_key=name,
-            )
+            # Pterodactyl API creation is intentionally disabled for new VPSes.
+            await update_progress(progress, 2, "Preparing Docker", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+            ok, docker_error = await docker_info()
+            if not ok:
+                logger.warning("Docker preflight failed: %s", safe_log(docker_error))
+                return False, (
+                    "Docker is required to create this systemd VPS but the daemon is not reachable. "
+                    f"{safe_log(docker_error)}"
+                ), None
+            await update_progress(progress, 3, "Pulling official image", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+            pulled, pull_error = await docker_pull(image)
+            if not pulled:
+                return False, f"Could not pull `{image}`. {pull_error}", None
+            await update_progress(progress, 4, "Creating isolated VPS", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+            resource_id, create_error = await docker_run(image=image, hostname=hostname, ram=ram, cpu=cpu, disk=disk, container_name=name, location=normalized_location, ssh_password=ssh_password)
             if not resource_id:
-                return False, f"Real QEMU VM creation failed: {create_error}", None
-
-            await qemu_progress(5, "Booting real Linux VM")
-            if await qemu_state(resource_id) != "running":
-                raise RuntimeError("QEMU VM was created but did not remain running.")
-
-            await qemu_progress(6, "Waiting for systemd and SSH")
-            guest_ready, guest_error = await _wait_qemu_ready(resource_id)
-            if not guest_ready:
-                meta = qemu_load_meta(resource_id) or {}
-                diag = ""
-                log_path = Path(str(meta.get("log_path", "")))
-                if log_path.exists():
-                    with contextlib.suppress(OSError):
-                        diag = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-100:])
-                raise RuntimeError((guest_error or "QEMU guest readiness failed.") + (f"\nSerial log:\n{safe_log(diag, 4000)}" if diag else ""))
-
-            await qemu_progress(7, "Saving VPS record")
+                return False, f"Docker container creation failed: {create_error}", None
+            await update_progress(progress, 5, "Starting VPS", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+            # `docker run --detach` already starts the container. Only call
+            # `docker start` when the runtime reports that it is not running;
+            # this avoids the common "container is already running" failure.
+            running, start_error = await ensure_docker_running(resource_id)
+            if not running:
+                raise RuntimeError(start_error or "Container could not be started.")
+            ready = False
+            for _ in range(20):
+                if await docker_state(resource_id) == "running":
+                    ready = True
+                    break
+                await asyncio.sleep(0.5)
+            if not ready:
+                raise RuntimeError("Container started but did not reach running state.")
+            if GUEST_SYSTEMD_ENABLED:
+                await update_progress(progress, 6, "Initializing Linux services", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+                guest_ready, guest_error = await wait_for_guest_ready(resource_id)
+                if not guest_ready:
+                    raise RuntimeError(guest_error or "Guest Linux services failed to initialize.")
+            # Persist the VPS immediately after Docker reports it as running.
+            # Console access is strictly optional and must NEVER be allowed to
+            # turn a successful VPS creation into a failure/rollback.
+            await update_progress(progress, 7, "Saving VPS record", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
             db_upsert_user(user.id, str(user))
             db_insert_vps(
-                user_id=user.id, container_id=resource_id, container_name=name,
-                os_type=normalized_os, location=normalized_location, hostname=hostname,
-                ram=ram, cpu=cpu, disk=disk, sshx_url=None, sshx_pid=None,
-                public_ipv4=None, ipv4_verified_at=None, backend="qemu",
-                ptero_server_id=None, ptero_identifier=None, ptero_user_id=None,
+                user_id=user.id,
+                container_id=resource_id,
+                container_name=name,
+                os_type=normalized_os,
+                location=normalized_location,
+                hostname=hostname,
+                ram=ram,
+                cpu=cpu,
+                disk=disk,
+                sshx_url=None,
+                sshx_pid=None,
+                ssh_password=ssh_password,
+                public_ipv4=verified_ipv4 if valid_public_ipv4(verified_ipv4) else None,
+                ipv4_verified_at=utc_now() if valid_public_ipv4(verified_ipv4) else None,
+                backend="docker",
+                ptero_server_id=None,
+                ptero_identifier=None,
+                ptero_user_id=None,
             )
             row = db_find_vps(user.id, resource_id)
             if not row:
                 raise RuntimeError("VPS was created but could not be saved to SQLite.")
+            ssh_forward_ok, ssh_forward_message, ssh_host_port = await ensure_ssh_forward(row)
+            if not ssh_forward_ok:
+                logger.warning("Automatic SSH forwarding failed for VPS #%s: %s", row["id"], safe_log(ssh_forward_message))
+            row = db_get_vps(row["id"]) or row
 
+            # Best-effort background-style console setup. Every exception is
+            # contained here; SSHx availability is NOT part of VPS readiness.
             console = None
-            await qemu_progress(8, "Preparing optional console access")
+            await update_progress(progress, 8, "Preparing optional console access", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
             try:
-                console = await asyncio.wait_for(
-                    install_and_start_sshx(resource_id), timeout=max(20, SSHX_TOTAL_TIMEOUT + 5)
-                )
+                console = await asyncio.wait_for(install_and_start_sshx(resource_id), timeout=max(20, SSHX_TOTAL_TIMEOUT + 5))
             except Exception as exc:
                 logger.warning("Optional SSHx setup failed for %s; VPS remains healthy: %s", clean(resource_id, 32), safe_log(exc))
+                console = None
 
             if console and console.get("pid"):
-                db_update_vps(
-                    resource_id,
-                    sshx_url=normalize_sshx_url(console.get("url")) if console.get("url") else None,
-                    sshx_pid=console.get("pid"),
-                )
+                db_update_vps(resource_id, sshx_url=normalize_sshx_url(console.get("url")) if console.get("url") else None, sshx_pid=console.get("pid"))
 
-            with contextlib.suppress(Exception):
+            # Port supervision is useful but is also non-fatal during first boot.
+            try:
                 await supervise_vps_ports(db_get_vps(row["id"]) or row)
+            except Exception as exc:
+                logger.warning("Initial VPS port supervision failed for %s: %s", clean(resource_id, 32), safe_log(exc))
 
             final_row = db_get_vps(row["id"]) or row
-            await qemu_progress(10, "VPS Ready")
-            return True, "Real QEMU VPS created successfully (TCG, no KVM).", final_row
+            ssh_port_row = next((p for p in db_list_ports(final_row["id"]) if int(p["container_port"]) == 22 and str(p["protocol"]).lower() == "tcp"), None)
+            if ssh_port_row:
+                db_update_vps(final_row["container_id"], ssh_command=f"ssh root@<PUBLIC_IP> -p {int(ssh_port_row["host_port"])}")
+                final_row = db_get_vps(final_row["id"]) or final_row
+            await update_progress(progress, 10, "VPS Ready", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
+            return True, (
+                "RGNODES VPS created successfully."
+                + (" Console is ready." if console else " Console is temporarily unavailable; the VPS is online. Use Console/sshx to retry.")
+            ), final_row
 
         except asyncio.CancelledError:
-            logger.warning("QEMU VPS creation cancelled for user %s", user.id)
-            if resource_id:
+            logger.error("VPS creation cancelled for user %s", user.id)
+            if resource_id and backend == "docker":
                 with contextlib.suppress(Exception):
                     await stop_sshx(resource_id)
                 with contextlib.suppress(Exception):
-                    await qemu_remove_vm(resource_id)
+                    await docker_remove(resource_id)
+            elif ptero_server_id:
+                with contextlib.suppress(Exception):
+                    await ptero_delete_server(ptero_server_id, force=True)
             raise
         except Exception as exc:
-            logger.error("QEMU VPS creation failed: %s", safe_log(exc))
-            if resource_id:
+            logger.error("VPS creation failed: %s", safe_log(exc))
+            if resource_id and backend == "docker":
                 with contextlib.suppress(Exception):
                     await stop_sshx(resource_id)
                 with contextlib.suppress(Exception):
-                    await qemu_remove_vm(resource_id)
+                    await docker_remove(resource_id)
+            elif ptero_server_id:
+                with contextlib.suppress(Exception):
+                    await ptero_delete_server(ptero_server_id, force=True)
             return False, f"VPS creation failed safely: {safe_log(exc)}", None
 
 
@@ -4385,72 +3873,97 @@ async def ptero_suspend_server(server_id: int, suspended: bool) -> tuple[bool, s
 
 
 async def docker_reinstall_vps(vps: sqlite3.Row, os_type: str) -> tuple[bool, str]:
-    """Reinstall a real QEMU VPS while preserving its database identity."""
+    """Replace a Docker VPS container with a clean container using the selected OS.
+
+    The VPS database row, ID, allocation and user ownership are preserved. The
+    container itself is recreated from the selected image.
+    """
     normalized = normalize_os(os_type)
     if not normalized:
         return False, "Unsupported operating system."
-    old_vm = str(vps["container_id"])
-    new_name = f"{str(vps['container_name'])[:42]}-reinstall-{int(time.time()) % 100000}"[:63]
-    new_vm: str | None = None
-    try:
-        await stop_sshx(old_vm)
+    old_container = str(vps["container_id"])
+    image = str(OS_CONFIG[normalized]["image"])
+    new_container = f"{str(vps['container_name'])[:48]}-reinstall-{int(time.time()) % 100000}"[:63]
+    old_exists = await docker_exists(old_container)
+    new_exists = await docker_exists(new_container)
+    if new_exists:
+        with contextlib.suppress(Exception):
+            await docker_remove(new_container)
+    if old_exists:
+        await stop_sshx(old_container)
         for p_row in db_list_ports(vps["id"]):
             await stop_port_forward(p_row)
-        if await qemu_state(old_vm) == "running":
-            await qemu_stop_vm(old_vm)
-
-        new_vm, error = await qemu_create_vm(
-            os_type=normalized, hostname=str(vps["hostname"]), ram=str(vps["ram"]),
-            cpu=str(vps["cpu"]), disk=str(vps["disk"]), name=new_name,
+        if not await docker_stop(old_container):
+            state_now = await docker_state(old_container)
+            if state_now not in {"exited", "stopped", None}:
+                return False, "Could not stop the current VPS before reinstall."
+    reinstall_ssh_password = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(SSH_PASSWORD_LENGTH))
+    try:
+        created_id, err = await docker_run(
+            image=image,
+            container_name=new_container,
+            ram=str(vps["ram"]),
+            cpu=str(vps["cpu"]),
+            disk=str(vps["disk"]),
+            hostname=str(vps["hostname"]),
+            location=str(vps["location"]),
             persistent_key=str(vps["container_name"]),
+            ssh_password=reinstall_ssh_password,
         )
-        if not new_vm:
+        if not created_id:
+            # Roll the old VPS back to running state so a failed reinstall does
+            # not unnecessarily leave the user's service offline.
+            if old_exists:
+                with contextlib.suppress(Exception):
+                    await docker_start(old_container)
+            return False, f"Reinstall failed while creating the new container: {err or 'Docker run failed.'}"
+        # Keep the old container until the replacement passes the full
+        # readiness gate. It remains stopped, so persistent volumes are not
+        # written by two containers at the same time.
+        container_ref = str(created_id)
+        for _ in range(30):
+            if await docker_state(container_ref) == "running":
+                break
+            await asyncio.sleep(0.5)
+        else:
             with contextlib.suppress(Exception):
-                await qemu_launch(old_vm)
-            return False, f"Reinstall failed while creating the replacement VM: {error or 'QEMU failed.'}"
-
-        ready, detail = await _wait_qemu_ready(new_vm)
-        if not ready:
-            with contextlib.suppress(Exception):
-                await qemu_remove_vm(new_vm)
-            with contextlib.suppress(Exception):
-                await qemu_launch(old_vm)
-            return False, f"Replacement VM failed readiness: {detail}"
-
-        console = await install_and_start_sshx(new_vm)
-        new_url = normalize_sshx_url(console.get("url")) if console and console.get("url") else None
-        new_pid = console.get("pid") if console else None
-
-        if await qemu_state(old_vm) in {"running", "stopped"}:
-            with contextlib.suppress(Exception):
-                await qemu_remove_vm(old_vm)
-
-        # Snapshots are internal to the old qcow2 overlay and cannot safely
-        # reference the replacement disk. Preserve the VPS, not stale snapshots.
-        with contextlib.suppress(Exception):
-            db_delete_all_snapshots(vps["id"])
-        db_update_vps(
-            old_vm,
-            container_id=new_vm,
-            container_name=new_name,
-            os_type=normalized,
-            status="running",
-            suspended=0,
-            sshx_url=new_url,
-            sshx_pid=new_pid,
-            backend="qemu",
-        )
+                await docker_remove(container_ref)
+            if old_exists:
+                with contextlib.suppress(Exception):
+                    await docker_start(old_container)
+            return False, "Reinstall container did not reach running state; the previous VPS was restored."
+        if GUEST_SYSTEMD_ENABLED:
+            guest_ready, guest_error = await wait_for_guest_ready(container_ref)
+            if not guest_ready:
+                with contextlib.suppress(Exception):
+                    await docker_remove(container_ref)
+                if old_exists:
+                    with contextlib.suppress(Exception):
+                        await docker_start(old_container)
+                return False, f"Reinstall guest bootstrap failed: {guest_error}"
+        console = await install_and_start_sshx(container_ref)
+        if old_exists:
+            if not await docker_remove(old_container):
+                logger.warning(
+                    "Old reinstall container %s could not be removed after successful readiness; keeping it stopped.",
+                    clean(old_container, 48),
+                )
+        conn = db_connect()
+        try:
+            conn.execute(
+                "UPDATE vps SET container_id=?, container_name=?, os_type=?, status='running', suspended=0, sshx_url=?, sshx_pid=?, ssh_password=?, updated_at=? WHERE id=?",
+                (container_ref, new_container, normalized, console.get("url") if console else None, console.get("pid") if console else None, reinstall_ssh_password, utc_now(), int(vps["id"])),
+            )
+        finally:
+            conn.close()
         latest = db_get_vps(vps["id"])
         if latest:
             await supervise_vps_ports(latest)
         return True, f"VPS reinstalled successfully with **{os_label(normalized)}**."
     except Exception as exc:
-        logger.exception("QEMU reinstall failed for VPS #%s", vps["id"])
-        if new_vm:
-            with contextlib.suppress(Exception):
-                await qemu_remove_vm(new_vm)
+        logger.exception("Docker reinstall failed for VPS #%s", vps["id"])
         with contextlib.suppress(Exception):
-            await qemu_launch(old_vm)
+            await docker_remove(locals().get("container_ref", new_container))
         return False, f"Reinstall failed safely: {safe_log(exc)}"
 
 
@@ -4521,70 +4034,65 @@ async def lifecycle_action(vps: sqlite3.Row, action: str) -> tuple[bool, str]:
 
             return False, "Unsupported Pterodactyl VPS action."
 
-        container = str(vps["container_id"])
-        if backend != "qemu":
-            return False, "Unsupported local VPS backend."
-        exists = qemu_load_meta(container) is not None
-
+        container = vps["container_id"]
+        exists = await docker_exists(container)
         if action == "start":
             if vps["suspended"]:
                 return False, "This VPS is suspended by an administrator."
             if not exists:
-                return False, "The QEMU VM metadata no longer exists. Ask an administrator to recreate this VPS."
+                return False, "The Docker container no longer exists. Ask an administrator to recreate this VPS."
             async with CAPACITY_LOCK:
                 _, current = await docker_running_count()
-                already_running = (await qemu_state(container)) == "running"
+                already_running = (await docker_state(container)) == "running"
                 if not already_running and current >= TOTAL_RUNNING_LIMIT:
                     return False, f"Global running VPS limit reached ({TOTAL_RUNNING_LIMIT})."
-                ok, error = await qemu_launch(container, qemu_running_forwards(int(vps["id"])))
+                ok, error = await docker_start(container)
             if not ok:
                 return False, error or "Failed to start the VPS."
-            if not already_running:
-                ready, detail = await _wait_qemu_ready(container)
-                if not ready:
-                    return False, f"VPS started but readiness failed: {detail}"
+            for _ in range(20):
+                if await docker_state(container) == "running":
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                return False, "The VPS start command returned, but the container is not running."
             console = await install_and_start_sshx(container)
             existing = db_get_vps(vps["id"]) or vps
-            db_update_vps(
-                container, status="running",
-                sshx_url=normalize_sshx_url(console.get("url")) if console and console.get("url") else existing["sshx_url"],
-                sshx_pid=console.get("pid") if console and console.get("pid") else existing["sshx_pid"],
-            )
-            latest = db_get_vps(vps["id"]) or vps
-            await supervise_vps_ports(latest)
-            return True, "VPS started successfully." + (" Console refreshed." if console else " Press Console to retry SSHx.")
+            db_update_vps(container, status="running", sshx_url=console["url"] if console else existing["sshx_url"], sshx_pid=console.get("pid") if console else existing["sshx_pid"])
+            await supervise_vps_ports(vps)
+            return True, "VPS started. Console refreshed." if console else "VPS started; press Console to retry SSHx."
 
         if action == "stop":
             if exists:
                 await stop_sshx(container)
                 for p_row in db_list_ports(vps["id"]):
                     await stop_port_forward(p_row)
-                if not await qemu_stop_vm(container) and await qemu_state(container) == "running":
+                if not await docker_stop(container) and await docker_state(container) not in {"exited", "stopped"}:
                     return False, "Failed to stop the VPS."
             db_update_vps(container, status="stopped", sshx_url=None, sshx_pid=None)
             return True, "VPS stopped successfully."
 
         if action == "restart":
             if not exists:
-                return False, "The QEMU VM metadata no longer exists."
+                return False, "The Docker container no longer exists."
             async with CAPACITY_LOCK:
+                _, current = await docker_running_count()
+                if current >= TOTAL_RUNNING_LIMIT and (await docker_state(container)) != "running":
+                    return False, f"Global running VPS limit reached ({TOTAL_RUNNING_LIMIT})."
                 await stop_sshx(container)
-                ok, error = await qemu_restart_vm(container, int(vps["id"]))
+                ok, error = await docker_restart(container)
             if not ok:
                 return False, error or "Failed to restart the VPS."
-            ready, detail = await _wait_qemu_ready(container)
-            if not ready:
-                return False, f"VPS restarted but readiness failed: {detail}"
+            for _ in range(20):
+                if await docker_state(container) == "running":
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                return False, "The VPS restart command returned, but the container is not running."
             console = await install_and_start_sshx(container)
             existing = db_get_vps(vps["id"]) or vps
-            db_update_vps(
-                container, status="running",
-                sshx_url=normalize_sshx_url(console.get("url")) if console and console.get("url") else existing["sshx_url"],
-                sshx_pid=console.get("pid") if console and console.get("pid") else existing["sshx_pid"],
-            )
-            latest = db_get_vps(vps["id"]) or vps
-            await supervise_vps_ports(latest)
-            return True, "VPS restarted successfully."
+            db_update_vps(container, status="running", sshx_url=console["url"] if console else existing["sshx_url"], sshx_pid=console.get("pid") if console else existing["sshx_pid"])
+            await supervise_vps_ports(vps)
+            return True, "VPS restarted successfully." if console else "VPS restarted; press Console to retry SSHx."
 
         if action == "reinstall":
             return False, "Select an operating system from the Reinstall menu first."
@@ -4594,8 +4102,8 @@ async def lifecycle_action(vps: sqlite3.Row, action: str) -> tuple[bool, str]:
                 await stop_port_forward(p_row)
             if exists:
                 await stop_sshx(container)
-                if not await qemu_remove_vm(container):
-                    return False, "QEMU cleanup failed; the VPS record was kept."
+                if not await docker_remove(container):
+                    return False, "Docker cleanup failed; the VPS record was kept."
             db_delete_vps(container)
             return True, "VPS deleted successfully."
 
@@ -4604,7 +4112,11 @@ async def lifecycle_action(vps: sqlite3.Row, action: str) -> tuple[bool, str]:
                 await stop_sshx(container)
                 for p_row in db_list_ports(vps["id"]):
                     await stop_port_forward(p_row)
-                await qemu_stop_vm(container)
+                stopped = await docker_stop(container)
+                if not stopped:
+                    state_now = await docker_state(container)
+                    if state_now not in {"exited", "stopped", None}:
+                        return False, "Failed to stop the VPS before suspension."
             db_update_vps(container, status="stopped", suspended=1, sshx_url=None, sshx_pid=None)
             return True, "VPS stopped and suspended."
 
@@ -4628,8 +4140,7 @@ async def create_console_access(vps: sqlite3.Row, user: discord.User | discord.M
         sent = await safe_dm(user, make_embed("✨ RGNODES™ • 🦖 Pterodactyl Panel", "Open your VPS panel from the button below."), sshx_view(url))
         return True, "Pterodactyl panel access link sent by DM." if sent else "Pterodactyl panel is ready, but your DM is closed."
 
-    backend = str(vps["backend"] or "qemu").lower()
-    state = await qemu_state(str(vps["container_id"])) if backend == "qemu" else await docker_state(str(vps["container_id"]))
+    state = await docker_state(vps["container_id"])
     if state != "running":
         db_update_vps(vps["container_id"], status="stopped", sshx_url=None, sshx_pid=None)
         return False, "Start the VPS before opening Console."
@@ -4917,34 +4428,6 @@ async def verify_host_listener(port: int) -> bool:
 async def start_port_forward(port_row: sqlite3.Row, vps: sqlite3.Row) -> tuple[bool, str]:
     if str(port_row["protocol"]).lower() != "tcp":
         return False, "Only TCP forwarding is enabled."
-    if str(vps["backend"] or "docker").lower() == "qemu":
-        if await qemu_state(vps["container_id"]) != "running":
-            db_update_port(port_row["id"], status="stopped", pid=None, target_ip=None)
-            return False, "VPS is not running. Start it first."
-        host_port = int(port_row["host_port"])
-        if str(port_row["status"]).lower() == "running":
-            desired = [
-                (int(row["host_port"]), int(row["container_port"]))
-                for row in db_list_ports(vps["id"])
-                if str(row["protocol"]).lower() == "tcp" and str(row["status"]).lower() == "running"
-            ]
-            if (host_port, int(port_row["container_port"])) in desired and await qemu_state(vps["container_id"]) == "running":
-                return True, f"QEMU forwarding is already online on public port `{host_port}`."
-        if not port_bindable(host_port) and str(port_row["status"]).lower() != "running":
-            db_update_port(port_row["id"], status="error", pid=None, target_ip=None)
-            return False, f"Public port `{host_port}` is already in use."
-        desired = [
-            (int(row["host_port"]), int(row["container_port"]))
-            for row in db_list_ports(vps["id"])
-            if str(row["protocol"]).lower() == "tcp" and (int(row["id"]) == int(port_row["id"]) or str(row["status"]).lower() == "running")
-        ]
-        await qemu_stop_vm(vps["container_id"])
-        ok, detail = await qemu_launch(vps["container_id"], desired)
-        if not ok:
-            db_update_port(port_row["id"], status="error", pid=None, target_ip=None)
-            return False, detail or "QEMU network reconfiguration failed."
-        db_update_port(port_row["id"], status="running", pid=None, target_ip="127.0.0.1")
-        return True, f"QEMU forwarding is online on public port `{host_port}`."
     if await docker_state(vps["container_id"]) != "running":
         db_update_port(port_row["id"], status="stopped", pid=None, target_ip=None)
         return False, "VPS is not running. Start it first."
@@ -5011,6 +4494,48 @@ async def stop_port_forward(port_row: sqlite3.Row) -> None:
     db_update_port(port_row["id"], status="stopped", pid=None)
 
 
+
+async def ensure_ssh_forward(vps: sqlite3.Row) -> tuple[bool, str, int | None]:
+    """Guarantee one stable TCP host port for guest SSH/22."""
+    if not AUTO_CREATE_SSH_FORWARD:
+        return True, "Automatic SSH forwarding is disabled.", None
+    existing = db_list_ports(vps["id"])
+    for row in existing:
+        if int(row["container_port"]) == 22 and str(row["protocol"]).lower() == "tcp":
+            if str(row["status"]).lower() == "running":
+                return True, "SSH forwarding is already active.", int(row["host_port"])
+            ok, msg = await start_port_forward(row, vps)
+            return ok, msg, int(row["host_port"]) if ok else None
+
+    conn = db_connect()
+    try:
+        reserved = {int(r[0]) for r in conn.execute("SELECT host_port FROM vps_ports")}
+    finally:
+        conn.close()
+    for port in range(max(1024, SSH_FORWARD_PORT_START), min(65535, SSH_FORWARD_PORT_END) + 1):
+        if port in reserved or not port_bindable(port):
+            continue
+        now = utc_now()
+        conn = db_connect()
+        try:
+            cur = conn.execute(
+                "INSERT INTO vps_ports(vps_id,container_port,host_port,protocol,target_ip,pid,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (int(vps["id"]), 22, port, "tcp", None, None, "stopped", now, now),
+            )
+            port_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError:
+            conn.close()
+            continue
+        finally:
+            with contextlib.suppress(Exception):
+                conn.close()
+        row = next((r for r in db_list_ports(vps["id"]) if int(r["id"]) == port_id), None)
+        if not row:
+            return False, "SSH forwarding record could not be saved.", None
+        ok, msg = await start_port_forward(row, vps)
+        return ok, msg, port if ok else None
+    return False, "No free host port was available for SSH forwarding.", None
+
 async def supervise_vps_ports(vps: sqlite3.Row) -> None:
     try:
         ports = db_list_ports(vps["id"])
@@ -5037,77 +4562,99 @@ SNAPSHOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 async def docker_snapshot_create(vps: sqlite3.Row, name: str) -> tuple[bool, str]:
-    if str(vps["backend"] or "qemu").lower() != "qemu":
-        return False, "Snapshots are available for real QEMU VPS instances."
+    if str(vps["backend"] or "docker").lower() != "docker":
+        return False, "Snapshots are currently available for Docker VPS instances only. Pterodactyl backups are managed by the panel."
     name = name.strip()
     if not SNAPSHOT_NAME_RE.fullmatch(name):
         return False, "Snapshot name must be 1–64 characters and use only letters, numbers, `.`, `_`, or `-`."
     if db_get_snapshot(vps["id"], name):
         return False, "A snapshot with that name already exists."
-    vm_id = str(vps["container_id"])
-    if await qemu_state(vm_id) != "running":
+    if await docker_state(vps["container_id"]) != "running":
         return False, "Start the VPS before creating a snapshot."
-    meta = qemu_load_meta(vm_id) or {}
-    disk = Path(str(meta.get("disk_path", "")))
-    if not disk.exists():
-        return False, "The QEMU disk image is missing."
-    snap_dir = disk.parent / "snapshots"
-    snap_dir.mkdir(parents=True, exist_ok=True)
-    snap_path = snap_dir / f"{name}.qcow2"
-    was_running = await qemu_state(vm_id) == "running"
-    if was_running:
-        await qemu_stop_vm(vm_id)
+    image_ref = f"rgnodes-snapshot:{int(vps['id'])}-{name.lower()}"
+    rc, out, err = await docker_cli("commit", vps["container_id"], image_ref, timeout=180, retries=1)
+    if rc != 0:
+        return False, f"Docker snapshot failed: {safe_log(err.decode('utf-8', 'replace'))}"
+    if not out.decode("utf-8", "replace").strip():
+        return False, "Docker did not return a snapshot image ID."
     try:
-        rc, _, err = await run_process("qemu-img", "snapshot", "-c", name, str(disk), timeout=180)
-        if rc != 0:
-            return False, safe_log(err.decode("utf-8", "replace").strip() or "QEMU snapshot failed.")
-        db_insert_snapshot(vps["id"], name, str(disk))
-        return True, f"Snapshot `{name}` created successfully."
-    finally:
-        if was_running:
-            with contextlib.suppress(Exception):
-                await qemu_launch(vm_id)
+        db_insert_snapshot(vps["id"], name, image_ref)
+    except sqlite3.IntegrityError:
+        return False, "Snapshot record already exists."
+    return True, f"Snapshot `{name}` created successfully."
 
 
 async def docker_snapshot_restore(vps: sqlite3.Row, name: str) -> tuple[bool, str]:
-    if str(vps["backend"] or "qemu").lower() != "qemu":
-        return False, "Snapshot restore is currently available for real QEMU VPS instances."
+    if str(vps["backend"] or "docker").lower() != "docker":
+        return False, "Snapshot restore is currently available for Docker VPS instances only."
     snap = db_get_snapshot(vps["id"], name.strip())
     if not snap:
         return False, "Snapshot not found."
-    vm_id = str(vps["container_id"])
-    meta = qemu_load_meta(vm_id) or {}
-    disk = Path(str(meta.get("disk_path", "")))
-    if not disk.exists():
-        return False, "The QEMU disk image is missing."
-    await qemu_stop_vm(vm_id)
-    rc, _, err = await run_process("qemu-img", "snapshot", "-a", str(name).strip(), str(disk), timeout=180)
+    container = vps["container_id"]
+    snapshot_image = str(snap["image_ref"])
+    rc, _, err = await docker_cli("image", "inspect", snapshot_image, timeout=30, retries=1)
     if rc != 0:
-        return False, safe_log(err.decode("utf-8", "replace").strip() or "QEMU snapshot restore failed.")
-    ok, detail = await qemu_launch(vm_id)
-    if not ok:
-        return False, detail or "QEMU could not restart after snapshot restore."
-    ready, detail = await _wait_qemu_ready(vm_id)
-    if not ready:
-        return False, detail
+        db_delete_snapshot(vps["id"], name.strip())
+        return False, "Snapshot image no longer exists; its stale database record was removed."
+    new_name = str(vps["container_name"])
+    async with vps_lock(vps["id"]):
+        await stop_sshx(container)
+        for p_row in db_list_ports(vps["id"]):
+            await stop_port_forward(p_row)
+        if await docker_exists(container) and not await docker_remove(container):
+            return False, "Could not remove the current container safely, so restore was aborted."
+        new_container, create_error = await docker_run(
+            image=snapshot_image,
+            hostname=str(vps["hostname"]),
+            ram=str(vps["ram"]),
+            cpu=str(vps["cpu"]),
+            disk=str(vps["disk"]),
+            container_name=new_name,
+            location=str(vps["location"]),
+            persistent_key=str(vps["container_name"]),
+        )
+        if not new_container:
+            return False, f"Restore failed while recreating the container: {create_error}"
+        # `docker run --detach` starts the restored container already.
+        # Only start it explicitly when it is not running.
+        ok, error = await ensure_docker_running(new_container)
+        if not ok:
+            await docker_remove(new_container)
+            return False, f"Restore created a container but could not start it: {error}"
+        for _ in range(20):
+            if await docker_state(new_container) == "running":
+                break
+            await asyncio.sleep(0.5)
+        else:
+            await docker_remove(new_container)
+            return False, "Restored container did not reach running state."
+        console = await install_and_start_sshx(new_container)
+        # Atomically update the existing VPS record to the restored container.
+        conn = db_connect()
+        try:
+            conn.execute(
+                "UPDATE vps SET container_id=?, status='running', suspended=0, sshx_url=?, sshx_pid=?, updated_at=? WHERE id=?",
+                (new_container, console["url"] if console else None, console.get("pid") if console else None, utc_now(), int(vps["id"])),
+            )
+        finally:
+            conn.close()
+        latest = db_get_vps(vps["id"])
+        if latest:
+            await supervise_vps_ports(latest)
     return True, f"Snapshot `{name}` restored successfully."
 
 
 async def snapshot_delete_image(vps: sqlite3.Row, name: str) -> tuple[bool, str]:
-    if str(vps["backend"] or "qemu").lower() != "qemu":
-        return False, "Snapshot deletion is currently available for real QEMU VPS instances."
     snap = db_get_snapshot(vps["id"], name.strip())
     if not snap:
         return False, "Snapshot not found."
-    vm_id = str(vps["container_id"])
-    meta = qemu_load_meta(vm_id) or {}
-    disk = Path(str(meta.get("disk_path", "")))
-    if disk.exists():
-        rc, _, err = await run_process("qemu-img", "snapshot", "-d", str(name).strip(), str(disk), timeout=120)
-        if rc != 0:
-            return False, safe_log(err.decode("utf-8", "replace").strip() or "QEMU snapshot deletion failed.")
+    image_ref = str(snap["image_ref"])
+    rc, _, err = await docker_cli("image", "rm", "-f", image_ref, timeout=60, retries=1)
+    if rc != 0 and "No such image" not in err.decode("utf-8", "replace"):
+        return False, f"Could not remove snapshot image: {safe_log(err.decode('utf-8', 'replace'))}"
     db_delete_snapshot(vps["id"], name.strip())
-    return True, f"Snapshot `{name}` deleted successfully."
+    return True, f"Snapshot `{name}` deleted."
+
 
 # ================================================================
 # Host/system bootstrap
@@ -5270,11 +4817,20 @@ async def install_system_dependencies() -> tuple[bool, str]:
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
+
+
+def dynamic_prefix(bot_instance: commands.Bot, message: discord.Message):
+    """Admins may use ! for administration and - for user commands."""
+    author = getattr(message, "author", None)
+    if author is not None and ADMIN_ID > 0 and int(author.id) == int(ADMIN_ID):
+        return ["-", "!"]
+    return ["-"]
 
 
 class RGNODESBot(commands.Bot):
     def __init__(self) -> None:
-        super().__init__(command_prefix=PREFIX, intents=intents, help_command=None)
+        super().__init__(command_prefix=dynamic_prefix, intents=intents, help_command=None)
         self.synced = False
         self.loops_started = False
 
@@ -5351,8 +4907,8 @@ class ReinstallView(discord.ui.View):
             if not vps:
                 await safe_edit_original(interaction, embed=make_embed("❌ VPS Not Found", "This VPS no longer exists."), view=None)
                 return
-            backend = str(vps["backend"] or "qemu").lower()
-            if backend in {"docker", "qemu"}:
+            backend = str(vps["backend"] or "docker").lower()
+            if backend == "docker":
                 async with vps_lock(self.vps_id):
                     ok, message = await docker_reinstall_vps(vps, selected)
             elif backend == "pterodactyl":
@@ -5410,6 +4966,14 @@ class ManageView(discord.ui.View):
             await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "This VPS no longer exists."))
             self.stop()
             return
+        if int(interaction.user.id) not in {int(self.owner_id), int(ADMIN_ID)}:
+            share_level = db_share_access_level(self.vps_id, interaction.user.id)
+            if share_level == "manage" and action in {"delete", "reinstall"}:
+                await safe_followup(interaction, embed=make_embed("🔒 Limited Access", "This VPS was shared with **manage** access. Delete/reinstall actions require full access or ownership."))
+                return
+            if share_level not in {"manage", "full"}:
+                await safe_followup(interaction, embed=make_embed("❌ Access Denied", "Your VPS share is no longer valid."))
+                return
         try:
             if action in {"stats", "refresh"}:
                 await show_dashboard(interaction, vps)
@@ -5439,7 +5003,7 @@ class ManageView(discord.ui.View):
                 await safe_edit_original(interaction, embed=make_embed("🗑️ VPS Removed", f"`{clean(vps['container_name'])}` and its forwarding rules were removed successfully."), view=None)
                 return
             latest = await refresh_vps_record_state(db_get_vps(self.vps_id) or vps)
-            if str(latest["backend"] or "qemu").lower() in {"docker", "qemu"}:
+            if str(latest["backend"] or "docker").lower() == "docker":
                 await asyncio.gather(supervise_vps_ports(latest), detect_public_network(), return_exceptions=True)
                 ports = db_list_ports(latest["id"])
             else:
@@ -5562,7 +5126,7 @@ async def _dashboard_live_data(vps: sqlite3.Row) -> tuple[dict[str, str], str, d
     backend = str(vps["backend"] or "docker").lower()
     network = NETWORK_CACHE
     ports: list[sqlite3.Row] = []
-    if backend in {"docker", "qemu"}:
+    if backend == "docker":
         await asyncio.gather(
             supervise_vps_ports(vps),
             detect_public_network(),
@@ -5622,10 +5186,20 @@ async def show_dashboard(interaction: discord.Interaction, vps: sqlite3.Row) -> 
         await safe_followup(interaction, embed=embed, view=view)
 
 
-async def deploy_flow(interaction: discord.Interaction, *, user: discord.User | discord.Member, os_type: str, location: str, ram: str, cpu: str, disk: str, backend_override: str | None = None) -> None:
+async def deploy_flow(interaction: discord.Interaction, *, user: discord.User | discord.Member, os_type: str, location: str, ram: str, cpu: str, disk: str, backend_override: str | None = None, charge_cost: bool = True) -> None:
     async def progress(embed: discord.Embed) -> None:
         await safe_edit_original(interaction, embed=embed)
 
+    charged = False
+    if charge_cost and not (ADMIN_ID > 0 and int(interaction.user.id) == int(ADMIN_ID)):
+        wallet, _bank = db_balance(user.id)
+        if wallet < DEPLOY_COST:
+            await safe_edit_original(interaction, embed=make_embed("💰 Insufficient Coins", f"Deploying a VPS costs **{DEPLOY_COST:,} coins**.\nYour wallet: `{wallet:,}` coins."))
+            return
+        charged = db_take_coins(user.id, DEPLOY_COST)
+        if not charged:
+            await safe_edit_original(interaction, embed=make_embed("💰 Payment Failed", "Your coin balance changed before deployment. Please retry."))
+            return
     try:
         ok, message, vps = await asyncio.wait_for(
             create_vps(
@@ -5641,16 +5215,18 @@ async def deploy_flow(interaction: discord.Interaction, *, user: discord.User | 
             timeout=DEPLOY_TIMEOUT,
         )
     except asyncio.TimeoutError:
+        if charged: db_add_coins(user.id, DEPLOY_COST)
         logger.error("Deployment timed out for user %s after %ss", user.id, DEPLOY_TIMEOUT)
         await safe_edit_original(
             interaction,
             embed=make_embed(
                 "❌ VPS Creation Timed Out",
-                "QEMU took too long to complete the real VM deployment. Any partial VM was cleaned up when possible. Please retry.",
+                "Docker took too long to complete the deployment. Any partially created container was cleaned up when possible. Please retry.",
             ),
         )
         return
     except Exception:
+        if charged: db_add_coins(user.id, DEPLOY_COST)
         logger.exception("Unhandled deployment exception for user %s", user.id)
         await safe_edit_original(
             interaction,
@@ -5658,6 +5234,7 @@ async def deploy_flow(interaction: discord.Interaction, *, user: discord.User | 
         )
         return
     if not ok or not vps:
+        if charged: db_add_coins(user.id, DEPLOY_COST)
         await safe_edit_original(interaction, embed=make_embed("❌ VPS Creation Failed", message))
         return
     network = await detect_public_network(force=True)
@@ -5667,7 +5244,19 @@ async def deploy_flow(interaction: discord.Interaction, *, user: discord.User | 
             db_set_vps_ipv4(vps["container_id"], network["ip"])
 
     console_url = normalize_sshx_url(vps["sshx_url"]) if vps["sshx_url"] else None
-    dm_sent = await send_vps_ready_dm(user, vps, network)
+    dm_sent = False
+    ssh_port = next((int(p["host_port"]) for p in db_list_ports(vps["id"]) if int(p["container_port"]) == 22 and str(p["protocol"]).lower() == "tcp"), None)
+    await safe_dm(user, ssh_access_embed(vps, network.get("ip") if ip_ok else None, ssh_port))
+    if console_url:
+        dm_sent = await safe_dm(
+            user,
+            console_embed(vps["container_name"], console_url, network.get("ip") if ip_ok else None, actual_location_label(network)),
+            sshx_view(console_url),
+        )
+        if ip_ok:
+            await safe_dm(user, ipv4_dm_embed(vps, network))
+    elif ip_ok:
+        await safe_dm(user, ipv4_dm_embed(vps, network))
 
     final = make_embed("✅ VPS Ready", f"Your **{os_label(vps['os_type'])}** VPS is online.")
     final.add_field(name="🖥️ VPS", value=f"`{clean(vps['container_name'])}` • ID `{vps['id']}`", inline=False)
@@ -5735,6 +5324,9 @@ async def slash_lifecycle(interaction: discord.Interaction, identifier: str, act
     if not await safe_defer(interaction, ephemeral=True): return
     vps = actor_vps(interaction, identifier)
     if not vps: await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found.")); return
+    if action in {"delete", "reinstall"} and int(interaction.user.id) not in {int(vps["user_id"]), int(ADMIN_ID)}:
+        if db_share_access_level(vps["id"], interaction.user.id) != "full":
+            await safe_followup(interaction, embed=make_embed("🔒 Limited Access", "Delete/reinstall requires VPS ownership, admin access, or a full-access share.")); return
     ok, message = await lifecycle_action(vps, action)
     if ok and action in {"start", "restart"}:
         await send_private_ipv4(interaction.user, db_get_vps(vps["id"]) or vps)
@@ -5766,7 +5358,7 @@ async def vps_info_slash(interaction: discord.Interaction, vps_identifier: str |
     await show_dashboard(interaction, vps)
 
 
-@bot.tree.command(name="remove", description="Delete a RGNODES VPS.")
+@bot.tree.command(name="remove", description="Delete a VPS and its Docker container.")
 async def remove_slash(interaction: discord.Interaction, vps_identifier: str): await slash_lifecycle(interaction, vps_identifier, "delete")
 
 
@@ -5826,7 +5418,7 @@ async def restart_vps_slash(interaction: discord.Interaction, vps_identifier: st
     await slash_lifecycle(interaction, vps_identifier, "restart")
 
 
-@bot.tree.command(name="snapshot", description="Create a real VPS snapshot.")
+@bot.tree.command(name="snapshot", description="Create a Docker VPS snapshot.")
 async def snapshot_slash(interaction: discord.Interaction, vps_identifier: str, name: str | None = None):
     if not await safe_defer(interaction, ephemeral=True):
         return
@@ -5847,7 +5439,7 @@ async def list_snapshots_slash(interaction: discord.Interaction, vps_identifier:
     if not vps:
         await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found."))
         return
-    if str(vps["backend"] or "qemu").lower() not in {"docker", "qemu"}:
+    if str(vps["backend"] or "docker").lower() != "docker":
         await safe_followup(interaction, embed=make_embed("🦖 Pterodactyl Backups", "This VPS uses Pterodactyl. Use the Panel's backup system instead of local Docker snapshots."))
         return
     rows = db_list_snapshots(vps["id"])
@@ -5855,7 +5447,7 @@ async def list_snapshots_slash(interaction: discord.Interaction, vps_identifier:
     await safe_followup(interaction, embed=make_embed(f"📋 Snapshots • {clean(vps['container_name'])}", body))
 
 
-@bot.tree.command(name="restore-snapshot", description="Restore a VPS snapshot.")
+@bot.tree.command(name="restore-snapshot", description="Restore a Docker VPS snapshot.")
 async def restore_snapshot_slash(interaction: discord.Interaction, vps_identifier: str, name: str):
     if not await safe_defer(interaction, ephemeral=True):
         return
@@ -5955,7 +5547,7 @@ async def set_status_slash(interaction: discord.Interaction, status_type: str, n
 
 @bot.tree.command(name="about", description="Show RGNODES™ information.")
 async def about_slash(interaction: discord.Interaction):
-    embed = make_embed("☁️ RGNODES™ VPS Management", "Fast real QEMU VPS management with private SSHx access.")
+    embed = make_embed("☁️ RGNODES™ VPS Management", "Professional Docker + systemd VPS hosting with economy, nodes, SSH and custom RGNODES SSHx.")
     embed.add_field(name="🛠️ Stack", value="Python 3 • discord.py • Docker • SQLite WAL", inline=False)
     embed.add_field(name="🔐 Security", value="Console links are generated on demand and sent by DM only.", inline=False)
     await safe_respond(interaction, embed=embed)
@@ -6074,7 +5666,7 @@ def admin_ok(source: discord.Interaction | commands.Context) -> bool:
 @app_commands.choices(os_type=os_choices(), location=location_choices())
 async def admin_create(interaction: discord.Interaction, target_user: discord.User, os_type: str, location: str = DEFAULT_LOCATION, ram: str = DEFAULT_RAM, cpu: str = DEFAULT_CPU, disk: str = DEFAULT_DISK):
     if not admin_ok(interaction): await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required.")); return
-    if await safe_defer(interaction, ephemeral=True): await deploy_flow(interaction, user=target_user, os_type=os_type, location=location, ram=ram, cpu=cpu, disk=disk)
+    if await safe_defer(interaction, ephemeral=True): await deploy_flow(interaction, user=target_user, os_type=os_type, location=location, ram=ram, cpu=cpu, disk=disk, charge_cost=False)
 
 
 @bot.tree.command(name="add-slots", description="Admin: add VPS slots to a user.")
@@ -6124,18 +5716,6 @@ async def remove_all_slash(interaction: discord.Interaction, confirm: bool = Fal
     for cid in orphans:
         with contextlib.suppress(Exception):
             await docker_remove(cid)
-    # Explicit destructive cleanup also removes orphaned QEMU metadata/VM disks
-    # that are no longer referenced by the database. Normal startup never does
-    # this automatically, so unexpected files are not silently deleted.
-    referenced_qemu = {str(row["container_id"]) for row in rows if str(row["backend"] or "").lower() == "qemu"}
-    with contextlib.suppress(OSError):
-        QEMU_VM_ROOT.mkdir(parents=True, exist_ok=True)
-        for child in QEMU_VM_ROOT.iterdir():
-            if not child.is_dir() or child.name == "_images" or child.name in referenced_qemu:
-                continue
-            if child.name.startswith("qemu-"):
-                with contextlib.suppress(Exception):
-                    await qemu_remove_vm(child.name)
     db_delete_all_vps()
     await safe_followup(interaction, embed=make_embed("✅ Remove All Complete", f"Managed VPS removed: `{removed}`\nFailures: `{failed}`\nVPS ID sequence reset to `1`.\nAll forwarding records were cleared."))
 
@@ -6149,6 +5729,27 @@ async def admin_list(interaction: discord.Interaction):
     for row in rows[:25]: embed.add_field(name=f"#{row['id']} • {clean(row['container_name'])}", value=f"Owner: <@{row['user_id']}>\n{status_text(row['status'], bool(row['suspended']))} • {location_label(row['location'])}", inline=False)
     await safe_followup(interaction, embed=embed)
 
+
+
+@bot.tree.command(name="admin-remove", description="Admin: remove all VPS instances belonging to a user.")
+async def admin_remove_slash(interaction: discord.Interaction, target_user: discord.User):
+    if not admin_ok(interaction):
+        await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required."))
+        return
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    rows = db_get_user_vps(target_user.id)
+    removed = 0
+    failed = 0
+    for vps in rows:
+        try:
+            ok, _ = await lifecycle_action(vps, "delete")
+            removed += int(ok)
+            failed += int(not ok)
+        except Exception:
+            failed += 1
+            logger.exception("admin-remove failed for user %s VPS #%s", target_user.id, vps["id"])
+    await safe_followup(interaction, embed=make_embed("🗑️ Admin Remove Complete", f"User: <@{target_user.id}>\nRemoved: `{removed}`\nFailed: `{failed}`"))
 
 @bot.tree.command(name="admin-delete-user", description="Admin: delete one VPS belonging to a user.")
 async def admin_delete_user(interaction: discord.Interaction, target_user: discord.User, vps_identifier: str):
@@ -6259,7 +5860,7 @@ async def admin_vps_info(interaction: discord.Interaction, target_user: discord.
     if not vps: await safe_followup(interaction, embed=make_embed("❌ VPS Not Found", "No matching VPS was found.")); return
     vps = await refresh_vps_record_state(vps)
     stats, uptime, disk = await _safe_vps_live_data(vps)
-    ports = db_list_ports(vps["id"]) if str(vps["backend"] or "qemu").lower() in {"docker", "qemu"} else []
+    ports = db_list_ports(vps["id"]) if str(vps["backend"] or "docker").lower() == "docker" else []
     await safe_followup(interaction, embed=dashboard_embed(vps, stats, uptime, disk, NETWORK_CACHE, ports))
 
 
@@ -6309,7 +5910,7 @@ def confirm_value(value: str | bool | None) -> bool:
 
 @bot.tree.command(
     name="install-system",
-    description="Admin: install/repair QEMU VPS host dependencies.",
+    description="Admin: install/repair Linux and Docker dependencies.",
 )
 @app_commands.describe(confirm="Set true to actually run the system bootstrap.")
 async def install_system_slash(interaction: discord.Interaction, confirm: bool = False):
@@ -6325,8 +5926,8 @@ async def install_system_slash(interaction: discord.Interaction, confirm: bool =
         await safe_respond(interaction, embed=make_embed(
             "🛠️ RGNODES™ • Install System",
             (
-                "This command can install/repair the QEMU TCG host dependencies needed "
-                "for real VPS creation. KVM is not required.\n\n"
+                "This command can install/repair the small Linux dependency set "
+                "and Docker when Docker is missing.\n\n"
                 f"**Detected OS:** `{clean(info['name'])}`\n"
                 f"**PID 1:** `{clean(info['pid1'])}`\n"
                 f"**Root:** `{clean(info['root'])}`\n\n"
@@ -6339,10 +5940,7 @@ async def install_system_slash(interaction: discord.Interaction, confirm: bool =
     if not await safe_defer(interaction, ephemeral=True):
         return
     try:
-        if active_backend() == "qemu":
-            ok, result = await asyncio.wait_for(qemu_host_prepare(), timeout=900)
-        else:
-            ok, result = await asyncio.wait_for(install_system_dependencies(), timeout=900)
+        ok, result = await asyncio.wait_for(install_system_dependencies(), timeout=900)
         title = "✅ Install System Complete" if ok else "⚠️ Install System Finished With Issues"
         await safe_followup(interaction, embed=make_embed(title, f"```text\n{safe_log(result, 3800)}\n```"))
     except asyncio.TimeoutError:
@@ -6356,6 +5954,450 @@ async def install_system_slash(interaction: discord.Interaction, confirm: bool =
             "❌ Install System Failed",
             f"```text\n{safe_log(exc, 3800)}\n```",
         ))
+
+
+
+# ================================================================
+# RGNODES Pro economy, admin controls, security and node management
+# ================================================================
+
+def _duration_seconds(raw: str) -> int:
+    text = str(raw or "").strip().lower()
+    match = re.fullmatch(r"(\d+)\s*([smhdw])", text)
+    if not match:
+        raise ValueError("Use a duration like `30m`, `2h`, `7d`, or `1w`.")
+    amount = int(match.group(1))
+    unit = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[match.group(2)]
+    return amount * unit
+
+
+def _cooldown_text(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    if seconds >= 86400:
+        return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m {seconds % 60}s"
+    return f"{seconds}s"
+
+
+def economy_embed(user_id: int, title: str = "💰 RGNODES™ • Economy") -> discord.Embed:
+    wallet, bank = db_balance(user_id)
+    row = db_economy(user_id)
+    embed = make_embed(title)
+    embed.add_field(name="👛 Wallet", value=f"`{wallet:,}` coins", inline=True)
+    embed.add_field(name="🏦 Bank", value=f"`{bank:,}` coins", inline=True)
+    embed.add_field(name="💎 Total", value=f"`{wallet + bank:,}` coins", inline=True)
+    embed.add_field(name="🎟️ Invites", value=f"`{int(row['invites'])}`", inline=True)
+    embed.add_field(name="🖥️ VPS Slots", value=f"`{db_effective_slots(user_id)}`", inline=True)
+    return embed
+
+
+def db_set_invites(user_id: int, amount: int) -> None:
+    db_economy(user_id)
+    conn = db_connect()
+    try:
+        conn.execute("UPDATE economy SET invites=?,updated_at=? WHERE user_id=?", (max(0, int(amount)), utc_now(), int(user_id)))
+    finally:
+        conn.close()
+
+
+def db_take_invites(user_id: int, amount: int) -> bool:
+    db_economy(user_id)
+    conn = db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT invites FROM economy WHERE user_id=?", (int(user_id),)).fetchone()
+        if not row or int(row[0]) < amount:
+            conn.rollback()
+            return False
+        conn.execute("UPDATE economy SET invites=invites-?,updated_at=? WHERE user_id=?", (int(amount), utc_now(), int(user_id)))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def plan_rows() -> list[sqlite3.Row]:
+    conn=db_connect()
+    try: return conn.execute("SELECT * FROM plans ORDER BY price,id").fetchall()
+    finally: conn.close()
+
+
+def parse_plan_spec(name: str, price: int, status: str, ram: str | None, cpu: str | None, disk: str | None) -> tuple[str,str,str]:
+    raw = str(name).lower()
+    found = re.search(r"(\d+(?:\.\d+)?)\s*g", raw)
+    plan_ram = ram or (f"{found.group(1)}g" if found else DEFAULT_RAM)
+    c = re.search(r"(\d+(?:\.\d+)?)\s*(?:core|cores|c)", raw)
+    plan_cpu = cpu or (c.group(1) if c else DEFAULT_CPU)
+    d = re.search(r"(\d+(?:\.\d+)?)\s*g\s*(?:disk|ssd|storage)", raw)
+    plan_disk = disk or (d.group(1)+"g" if d else DEFAULT_DISK)
+    validate_resources(plan_ram, plan_cpu, plan_disk)
+    return plan_ram.lower(), str(plan_cpu), plan_disk.lower()
+
+
+async def scan_vps_security(vps: sqlite3.Row) -> tuple[bool, str]:
+    """High-confidence defensive scan; never executes attacker-supplied commands."""
+    if str(vps["backend"] or "docker").lower() != "docker":
+        return False, "unsupported backend"
+    if await docker_state(vps["container_id"]) != "running":
+        return False, "not running"
+    rc, out, err = await docker_cli("top", str(vps["container_id"]), "-eo", "pid,comm,args", timeout=20, retries=1)
+    text=(out+err).decode("utf-8","replace").lower()
+    suspicious=("xmrig","minerd","cpuminer","kinsing","kdevtmpfsi","cryptonight","masscan","zmap")
+    hit=next((x for x in suspicious if x in text),None)
+    if hit:
+        return True, f"high-confidence suspicious process detected: {hit}"
+    return False, "clean"
+
+
+async def security_sweep(delete_suspicious: bool = False) -> tuple[int,int,list[str]]:
+    scanned=suspicious=0; names=[]
+    for vps in db_get_all_vps():
+        try:
+            hit, detail = await scan_vps_security(vps)
+            scanned += 1
+            if hit:
+                suspicious += 1; names.append(f"#{vps['id']} {vps['container_name']}: {detail}")
+                db_update_vps(vps["container_id"], suspended=1, status="stopped")
+                if delete_suspicious:
+                    await lifecycle_action(vps, "delete")
+        except Exception as exc:
+            logger.warning("Security scan failed for VPS #%s: %s", vps["id"], safe_log(exc))
+    return scanned,suspicious,names
+
+
+class MassDMModal(discord.ui.Modal, title="📨 RGNODES™ • Mass DM"):
+    message = discord.ui.TextInput(label="Message", style=discord.TextStyle.paragraph, placeholder="Write your message…", max_length=4000, required=True)
+    def __init__(self, members: list[discord.Member]):
+        super().__init__(timeout=300)
+        self.members=members
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await safe_defer(interaction, ephemeral=True, claim=False):
+            return
+        sent=failed=0
+        for member in self.members:
+            if member.bot: continue
+            try:
+                await member.send(embed=make_embed("📢 RGNODES™ Announcement", str(self.message.value)))
+                sent += 1
+            except (discord.Forbidden, discord.HTTPException):
+                failed += 1
+            await asyncio.sleep(0.15)
+        await safe_followup(interaction, embed=make_embed("✅ Mass DM Complete", f"Sent: `{sent}`\nFailed/closed: `{failed}`"), ephemeral=True)
+
+
+class MassDMView(discord.ui.View):
+    def __init__(self, members: list[discord.Member]):
+        super().__init__(timeout=300)
+        self.members=members
+    @discord.ui.button(label="Write Message", emoji="✉️", style=discord.ButtonStyle.primary)
+    async def write(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_ok(interaction):
+            await safe_respond(interaction, embed=make_embed("❌ Permission Denied", "Administrator access is required."), ephemeral=True); return
+        await interaction.response.send_modal(MassDMModal(self.members))
+
+
+@bot.tree.command(name="create", description="Admin: create a VPS for a user.")
+@app_commands.describe(target_user="User", ram="RAM", cpu="CPU cores", disk="Disk", location="SG or IN")
+async def admin_create_pro(interaction: discord.Interaction, target_user: discord.User, ram: str=DEFAULT_RAM, cpu: str=DEFAULT_CPU, disk: str=DEFAULT_DISK, location: str=DEFAULT_LOCATION):
+    if not admin_ok(interaction):
+        await safe_respond(interaction, embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    if await safe_defer(interaction, ephemeral=True):
+        await deploy_flow(interaction,user=target_user,os_type="ubuntu-24.04",location=location,ram=ram,cpu=cpu,disk=disk,charge_cost=False)
+
+
+@bot.tree.command(name="status-all-vm", description="Admin: show all VPS status.")
+async def status_all_vm(interaction: discord.Interaction):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    rows=db_get_all_vps(); running=sum(1 for r in rows if r["status"]=="running" and not r["suspended"])
+    embed=make_embed("🖥️ RGNODES™ • All VPS Status", f"Total: `{len(rows)}` • Running: `{running}` • Global create limit: `{db_total_create_limit()}`")
+    for r in rows[:25]: embed.add_field(name=f"#{r['id']} • {clean(r['container_name'])}",value=f"<@{r['user_id']}> • {status_text(r['status'],bool(r['suspended']))}",inline=False)
+    await safe_respond(interaction,embed=embed)
+
+
+@bot.tree.command(name="suspend-user", description="Admin: suspend a user for a duration.")
+async def suspend_user_slash(interaction: discord.Interaction, target_user: discord.User, duration: str="1h"):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    try: seconds=_duration_seconds(duration)
+    except ValueError as exc: await safe_respond(interaction,embed=make_embed("❌ Invalid Duration",str(exc))); return
+    until=datetime.now(timezone.utc)+timedelta(seconds=seconds); db_set_user_suspension(target_user.id,until)
+    for v in db_get_user_vps(target_user.id):
+        await lifecycle_action(v,"stop"); db_update_vps(v["container_id"],suspended=1)
+    await safe_respond(interaction,embed=make_embed("⛔ User Suspended",f"<@{target_user.id}> suspended for `{duration}`."))
+
+
+@bot.tree.command(name="unsuspend-user", description="Admin: unsuspend a user.")
+async def unsuspend_user_slash(interaction: discord.Interaction,target_user: discord.User):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    db_clear_user_suspension(target_user.id)
+    for v in db_get_user_vps(target_user.id): db_update_vps(v["container_id"],suspended=0)
+    await safe_respond(interaction,embed=make_embed("✅ User Unsuspended",f"<@{target_user.id}> can create VPS again."))
+
+
+@bot.tree.command(name="add-total-slot", description="Admin: set global VPS creation limit.")
+async def add_total_slot_slash(interaction: discord.Interaction, amount: int):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    value=db_set_total_create_limit(amount)
+    await safe_respond(interaction,embed=make_embed("🎟️ Global Limit Updated",f"Maximum total VPS records: `{value}`."))
+
+
+@bot.tree.command(name="add-user-slots", description="Admin: add VPS slots to a user.")
+async def add_user_slots_pro(interaction: discord.Interaction,target_user: discord.User,amount: int):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    db_upsert_user(target_user.id,str(target_user)); total=db_add_slots(target_user.id,amount)
+    await safe_respond(interaction,embed=make_embed("🎟️ User Slots Updated",f"<@{target_user.id}> now has `{total}` slots."))
+
+
+@bot.tree.command(name="add-coins", description="Admin: add coins to a user wallet.")
+async def add_coins_slash(interaction: discord.Interaction,target_user: discord.User,amount: int):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    if amount<=0: await safe_respond(interaction,embed=make_embed("❌ Invalid Amount","Amount must be positive.")); return
+    total=db_add_coins(target_user.id,amount)
+    await safe_respond(interaction,embed=make_embed("💰 Coins Added",f"Added `{amount:,}` coins to <@{target_user.id}>. Combined balance: `{total:,}`."))
+
+
+@bot.tree.command(name="rm-coins", description="Admin: remove coins from a user wallet.")
+async def rm_coins_slash(interaction: discord.Interaction,target_user: discord.User,amount: int):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    ok=db_take_coins(target_user.id,amount)
+    await safe_respond(interaction,embed=make_embed("🗑️ Coins Removed" if ok else "❌ Insufficient Coins",f"Removed `{amount:,}` coins from <@{target_user.id}>." if ok else "The user does not have enough wallet coins."))
+
+
+@bot.tree.command(name="dm-all", description="Admin: open a message box for mass DM.")
+async def dm_all_slash(interaction: discord.Interaction):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    await safe_respond(interaction,embed=make_embed("📨 RGNODES™ • Mass DM","Press **Write Message** to open the message box. Emojis are supported."),view=MassDMView(interaction.guild.members if interaction.guild else []))
+
+
+@bot.tree.command(name="dm", description="Admin: DM a user.")
+async def dm_slash(interaction: discord.Interaction,target_user: discord.User):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    await safe_respond(interaction,embed=make_embed("📨 DM User",f"Open a message box for <@{target_user.id}>."),view=SingleDMView(target_user))
+
+
+class SingleDMModal(discord.ui.Modal, title="📨 RGNODES™ • Direct Message"):
+    message=discord.ui.TextInput(label="Message",style=discord.TextStyle.paragraph,max_length=4000,required=True)
+    def __init__(self,target: discord.User): super().__init__(timeout=300); self.target=target
+    async def on_submit(self,interaction: discord.Interaction):
+        if not await safe_defer(interaction,ephemeral=True,claim=False):
+            return
+        ok=await safe_dm(self.target,make_embed("📨 RGNODES™ • Message",str(self.message.value)))
+        await safe_followup(interaction,embed=make_embed("✅ DM Sent" if ok else "❌ DM Failed",f"Target: <@{self.target.id}>"),ephemeral=True)
+class SingleDMView(discord.ui.View):
+    def __init__(self,target: discord.User): super().__init__(timeout=300); self.target=target
+    @discord.ui.button(label="Write Message",emoji="✉️",style=discord.ButtonStyle.primary)
+    async def write(self,interaction: discord.Interaction,button: discord.ui.Button):
+        if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+        await interaction.response.send_modal(SingleDMModal(self.target))
+
+
+@bot.tree.command(name="backup-vm", description="Admin: create a safe VPS backup archive.")
+async def backup_vm_slash(interaction: discord.Interaction):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    if not await safe_defer(interaction,ephemeral=True): return
+    archive=Path(tempfile.gettempdir())/f"rgnodes-backup-{int(time.time())}.zip"
+    try:
+        with zipfile.ZipFile(archive,"w",zipfile.ZIP_DEFLATED) as z:
+            conn=db_connect()
+            try:
+                dbcopy=archive.with_suffix(".db"); shutil.copy2(DATABASE_FILE,dbcopy); z.write(dbcopy,"vps_bot.db"); dbcopy.unlink(missing_ok=True)
+                manifest=[]
+                for r in db_get_all_vps():
+                    if int(r["critical"] or 0): continue
+                    meta={k:("<redacted>" if k=="ssh_password" else r[k]) for k in r.keys()}
+                    manifest.append(meta)
+                    logs=await docker_logs(r["container_id"],80)
+                    z.writestr(f"logs/vps-{r['id']}.txt",logs[:100000])
+                z.writestr("metadata.json",json.dumps(manifest,indent=2,default=str))
+            finally: conn.close()
+        size=archive.stat().st_size
+        if size>20*1024*1024:
+            await safe_followup(interaction,embed=make_embed("⚠️ Backup Created",f"Archive created but is too large for a Discord DM attachment (`{size/1024/1024:.1f}MB`). Host path: `{archive}`")); return
+        sent=await safe_dm_file(interaction.user,make_embed("💾 RGNODES™ • VPS Backup","Backup excludes VPS records marked critical. SSH passwords are redacted."),str(archive))
+        await safe_followup(interaction,embed=make_embed("✅ Backup Complete" if sent else "⚠️ Backup Created",f"Archive size: `{size/1024/1024:.1f}MB`. Admin DM: `{'sent' if sent else 'unavailable'}`."))
+    finally:
+        with contextlib.suppress(OSError): archive.unlink()
+
+
+@bot.tree.command(name="vm-backup", description="Admin: backup one user's VPS metadata/logs.")
+async def vm_backup_slash(interaction: discord.Interaction,target_user: discord.User):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    rows=[r for r in db_get_user_vps(target_user.id) if not int(r["critical"] or 0)]
+    embed=make_embed("💾 User VPS Backup",f"Target: <@{target_user.id}> • VPS included: `{len(rows)}`")
+    for r in rows[:25]: embed.add_field(name=f"#{r['id']} {clean(r['container_name'])}",value=f"{os_label(r['os_type'])} • {r['ram']} • {r['cpu']} CPU • {r['disk']}",inline=False)
+    await safe_respond(interaction,embed=embed)
+
+
+@bot.tree.command(name="reset-pass", description="Admin: reset root SSH password for a user's VPS.")
+async def reset_pass_slash(interaction: discord.Interaction,target_user: discord.User):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    rows=db_get_user_vps(target_user.id)
+    if not rows: await safe_respond(interaction,embed=make_embed("❌ No VPS", "User has no VPS.")); return
+    password="".join(secrets.choice(string.ascii_letters+string.digits) for _ in range(SSH_PASSWORD_LENGTH))
+    ok_count=0
+    for v in rows:
+        rc,_,err=await docker_exec(v["container_id"],"bash","-lc",f"printf '%s\\n' {json.dumps('root:'+password)} | chpasswd",timeout=20,retries=0)
+        if rc==0: db_update_vps(v["container_id"],ssh_password=password); ok_count+=1
+    await safe_dm(target_user,make_embed("🔐 RGNODES™ • SSH Password Reset",f"Your root SSH password was reset.\n\n**Password:** `{password}`\n\nKeep it private."))
+    await safe_respond(interaction,embed=make_embed("🔐 Password Reset",f"Updated `{ok_count}/{len(rows)}` VPS. New password sent by DM to <@{target_user.id}>."))
+
+
+@bot.tree.command(name="anty-hacking", description="Admin: enable defensive anti-hacking scans.")
+async def anty_hacking_slash(interaction: discord.Interaction):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    conn=db_connect()
+    try: conn.execute("INSERT INTO security_settings(key,value) VALUES('anti_hacking','1') ON CONFLICT(key) DO UPDATE SET value='1'")
+    finally: conn.close()
+    scanned, suspicious, names=await security_sweep(delete_suspicious=True)
+    await safe_respond(interaction,embed=make_embed("🛡️ Anti-Hacking Enabled",f"Scanned: `{scanned}` • Removed suspicious VPS: `{suspicious}`\n"+"\n".join(names[:10]) if names else "All scanned VPS were clean."))
+
+
+@bot.tree.command(name="nodes", description="Show configured RGNODES nodes.")
+async def nodes_slash(interaction: discord.Interaction):
+    conn=db_connect()
+    try: rows=conn.execute("SELECT * FROM nodes ORDER BY id").fetchall()
+    finally: conn.close()
+    embed=make_embed("🌍 RGNODES™ • Nodes",f"Configured nodes: `{len(rows)}`")
+    for n in rows[:25]: embed.add_field(name=f"#{n['id']} • {clean(n['name'])}",value=f"{location_label(n['location'])} • `{clean(n['host'])}:{n['port']}` • **{clean(n['status'])}**",inline=False)
+    if not rows: embed.description="No nodes configured. An admin can use `/add-node`."
+    await safe_respond(interaction,embed=embed)
+
+
+@bot.tree.command(name="add-node", description="Admin: add a node record.")
+async def add_node_slash(interaction: discord.Interaction,name: str,location: str,host: str,port: int=22):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    location=normalize_location(location) or "SG"
+    if not 1<=port<=65535: await safe_respond(interaction,embed=make_embed("❌ Invalid Port","Use 1-65535.")); return
+    conn=db_connect()
+    try: conn.execute("INSERT INTO nodes(name,location,host,port,status,created_at) VALUES(?,?,?,?,?,?)",(name[:80],location,host[:255],port,"online",utc_now()))
+    except sqlite3.IntegrityError: await safe_respond(interaction,embed=make_embed("⚠️ Node Exists","A node with that name already exists.")); return
+    finally: conn.close()
+    await safe_respond(interaction,embed=make_embed("✅ Node Added",f"`{name}` • {location_label(location)} • `{host}:{port}`"))
+
+
+@bot.tree.command(name="add-plans", description="Admin: add a resource/slot plan.")
+async def add_plans_slash(interaction: discord.Interaction,name: str,price: int,status: str="active",ram: str=DEFAULT_RAM,cpu: str=DEFAULT_CPU,disk: str=DEFAULT_DISK):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    try: ram,cpu,disk=validate_resources(ram,cpu,disk)
+    except ValueError as exc: await safe_respond(interaction,embed=make_embed("❌ Invalid Plan Resources",str(exc))); return
+    conn=db_connect()
+    try: cur=conn.execute("INSERT INTO plans(name,price,status,ram,cpu,disk,created_at) VALUES(?,?,?,?,?,?,?)",(name[:80],max(0,price),status[:20],ram,cpu,disk,utc_now())); plan_id=cur.lastrowid
+    except sqlite3.IntegrityError: await safe_respond(interaction,embed=make_embed("⚠️ Plan Exists","That plan name already exists.")); return
+    finally: conn.close()
+    await safe_respond(interaction,embed=make_embed("✅ Plan Added",f"Plan ID: `{plan_id}` • `{name}` • `{price:,}` coins • `{status}`"))
+
+
+@bot.tree.command(name="rm-redeem", description="Admin: remove a redeem code.")
+async def rm_redeem_slash(interaction: discord.Interaction,code_id: int):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    conn=db_connect()
+    try: cur=conn.execute("DELETE FROM redeem_codes WHERE id=?",(int(code_id),))
+    finally: conn.close()
+    await safe_respond(interaction,embed=make_embed("🗑️ Redeem Removed" if cur.rowcount else "❌ Redeem Not Found",f"Redeem ID: `{code_id}`"))
+
+
+@bot.tree.command(name="add-redeem", description="Admin: add a redeem code.")
+async def add_redeem_slash(interaction: discord.Interaction,code: str,reward_coins: int=0,reward_slots: int=0,max_uses: int=1):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    conn=db_connect()
+    try: cur=conn.execute("INSERT INTO redeem_codes(code,reward_coins,reward_slots,max_uses,uses,status,created_at) VALUES(?,?,?,?,?,?,?)",(code.strip().upper(),max(0,reward_coins),max(0,reward_slots),max(1,max_uses),0,"active",utc_now()))
+    except sqlite3.IntegrityError: await safe_respond(interaction,embed=make_embed("⚠️ Code Exists","That redeem code already exists.")); return
+    finally: conn.close()
+    await safe_respond(interaction,embed=make_embed("🎁 Redeem Added",f"ID: `{cur.lastrowid}` • Code: `{code.upper()}` • Coins: `{reward_coins:,}` • Slots: `{reward_slots}` • Uses: `{max_uses}`"))
+
+
+@bot.tree.command(name="rm", description="Admin: remove one user's selected VPS.")
+async def admin_rm_slash(interaction: discord.Interaction,target_user: discord.User,vps_identifier: str|None=None):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    v=db_find_vps(target_user.id,vps_identifier)
+    if not v: await safe_respond(interaction,embed=make_embed("❌ VPS Not Found","No VPS matched.")); return
+    ok,msg=await lifecycle_action(v,"delete"); await safe_respond(interaction,embed=make_embed("✅ VPS Removed" if ok else "❌ Remove Failed",msg))
+
+
+@bot.tree.command(name="re-boot", description="Admin: restart all VPS and security-scan them.")
+async def reboot_all_slash(interaction: discord.Interaction):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    if not await safe_defer(interaction,ephemeral=True): return
+    scanned,suspicious,names=await security_sweep(delete_suspicious=True)
+    rows=db_get_all_vps(); restarted=0
+    for v in rows:
+        if str(v["status"]).lower()=="running" and not v["suspended"]:
+            ok,_=await lifecycle_action(v,"restart"); restarted += int(ok)
+    await safe_followup(interaction,embed=make_embed("🔄 Re-Boot Complete",f"Scanned: `{scanned}` • removed: `{suspicious}` • restarted: `{restarted}`" + ("\n"+"\n".join(names[:10]) if names else "")))
+
+
+@bot.tree.command(name="re-install", description="Admin: reinstall all VPS with their current OS.")
+async def reinstall_all_slash(interaction: discord.Interaction):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    if not await safe_defer(interaction,ephemeral=True): return
+    rows=db_get_all_vps(); success=failed=0
+    for v in rows:
+        try:
+            ok,_=await docker_reinstall_vps(v,str(v["os_type"])); success+=int(ok); failed+=int(not ok)
+        except Exception as exc: failed+=1; logger.warning("Reinstall-all VPS #%s failed: %s",v["id"],safe_log(exc))
+    await safe_followup(interaction,embed=make_embed("♻️ Re-Install Complete",f"Success: `{success}` • Failed: `{failed}`"))
+
+
+
+@bot.tree.command(name="rm-all", description="Admin: remove all VPS instances.")
+async def rm_all_slash_alias(interaction: discord.Interaction, confirm: bool=False):
+    await remove_all_slash(interaction, confirm)
+
+@bot.tree.command(name="vm-creating-ban", description="Admin: block VPS creation for a user.")
+async def vm_creating_ban_slash(interaction: discord.Interaction, target_user: discord.User):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    db_set_ban(target_user.id,True); await safe_respond(interaction,embed=make_embed("🚫 VPS Creation Banned",f"<@{target_user.id}> cannot create VPS."))
+
+@bot.tree.command(name="suspand", description="Admin: suspend a user for a duration.")
+async def suspand_slash_alias(interaction: discord.Interaction,target_user: discord.User,duration: str="1h"):
+    await suspend_user_slash(interaction,target_user,duration)
+
+@bot.tree.command(name="unsuspand", description="Admin: unsuspend a user.")
+async def unsuspand_slash_alias(interaction: discord.Interaction,target_user: discord.User):
+    await unsuspend_user_slash(interaction,target_user)
+
+@bot.tree.command(name="ssh-user", description="Admin: send a user's SSH credentials by DM.")
+async def ssh_user_slash(interaction: discord.Interaction,target_user: discord.User):
+    if not admin_ok(interaction): await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Administrator access is required.")); return
+    rows=db_get_user_vps(target_user.id)
+    if not rows: await safe_respond(interaction,embed=make_embed("❌ VPS Not Found","User has no VPS.")); return
+    v=rows[0]; network=await detect_public_network(force=True); ip=network.get("ip") if valid_public_ipv4(network.get("ip")) else None
+    port=next((int(r["host_port"]) for r in db_list_ports(v["id"]) if int(r["container_port"])==22),None)
+    sent=await safe_dm(target_user,ssh_access_embed(v,ip,port)); await safe_respond(interaction,embed=make_embed("✅ SSH Sent" if sent else "⚠️ DM Unavailable",f"SSH information for <@{target_user.id}> was {'sent' if sent else 'not sent'} by DM."))
+
+
+@bot.tree.command(name="ssh", description="Get your SSH credentials; admins can target a user.")
+async def ssh_slash(interaction: discord.Interaction, target_user: discord.User | None = None):
+    target = target_user if (admin_ok(interaction) and target_user) else interaction.user
+    if target_user is not None and not admin_ok(interaction):
+        target = interaction.user
+    rows = db_get_user_vps(target.id)
+    if not rows:
+        await safe_respond(interaction,embed=make_embed("❌ VPS Not Found","No VPS found.")); return
+    v=rows[0]; network=await detect_public_network(force=True); ip=network.get('ip') if valid_public_ipv4(network.get('ip')) else None
+    port=next((int(r['host_port']) for r in db_list_ports(v['id']) if int(r['container_port'])==22),None)
+    sent=await safe_dm(target,ssh_access_embed(v,ip,port))
+    await safe_respond(interaction,embed=make_embed("✅ SSH Sent" if sent else "⚠️ DM Unavailable",f"SSH credentials {'sent to' if sent else 'could not be sent to'} <@{target.id}> by DM."))
+
+
+@bot.tree.command(name="sshx-user", description="Get custom RGNODES SSHx for a user or yourself.")
+async def sshx_user_slash(interaction: discord.Interaction, target_user: discord.User | None = None):
+    if target_user is not None and not admin_ok(interaction):
+        await safe_respond(interaction,embed=make_embed("❌ Permission Denied","Only administrators can target another user.")); return
+    target=target_user or interaction.user; rows=db_get_user_vps(target.id)
+    if not rows:
+        await safe_respond(interaction,embed=make_embed("❌ VPS Not Found","No VPS found.")); return
+    ok,msg=await create_console_access(rows[0],target)
+    await safe_respond(interaction,embed=make_embed("✅ SSHx Ready" if ok else "❌ SSHx Failed",msg))
+
+# User slash economy commands
+@bot.tree.command(name="balance", description="Show your RGNODES coin balance.")
+async def balance_slash(interaction: discord.Interaction): await safe_respond(interaction,embed=economy_embed(interaction.user.id))
+
+@bot.tree.command(name="inventory", description="Show your RGNODES inventory/invites.")
+async def inventory_slash(interaction: discord.Interaction): await safe_respond(interaction,embed=economy_embed(interaction.user.id,"🎒 RGNODES™ • Inventory"))
 
 
 # ================================================================
@@ -6580,7 +6622,7 @@ async def prefix_ports(ctx: commands.Context, identifier: str = ""):
     if not vps:
         await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", f"Use `{PREFIX}ports list <vps#>` or open `{PREFIX}manage`."))
         return
-    if str(vps["backend"] or "qemu").lower() not in {"docker", "qemu"}:
+    if str(vps["backend"] or "docker").lower() != "docker":
         panel = await ptero_panel_link(vps)
         await safe_ctx_send(ctx, make_embed("🦖 Pterodactyl Ports", f"Port allocations are managed by Pterodactyl.\nPanel: {panel or 'not configured'}"))
         return
@@ -6595,7 +6637,7 @@ async def prefix_ports_add(ctx: commands.Context, identifier: str, container_por
     if not vps:
         await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
         return
-    if str(vps["backend"] or "qemu").lower() not in {"docker", "qemu"}:
+    if str(vps["backend"] or "docker").lower() != "docker":
         await safe_ctx_send(ctx, make_embed("🦖 Pterodactyl Allocations", "This VPS uses Pterodactyl. Manage ports/allocations from the panel."))
         return
     if not 1 <= container_port <= 65535:
@@ -6633,7 +6675,7 @@ async def prefix_ports_list(ctx: commands.Context, identifier: str = ""):
     if not vps:
         await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
         return
-    if str(vps["backend"] or "qemu").lower() not in {"docker", "qemu"}:
+    if str(vps["backend"] or "docker").lower() != "docker":
         panel = await ptero_panel_link(vps)
         await safe_ctx_send(ctx, make_embed("🦖 Pterodactyl Ports", f"Port allocations are managed by Pterodactyl.\nPanel: {panel or 'not configured'}"))
         return
@@ -6704,6 +6746,16 @@ async def prefix_deploy(
         with contextlib.suppress(discord.HTTPException):
             await message.edit(embed=embed)
 
+    charged = False
+    if not (ADMIN_ID > 0 and int(ctx.author.id) == int(ADMIN_ID)):
+        wallet, _bank = db_balance(ctx.author.id)
+        if wallet < DEPLOY_COST:
+            await message.edit(embed=make_embed("💰 Insufficient Coins", f"Deploying a VPS costs **{DEPLOY_COST:,} coins**.\nYour wallet: `{wallet:,}` coins."))
+            return
+        charged = db_take_coins(ctx.author.id, DEPLOY_COST)
+        if not charged:
+            await message.edit(embed=make_embed("💰 Payment Failed", "Your coin balance changed before deployment. Please retry."))
+            return
     try:
         ok, reason, vps = await asyncio.wait_for(
             create_vps(
@@ -6718,25 +6770,36 @@ async def prefix_deploy(
             timeout=DEPLOY_TIMEOUT,
         )
     except asyncio.TimeoutError:
+        if charged: db_add_coins(ctx.author.id, DEPLOY_COST)
         ok, reason, vps = False, "Deployment timed out safely. Check the bot log before retrying.", None
     except Exception:
         logger.exception("Prefix deployment failed for user %s", ctx.author.id)
         ok, reason, vps = False, "Deployment failed safely. Check the bot log for details.", None
     if not ok or not vps:
+        if charged: db_add_coins(ctx.author.id, DEPLOY_COST)
         with contextlib.suppress(discord.HTTPException):
             await message.edit(embed=make_embed("❌ VPS Creation Failed", reason))
         return
+    view = sshx_view(vps["sshx_url"]) if vps["sshx_url"] else None
+    dm_sent = False
+    if vps["sshx_url"]:
+        dm_sent = await safe_dm(ctx.author, console_embed(vps["container_name"], vps["sshx_url"]), view)
     network = await detect_public_network(force=True)
-    console_url = normalize_sshx_url(vps["sshx_url"]) if vps["sshx_url"] else None
-    dm_sent = await send_vps_ready_dm(ctx.author, vps, network)
+    ip = network.get("ip") if valid_public_ipv4(network.get("ip")) else None
+    ssh_port = next((int(p["host_port"]) for p in db_list_ports(vps["id"]) if int(p["container_port"]) == 22 and str(p["protocol"]).lower() == "tcp"), None)
+    await safe_dm(ctx.author, ssh_access_embed(vps, ip, ssh_port))
     final = make_embed("✅ VPS Ready", f"`{clean(vps['container_name'])}` is online.")
-    final.add_field(name="🌐 Console", value="✅ Ready details sent by DM" if dm_sent else ("⚠️ SSHx pending — use Console to retry" if not console_url else "⚠️ DM unavailable"), inline=False)
+    final.add_field(name="🌐 Console", value="✅ Link sent by DM" if dm_sent else ("⚠️ SSHx pending — use Console to retry" if not vps["sshx_url"] else "⚠️ DM unavailable"), inline=False)
     await message.edit(embed=final, view=ManageView(vps["id"], vps["user_id"]))
 
 
 @bot.command(name="manage")
 async def prefix_manage(ctx: commands.Context, identifier: str = ""):
-    vps = ctx_vps(ctx, identifier)
+    if admin_ok(ctx) and ctx.message.mentions:
+        target = ctx.message.mentions[0]
+        vps = db_find_vps(target.id, None)
+    else:
+        vps = ctx_vps(ctx, identifier)
     if not vps:
         await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", f"No matching VPS was found. Create one with `{PREFIX}deploy`."))
         return
@@ -6781,8 +6844,41 @@ async def prefix_list(ctx: commands.Context):
     await safe_ctx_send(ctx, embed)
 
 
+
+@bot.command(name="admin-remove", aliases=["admin_rm"])
+async def prefix_admin_remove(ctx: commands.Context, target: discord.User | None = None):
+    if not admin_ok(ctx):
+        await safe_ctx_send(ctx, make_embed("❌ Permission Denied", "Administrator access is required."))
+        return
+    if target is None:
+        await safe_ctx_send(ctx, make_embed("❌ User Required", f"Usage: `{PREFIX}admin-remove @user`"))
+        return
+    rows = db_get_user_vps(target.id)
+    removed = 0
+    failed = 0
+    for vps in rows:
+        try:
+            ok, _ = await lifecycle_action(vps, "delete")
+            removed += int(ok)
+            failed += int(not ok)
+        except Exception:
+            failed += 1
+            logger.exception("prefix admin-remove failed for user %s VPS #%s", target.id, vps["id"])
+    await safe_ctx_send(ctx, make_embed("🗑️ Admin Remove Complete", f"User: <@{target.id}>\nRemoved: `{removed}`\nFailed: `{failed}`"))
+
 @bot.command(name="remove")
-async def prefix_remove(ctx: commands.Context, identifier: str = ""): await prefix_action(ctx, identifier, "delete")
+async def prefix_remove(ctx: commands.Context, identifier: str = ""):
+    if not identifier:
+        await safe_ctx_send(ctx, make_embed("⚠️ VPS ID Required", f"Use `{PREFIX}remove <vps#>` to remove exactly one VPS."))
+        return
+    vps = ctx_vps(ctx, identifier)
+    if not vps:
+        await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No matching VPS was found."))
+        return
+    if int(ctx.author.id) not in {int(vps["user_id"]), int(ADMIN_ID)} and db_share_access_level(vps["id"], ctx.author.id) != "full":
+        await safe_ctx_send(ctx, make_embed("🔒 Limited Access", "Delete requires VPS ownership, admin access, or a full-access share."))
+        return
+    await prefix_action(ctx, identifier, "delete")
 
 
 @bot.command(name="start")
@@ -6855,80 +6951,98 @@ class HelpView(discord.ui.View):
 
 
 def build_help_embed(admin: bool, category: str = "user") -> discord.Embed:
-    embed = make_embed("📚 RGNODES™ Help", "Use the dropdown below to switch categories.")
+    embed = make_embed("📚 RGNODES™ Pro Command Center", "Premium command navigator • choose a category below.")
     category = category if category in {"user", "vps", "ports", "system", "bot", "admin"} else "user"
 
     if category == "user":
         embed.title = "📚 RGNODES™ • 👤 User Commands"
-        embed.add_field(name="Basic commands for all users", value="Use the dropdown below to switch categories.", inline=False)
-        embed.add_field(name="Available Commands", value=(
-            f"**`{PREFIX}ping`** ╰ Check bot latency\n"
-            f"**`{PREFIX}uptime`** ╰ Show host uptime\n"
-            f"**`{PREFIX}myvps`** ╰ View your VPS dashboard\n"
-            f"**`{PREFIX}manage [vps#]`** ╰ Manage your VPS instances\n"
-            f"**`{PREFIX}share-user @user <vps#>`** ╰ Share VPS access\n"
-            f"**`{PREFIX}share-ruser @user <vps#>`** ╰ Revoke shared access\n"
-            f"**`{PREFIX}manage-shared @owner <vps#>`** ╰ Manage shared VPS"
+        embed.add_field(name="🚀 VPS", value=(
+            f"`{PREFIX}deploy` • **155 coins** VPS deployment\n"
+            f"`{PREFIX}manage` • Dashboard + control buttons\n"
+            f"`{PREFIX}myvps` • List your VPS\n"
+            f"`{PREFIX}share-vps-manage @user` • Manage access\n"
+            f"`{PREFIX}share-vps-full @user` • Full access\n"
+            f"`{PREFIX}unshare @user` • Remove share\n"
+            f"`{PREFIX}trust @user` • `{PREFIX}untrust @user`"
+        ), inline=False)
+        embed.add_field(name="💰 Economy & Games", value=(
+            f"`{PREFIX}i` • Inventory / coins / invites\n"
+            f"`{PREFIX}inv2coins` • 1 invite → 10 coins\n"
+            f"`{PREFIX}work` • `{PREFIX}hour` • `{PREFIX}day` • `{PREFIX}week`\n"
+            f"`{PREFIX}monthe` • `{PREFIX}year` • `{PREFIX}deposit all` / `{PREFIX}dp`\n"
+            f"`{PREFIX}reedim CODE` • `{PREFIX}plans` • `{PREFIX}buy-item ID`\n"
+            f"`{PREFIX}coinflp` • `{PREFIX}spain` • `{PREFIX}dice` • `{PREFIX}quiz`"
+        ), inline=False)
+        embed.add_field(name="🤖 Utility", value=(
+            f"`{PREFIX}ping` • `{PREFIX}uptime` • `{PREFIX}tps` • `{PREFIX}nodes`\n"
+            f"`{PREFIX}bot-info` • `{PREFIX}help`"
         ), inline=False)
         return embed
 
     if category == "vps":
         embed.title = "📚 RGNODES™ • 🖥️ VPS Management"
-        embed.add_field(name="Commands for VPS control", value="Use the dropdown below to switch categories.", inline=False)
-        embed.add_field(name="Available Commands", value=(
-            f"**`{PREFIX}myvps`** ╰ List your VPS\n"
-            f"**`{PREFIX}vpsinfo <vps#>`** ╰ VPS information\n"
-            f"**`{PREFIX}vps-stats <vps#>`** ╰ Live statistics\n"
-            f"**`{PREFIX}vps-uptime <vps#>`** ╰ VPS uptime\n"
-            f"**`{PREFIX}restart-vps <vps#>`** ╰ Restart VPS\n"
-            f"**`{PREFIX}snapshot <vps#> [name]`** ╰ Create snapshot\n"
-            f"**`{PREFIX}list-snapshots <vps#>`** ╰ List snapshots\n"
-            f"**`{PREFIX}restore-snapshot <vps#> <name>`** ╰ Restore snapshot"
+        embed.add_field(name="⚙️ Control", value=(
+            f"`{PREFIX}manage [vps#]` • `{PREFIX}start` • `{PREFIX}stop` • `{PREFIX}restart`\n"
+            f"`{PREFIX}console [vps#]` • `{PREFIX}ssh-me [vps#]` • `{PREFIX}sshx [vps#]`\n"
+            f"`{PREFIX}vpsinfo [vps#]` • `{PREFIX}vps-stats [vps#]` • `{PREFIX}vps-uptime [vps#]`\n"
+            f"`{PREFIX}snapshot` • `{PREFIX}list-snapshots` • `{PREFIX}restore-snapshot`\n"
+            f"`{PREFIX}remove <vps#>` • deletes **one VPS only**"
         ), inline=False)
-        embed.add_field(name="Also available", value=f"`{PREFIX}start` • `{PREFIX}stop` • `{PREFIX}restart` • `{PREFIX}console` • `{PREFIX}logs` • `{PREFIX}remove`", inline=False)
+        embed.add_field(name="🔐 SSH", value="`ssh root@IP -p PORT` • root password is delivered privately by DM.", inline=False)
         return embed
 
     if category == "ports":
-        embed.title = "📚 RGNODES™ • 🔌 Port Forwarding"
-        embed.add_field(name="Network and port management", value="Use the dropdown below to switch categories.", inline=False)
-        embed.add_field(name="Available Commands", value=(
-            f"**`{PREFIX}ports add <vps#> <port>`** ╰ Add port forward\n"
-            f"**`{PREFIX}ports list <vps#>`** ╰ List your ports\n"
-            f"**`{PREFIX}ports remove <id>`** ╰ Remove port forward\n"
-            f"**`/ports <vps#>`** ╰ View forwarding rules\n"
-            f"**`/port-add <vps#> <port>`** ╰ Add forwarding rule\n"
-            f"**`/port-remove <vps#> <id>`** ╰ Remove forwarding rule"
+        embed.title = "📚 RGNODES™ • 🔌 Network & Ports"
+        embed.add_field(name="Port Forwarding", value=(
+            f"`{PREFIX}ports` • List rules\n"
+            f"`{PREFIX}ports add <vps#> <container-port> [host-port]`\n"
+            f"`{PREFIX}ports remove <port-id>`\n"
+            "Guest firewall allows: **22 • 80 • 443 • 8080 • 8443**"
         ), inline=False)
         return embed
 
     if category == "system":
-        embed.title = "📚 RGNODES™ • ⚙️ System Status"
-        embed.add_field(name="System monitoring commands", value="Use the dropdown below to switch categories.", inline=False)
-        embed.add_field(name="Available Commands", value=(
-            f"**`{PREFIX}serverstats`** ╰ Server statistics\n"
-            f"**`{PREFIX}thresholds`** ╰ View thresholds\n"
-            f"**`{PREFIX}set-status <type> <name>`** ╰ Set bot status (admin)"
+        embed.title = "📚 RGNODES™ • ⚙️ System"
+        embed.add_field(name="Monitoring", value=(
+            f"`{PREFIX}serverstats` • host capacity\n"
+            f"`{PREFIX}thresholds` • resource thresholds\n"
+            f"`{PREFIX}status-all-vm` • all VPS status"
         ), inline=False)
         return embed
 
     if category == "bot":
-        embed.title = "📚 RGNODES™ • 🤖 Bot Info"
-        embed.add_field(name="Bot information and status", value="Use the dropdown below to switch categories.", inline=False)
-        embed.add_field(name="Available Commands", value=(
-            f"**`{PREFIX}ping`** ╰ Check latency\n"
-            f"**`{PREFIX}uptime`** ╰ Host uptime\n"
-            f"**`{PREFIX}help`** ╰ This help menu\n"
-            f"**`/about`** ╰ RGNODES™ information"
+        embed.title = "📚 RGNODES™ • 🤖 Platform"
+        embed.add_field(name="Identity", value=(
+            f"Hosting: `{HOSTING_NAME}`\nVersion: `{BOT_VERSION}`\n"
+            "Owners: `MrZetrix` • `Zynox2`\n"
+            f"Hostname: `{VPS_HOSTNAME_PREFIX}` • Health: `:{WEB_PORT}`"
         ), inline=False)
         return embed
 
-    embed.title = "📚 RGNODES™ • 🛡️ Admin Commands"
-    embed.add_field(name="Administration", value=(
-        "`/admin-create` • `/admin-manage` • `/admin-list` • `/admin-list-users` • `/admin-stats`\n"
-        "`/admin-vps-info` • `/admin-logs` • `/admin-delete-user` • `/admin-ban` • `/admin-unban`\n"
-        "`/add-slots` • `/remove-all confirm:true` • `/admin-kill-all` • `/install-system confirm:true`"
-    ), inline=False)
-    return embed
+    if category == "admin" and admin:
+        embed.title = "📚 RGNODES™ • 🛡️ Admin Commands"
+        embed.add_field(name="🖥️ VPS Control", value=(
+            "`!create @user ram cpu disk location`\n"
+            "`!manage @user` • `!suspand @user 1h` • `!unsuspand @user`\n"
+            "`!rm @user [vps#]` • `!admin-remove @user` • `!rm-all confirm`\n"
+            "`!re-boot` • `!re-install` • `!status-all-vm`\n"
+            "`!vm-creating-ban @user` • `!reset-pass @user`"
+        ), inline=False)
+        embed.add_field(name="🛡️ Security / Access", value=(
+            "`!anty-hacking` • scan/remove high-confidence malicious processes\n"
+            "`!ssh @user` • `!sshx @user`\n"
+            "`!backup-vm` • `!vm-backup @user`"
+        ), inline=False)
+        embed.add_field(name="💰 Economy / Nodes / DM", value=(
+            "`!add-toal-slot 1000` • `!add-user-slots @user 1`\n"
+            "`!add-coins @user 100` • `!rm-coins @user 100`\n"
+            "`!add-plans name price active`\n"
+            "`!add-reedim CODE 500 1 10` • `!rm-reedim ID`\n"
+            "`!add-node name SG host 22` • `!dm @user` • `!dm-all`"
+        ), inline=False)
+        return embed
+
+    return build_help_embed(admin, "user")
 
 
 @bot.command(name="ping")
@@ -6939,8 +7053,8 @@ async def prefix_ping(ctx: commands.Context):
 
 @bot.command(name="about")
 async def prefix_about(ctx: commands.Context):
-    embed = make_embed("☁️ RGNODES™ VPS Management", "Production Discord VPS management with real QEMU TCG/Pterodactyl backends.")
-    embed.add_field(name="🛠️ Stack", value="Python • discord.py • QEMU TCG • SQLite WAL", inline=False)
+    embed = make_embed("☁️ RGNODES™ VPS Management", "Professional RGNODES VPS management with Docker + systemd guests.")
+    embed.add_field(name="🛠️ Stack", value="Python • discord.py • Docker • SQLite WAL", inline=False)
     embed.add_field(name="⚙️ Prefix", value=f"`{PREFIX}`", inline=True)
     embed.add_field(name="🖥️ Backend", value=f"`{active_backend()}`", inline=True)
     await safe_ctx_send(ctx, embed)
@@ -6952,8 +7066,8 @@ async def prefix_logs(ctx: commands.Context, identifier: str, lines: int = 50):
     if not vps:
         await safe_ctx_send(ctx, make_embed("❌ VPS Not Found", "No VPS matches that identifier."))
         return
-    if str(vps["backend"] or "qemu").lower() not in {"docker", "qemu"}:
-        await safe_ctx_send(ctx, make_embed("🦖 Pterodactyl Logs", "Use the Pterodactyl Panel for server logs or the QEMU serial log for local VPS diagnostics."))
+    if str(vps["backend"] or "docker").lower() != "docker":
+        await safe_ctx_send(ctx, make_embed("🦖 Pterodactyl Logs", "Use the Pterodactyl Panel for server logs."))
         return
     logs = (await docker_logs(vps["container_id"], lines)).replace("```", "'''")
     await safe_ctx_send(ctx, make_embed(
@@ -6981,56 +7095,476 @@ async def safe_ctx_send(ctx: commands.Context, embed: discord.Embed, view: disco
         logger.exception("Prefix response failed: %s", exc)
 
 
+
+# ================================================================
+# Requested prefix commands: admin (!) and user (-)
+# ================================================================
+
+@bot.command(name="create")
+async def prefix_admin_create(ctx: commands.Context, target: discord.User, ram: str=DEFAULT_RAM, cpu: str=DEFAULT_CPU, disk: str=DEFAULT_DISK, location: str=DEFAULT_LOCATION):
+    if not admin_ok(ctx):
+        await safe_ctx_send(ctx, make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    msg=await ctx.send(embed=progress_embed(1,"Starting admin deployment","ubuntu-24.04",normalize_location(location) or DEFAULT_LOCATION,ram,cpu,disk,"rgnodes-pending"))
+    async def edit(e):
+        with contextlib.suppress(discord.HTTPException): await msg.edit(embed=e)
+    try:
+        ok,reason,vps=await asyncio.wait_for(create_vps(target,os_type="ubuntu-24.04",location=location,ram=ram,cpu=cpu,disk=disk,progress=edit),timeout=DEPLOY_TIMEOUT)
+    except Exception as exc:
+        logger.exception("Admin prefix create failed: %s",safe_log(exc)); ok=False; reason="Admin deployment failed safely."; vps=None
+    if not ok or not vps:
+        await msg.edit(embed=make_embed("❌ VPS Creation Failed",reason)); return
+    await safe_dm(target, make_embed("✅ VPS Ready",f"Admin created **{vps['container_name']}** for you.\nVMID: `{vps['id']}`\nResources: `{vps['ram']}` RAM • `{vps['cpu']}` CPU • `{vps['disk']}` Disk."))
+    await msg.edit(embed=make_embed("✅ VPS Created",f"Created VPS `{vps['container_name']}` for <@{target.id}> • ID `{vps['id']}`."))
+
+
+@bot.command(name="manage-user")
+async def prefix_admin_manage(ctx: commands.Context,target: discord.User,identifier: str=""):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    v=db_find_vps(target.id,identifier)
+    if not v: await safe_ctx_send(ctx,make_embed("❌ VPS Not Found","No VPS found for that user.")); return
+    await safe_ctx_send(ctx,make_embed("🛠️ Admin • Manage",f"User: <@{target.id}>\nVPS: `{v['container_name']}` • ID `{v['id']}`\nStatus: {status_text(v['status'],bool(v['suspended']))}"),ManageView(v['id'],v['user_id']))
+
+
+@bot.command(name="suspand",aliases=["suspend"])
+async def prefix_admin_suspend(ctx: commands.Context,target: discord.User,duration: str="1h"):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    try: seconds=_duration_seconds(duration)
+    except ValueError as exc: await safe_ctx_send(ctx,make_embed("❌ Invalid Duration",str(exc))); return
+    db_set_user_suspension(target.id,datetime.now(timezone.utc)+timedelta(seconds=seconds))
+    for v in db_get_user_vps(target.id):
+        with contextlib.suppress(Exception): await lifecycle_action(v,"stop")
+        db_update_vps(v['container_id'],suspended=1,status='stopped')
+    await safe_ctx_send(ctx,make_embed("⛔ User Suspended",f"<@{target.id}> suspended for `{duration}`."))
+
+
+@bot.command(name="unsuspand",aliases=["unsuspend"])
+async def prefix_admin_unsuspend(ctx: commands.Context,target: discord.User):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    db_clear_user_suspension(target.id)
+    for v in db_get_user_vps(target.id): db_update_vps(v['container_id'],suspended=0)
+    await safe_ctx_send(ctx,make_embed("✅ User Unsuspended",f"<@{target.id}> has been unsuspended."))
+
+
+@bot.command(name="rm-all")
+async def prefix_rm_all(ctx: commands.Context,confirm: str=""):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    if str(confirm).lower() not in {"confirm","yes","true","1"}:
+        await safe_ctx_send(ctx,make_embed("⚠️ Confirm RM-ALL","Use `!rm-all confirm` to remove all managed VPS.")); return
+    removed=0
+    for v in db_get_all_vps():
+        ok,_=await lifecycle_action(v,"delete"); removed+=int(ok)
+    await safe_ctx_send(ctx,make_embed("🗑️ RM-ALL Complete",f"Removed `{removed}` VPS instance(s)."))
+
+
+@bot.command(name="rm")
+async def prefix_rm(ctx: commands.Context,target: discord.User,identifier: str=""):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    v=db_find_vps(target.id,identifier)
+    if not v: await safe_ctx_send(ctx,make_embed("❌ VPS Not Found","No VPS matched.")); return
+    ok,msg=await lifecycle_action(v,"delete")
+    await safe_ctx_send(ctx,make_embed("✅ VPS Removed" if ok else "❌ Remove Failed",msg))
+
+
+@bot.command(name="vm-creating-ban",aliases=["vm-creation-ban","vm-crmeating-ban"])
+async def prefix_vm_ban(ctx: commands.Context,target: discord.User):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    db_set_ban(target.id,True); await safe_ctx_send(ctx,make_embed("🚫 VPS Creation Banned",f"<@{target.id}> cannot create VPS."))
+
+
+@bot.command(name="add-total-slot",aliases=["add-toal-slot"])
+async def prefix_total_slots(ctx: commands.Context,amount: int):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    if not 1<=amount<=100000: await safe_ctx_send(ctx,make_embed("❌ Invalid Limit","Use 1–100000.")); return
+    db_set_total_create_limit(amount); await safe_ctx_send(ctx,make_embed("🎟️ Global VPS Limit",f"Maximum total VPS records: `{amount}`."))
+
+
+@bot.command(name="reset-pass")
+async def prefix_reset_pass(ctx: commands.Context,target: discord.User):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    rows=db_get_user_vps(target.id)
+    if not rows: await safe_ctx_send(ctx,make_embed("❌ No VPS","Target user has no VPS.")); return
+    password="".join(secrets.choice(string.ascii_letters+string.digits) for _ in range(SSH_PASSWORD_LENGTH)); ok_count=0
+    for v in rows:
+        rc,_,_=await docker_exec(v['container_id'],'bash','-lc',f"printf '%s\\n' {json.dumps('root:'+password)} | chpasswd",timeout=20,retries=0)
+        if rc==0: db_update_vps(v['container_id'],ssh_password=password); ok_count+=1
+    await safe_dm(target,make_embed("🔐 SSH Password Reset",f"New root password: `{password}`\nKeep it private."))
+    await safe_ctx_send(ctx,make_embed("✅ Password Reset",f"Updated `{ok_count}/{len(rows)}` VPS."))
+
+
+@bot.command(name="anty-hacking",aliases=["anti-hacking"])
+async def prefix_anty_hacking(ctx: commands.Context):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    conn=db_connect(); conn.execute("INSERT INTO security_settings(key,value) VALUES('anti_hacking','1') ON CONFLICT(key) DO UPDATE SET value='1'"); conn.close()
+    scanned,suspicious,names=await security_sweep(delete_suspicious=True)
+    await safe_ctx_send(ctx,make_embed("🛡️ Anti-Hacking Enabled",f"Scanned `{scanned}` • removed `{suspicious}` suspicious VPS."+(("\n"+"\n".join(names[:10])) if names else "")))
+
+
+@bot.command(name="status-all-vm")
+async def prefix_status_all(ctx: commands.Context):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    rows=db_get_all_vps(); embed=make_embed("🖥️ All VPS Status",f"Total `{len(rows)}` • Global limit `{db_total_create_limit()}`")
+    for v in rows[:25]: embed.add_field(name=f"#{v['id']} • {clean(v['container_name'])}",value=f"<@{v['user_id']}> • {status_text(v['status'],bool(v['suspended']))}",inline=False)
+    await safe_ctx_send(ctx,embed)
+
+
+@bot.command(name="ssh")
+async def prefix_admin_ssh(ctx: commands.Context, identifier: str=""):
+    if admin_ok(ctx):
+        target = ctx.message.mentions[0] if ctx.message.mentions else None
+        if target is None:
+            await safe_ctx_send(ctx,make_embed("❌ User Required","Usage: `!ssh @user`")); return
+        v=db_find_vps(target.id,None); recipient=target
+    else:
+        v=ctx_vps(ctx,identifier); recipient=ctx.author
+    if not v: await safe_ctx_send(ctx,make_embed("❌ VPS Not Found","No VPS found.")); return
+    network=await detect_public_network(force=True); ip=network.get('ip') if valid_public_ipv4(network.get('ip')) else None
+    port=next((int(r['host_port']) for r in db_list_ports(v['id']) if int(r['container_port'])==22),None)
+    sent=await safe_dm(recipient,ssh_access_embed(v,ip,port))
+    await safe_ctx_send(ctx,make_embed("🔐 SSH Details Sent" if sent else "⚠️ DM Unavailable",f"SSH credentials {'sent to' if sent else 'could not be sent to'} <@{recipient.id}> by DM."))
+
+
+@bot.command(name="sshx")
+async def prefix_admin_sshx(ctx: commands.Context, identifier: str=""):
+    if admin_ok(ctx):
+        target = ctx.message.mentions[0] if ctx.message.mentions else None
+        if target is None:
+            await safe_ctx_send(ctx,make_embed("❌ User Required","Usage: `!sshx @user`")); return
+        v=db_find_vps(target.id,None); recipient=target
+    else:
+        v=ctx_vps(ctx,identifier); recipient=ctx.author
+    if not v: await safe_ctx_send(ctx,make_embed("❌ VPS Not Found","No VPS found.")); return
+    ok,msg=await create_console_access(v,recipient)
+    await safe_ctx_send(ctx,make_embed("✅ SSHx Ready" if ok else "❌ SSHx Failed",msg))
+
+
+@bot.command(name="dm-all")
+async def prefix_dm_all(ctx: commands.Context):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    members=list(ctx.guild.members) if ctx.guild else []
+    await safe_ctx_send(ctx,make_embed("📨 Mass DM","Press **Write Message** to open the message box. Emojis are supported."),MassDMView(members))
+
+
+@bot.command(name="dm")
+async def prefix_dm(ctx: commands.Context,target: discord.User):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    await safe_ctx_send(ctx,make_embed("📨 Direct DM",f"Press **Write Message** to message <@{target.id}>."),SingleDMView(target))
+
+
+@bot.command(name="add-coins", aliases=["add_coin"])
+async def prefix_add_coins(ctx: commands.Context,target: discord.User,amount: int):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    if amount<=0: await safe_ctx_send(ctx,make_embed("❌ Invalid Amount","Amount must be positive.")); return
+    db_add_coins(target.id,amount); await safe_ctx_send(ctx,make_embed("💰 Coins Added",f"Added `{amount:,}` coins to <@{target.id}>."))
+
+
+@bot.command(name="rm-coins", aliases=["remove-coins"])
+async def prefix_rm_coins(ctx: commands.Context,target: discord.User,amount: int):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    ok=db_take_coins(target.id,amount); await safe_ctx_send(ctx,make_embed("🗑️ Coins Removed" if ok else "❌ Insufficient Coins",f"Amount: `{amount:,}`"))
+
+
+@bot.command(name="add-user-slots")
+async def prefix_add_user_slots(ctx: commands.Context,target: discord.User,amount: int):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    db_upsert_user(target.id,str(target)); total=db_add_slots(target.id,amount); await safe_ctx_send(ctx,make_embed("🎟️ Slots Added",f"<@{target.id}> now has `{total}` slots."))
+
+
+@bot.command(name="add-plans", aliases=["add-plan"])
+async def prefix_add_plans(ctx: commands.Context,*args: str):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    if len(args)==1 and "," in args[0]:
+        args=tuple(x.strip() for x in args[0].split(",") if x.strip())
+    if len(args)<3:
+        await safe_ctx_send(ctx,make_embed("❌ Usage", "`!add-plans name,price,status` or `!add-plans name price status [ram cpu disk]`")); return
+    name,price,status=args[0],int(args[1]),args[2]; ram=args[3] if len(args)>3 else DEFAULT_RAM; cpu=args[4] if len(args)>4 else DEFAULT_CPU; disk=args[5] if len(args)>5 else DEFAULT_DISK
+    ram,cpu,disk=validate_resources(ram,cpu,disk); conn=db_connect()
+    try: cur=conn.execute("INSERT INTO plans(name,price,status,ram,cpu,disk,created_at) VALUES(?,?,?,?,?,?,?)",(name,price,status,ram,cpu,disk,utc_now()))
+    except sqlite3.IntegrityError: await safe_ctx_send(ctx,make_embed("⚠️ Plan Exists","That plan name already exists.")); return
+    finally: conn.close()
+    await safe_ctx_send(ctx,make_embed("✅ Plan Added",f"ID `{cur.lastrowid}` • `{name}` • `{price:,}` coins"))
+
+
+@bot.command(name="add-node")
+async def prefix_add_node(ctx: commands.Context,name: str,location: str,host: str,port: int=22):
+    if not admin_ok(ctx): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    conn=db_connect()
+    try: conn.execute("INSERT INTO nodes(name,location,host,port,status,created_at) VALUES(?,?,?,?,?,?)",(name,normalize_location(location) or 'SG',host,port,'online',utc_now()))
+    except sqlite3.IntegrityError: await safe_ctx_send(ctx,make_embed("⚠️ Node Exists","That node already exists.")); return
+    finally: conn.close()
+    await safe_ctx_send(ctx,make_embed("✅ Node Added",f"`{name}` • `{host}:{port}`"))
+
+
+@bot.command(name="i",aliases=["inventory"])
+async def prefix_inventory(ctx: commands.Context): await safe_ctx_send(ctx,economy_embed(ctx.author.id,"🎒 RGNODES™ • Inventory"))
+
+@bot.command(name="inv2coins")
+async def prefix_inv2coins(ctx: commands.Context):
+    row=db_economy(ctx.author.id); invites=int(row['invites'])
+    if invites<=0: await safe_ctx_send(ctx,make_embed("🎟️ No Invites","You have no tracked invites to convert.")); return
+    db_set_invites(ctx.author.id,0); db_add_coins(ctx.author.id,invites*10)
+    await safe_ctx_send(ctx,make_embed("💰 Invites Converted",f"Converted `{invites}` invites → `{invites*10}` coins."))
+
+
+async def _claim_reward(ctx: commands.Context,action: str,seconds: int,low: int,high: int):
+    remain=db_cooldown_remaining(ctx.author.id,action)
+    if remain: await safe_ctx_send(ctx,make_embed("⏳ Cooldown",f"Try again in `{_cooldown_text(remain)}`.")); return
+    reward=random.randint(low,high); db_add_coins(ctx.author.id,reward); db_set_cooldown(ctx.author.id,action,seconds)
+    await safe_ctx_send(ctx,make_embed("💰 Reward Claimed",f"You earned **{reward:,} coins** from `{action}`."))
+
+
+@bot.command(name="work")
+async def prefix_work(ctx): await _claim_reward(ctx,"work",3600,75,180)
+@bot.command(name="hour")
+async def prefix_hour(ctx): await _claim_reward(ctx,"hour",3600,40,100)
+@bot.command(name="day")
+async def prefix_day(ctx): await _claim_reward(ctx,"day",86400,250,500)
+@bot.command(name="week")
+async def prefix_week(ctx): await _claim_reward(ctx,"week",604800,2000,3500)
+@bot.command(name="monthe",aliases=["month"])
+async def prefix_month(ctx): await _claim_reward(ctx,"month",2592000,9000,14000)
+@bot.command(name="year")
+async def prefix_year(ctx): await _claim_reward(ctx,"year",31536000,50000,90000)
+
+
+@bot.command(name="coinflp",aliases=["coinflip"])
+async def prefix_coinflip(ctx: commands.Context,amount: int=10,guess: str="heads"):
+    if amount<=0 or amount>100000: await safe_ctx_send(ctx,make_embed("❌ Invalid Bet","Bet 1–100000 coins.")); return
+    if not db_take_coins(ctx.author.id,amount): await safe_ctx_send(ctx,make_embed("💰 Insufficient Coins","Not enough wallet coins.")); return
+    result=random.choice(("heads","tails")); won=result==guess.lower().strip()
+    payout=amount*2 if won else 0
+    if payout: db_add_coins(ctx.author.id,payout)
+    await safe_ctx_send(ctx,make_embed("🪙 Coin Flip",f"Result: **{result}**\nYour guess: **{guess}**\n"+(f"✅ Won `{payout:,}` coins." if won else f"❌ Lost `{amount:,}` coins.")))
+
+
+@bot.command(name="spain",aliases=["spin"])
+async def prefix_spin(ctx: commands.Context,amount: int=10):
+    if amount<=0 or amount>100000: await safe_ctx_send(ctx,make_embed("❌ Invalid Bet","Bet 1–100000 coins.")); return
+    if not db_take_coins(ctx.author.id,amount): await safe_ctx_send(ctx,make_embed("💰 Insufficient Coins","Not enough wallet coins.")); return
+    roll=random.randint(1,100); mult=5 if roll==100 else 3 if roll>=95 else 0; payout=amount*mult
+    if payout: db_add_coins(ctx.author.id,payout)
+    await safe_ctx_send(ctx,make_embed("🎰 Spin",f"Roll: `{roll}`\n"+(f"🎉 Payout: `{payout:,}` coins." if payout else f"No payout. Lost `{amount:,}` coins.")))
+
+
+@bot.command(name="deposit",aliases=["dp"])
+async def prefix_deposit(ctx: commands.Context,amount: str):
+    wallet,bank=db_balance(ctx.author.id)
+    value=wallet if amount.lower()=="all" else int(amount)
+    if value<=0 or value>wallet: await safe_ctx_send(ctx,make_embed("🏦 Deposit Failed","Invalid amount or insufficient wallet coins.")); return
+    db_take_coins(ctx.author.id,value); db_add_coins(ctx.author.id,value,wallet=False)
+    await safe_ctx_send(ctx,make_embed("🏦 Deposit Complete",f"Deposited `{value:,}` coins. Bank: `{bank+value:,}`."))
+
+
+@bot.command(name="redeem",aliases=["reedim"])
+async def prefix_redeem(ctx: commands.Context,code: str):
+    code=code.strip().upper(); conn=db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row=conn.execute("SELECT * FROM redeem_codes WHERE code=? AND status='active'",(code,)).fetchone()
+        if not row or int(row['uses'])>=int(row['max_uses']) or conn.execute("SELECT 1 FROM redeem_claims WHERE code_id=? AND user_id=?",(row['id'],ctx.author.id)).fetchone(): conn.rollback(); await safe_ctx_send(ctx,make_embed("❌ Redeem Failed","Invalid, exhausted, or already-used code.")); return
+        conn.execute("INSERT INTO redeem_claims(code_id,user_id,claimed_at) VALUES(?,?,?)",(row['id'],ctx.author.id,utc_now())); conn.execute("UPDATE redeem_codes SET uses=uses+1,status=CASE WHEN uses+1>=max_uses THEN 'used' ELSE status END WHERE id=?",(row['id'],)); conn.commit()
+    finally: conn.close()
+    if int(row['reward_coins']): db_add_coins(ctx.author.id,int(row['reward_coins']))
+    if int(row['reward_slots']): db_add_slots(ctx.author.id,int(row['reward_slots']))
+    await safe_ctx_send(ctx,make_embed("🎁 Redeem Successful",f"Code `{code}` → `{row['reward_coins']:,}` coins • `{row['reward_slots']}` VPS slots."))
+
+
+@bot.command(name="plans")
+async def prefix_plans(ctx: commands.Context):
+    rows=plan_rows(); embed=make_embed("🛒 RGNODES™ • Plans")
+    if not rows: embed.description="No plans are currently available." 
+    for r in rows[:20]: embed.add_field(name=f"#{r['id']} • {clean(r['name'])}",value=f"💰 `{r['price']:,}` coins • {clean(r['status'])}\n🖥️ `{r['ram']}` RAM • `{r['cpu']}` CPU • `{r['disk']}` disk",inline=False)
+    await safe_ctx_send(ctx,embed)
+
+
+@bot.command(name="buy-item")
+async def prefix_buy_item(ctx: commands.Context,plan_id: int):
+    conn=db_connect()
+    try: row=conn.execute("SELECT * FROM plans WHERE id=? AND status='active'",(plan_id,)).fetchone()
+    finally: conn.close()
+    if not row: await safe_ctx_send(ctx,make_embed("❌ Plan Not Found","That plan is not active.")); return
+    if not db_take_coins(ctx.author.id,int(row['price'])): await safe_ctx_send(ctx,make_embed("💰 Insufficient Coins","Not enough wallet coins.")); return
+    db_add_slots(ctx.author.id,1)
+    await safe_ctx_send(ctx,make_embed("✅ Plan Purchased",f"**{row['name']}** purchased for `{row['price']:,}` coins.\nResource tier: `{row['ram']}` RAM • `{row['cpu']}` CPU • `{row['disk']}` disk.\n🎟️ +1 VPS slot granted."))
+
+
+@bot.command(name="bot-info")
+async def prefix_bot_info(ctx: commands.Context):
+    embed=make_embed("🤖 RGNODES™ • Pro Information","Professional VPS management and economy system.")
+    embed.add_field(name="👑 Owners",value="MrZetrix • Zynox2",inline=True)
+    embed.add_field(name="🏷️ Hosting",value=f"`{HOSTING_NAME}` • `Bot v{BOT_VERSION}`",inline=True)
+    embed.add_field(name="🖥️ Hostname",value=f"`{VPS_HOSTNAME_PREFIX}`",inline=True)
+    embed.add_field(name="🌐 Web",value=f"`:{WEB_PORT}`",inline=True)
+    embed.add_field(name="💰 Deploy Cost",value=f"`{DEPLOY_COST:,}` coins",inline=True)
+    embed.add_field(name="🎟️ Global VPS Limit",value=f"`{db_total_create_limit():,}`",inline=True)
+    embed.add_field(name="⚙️ Backend",value="Docker + systemd guest",inline=True)
+    await safe_ctx_send(ctx,embed)
+
+
+@bot.command(name="tps")
+async def prefix_tps(ctx: commands.Context):
+    active=sum(1 for r in db_get_all_vps() if r['status']=='running' and not r['suspended'])
+    await safe_ctx_send(ctx,make_embed("📈 RGNODES™ • TPS",f"Tracked running VPS: `{active}`\nDocker guest metrics are available from `{PREFIX}manage`."))
+
+
+@bot.command(name="nodes")
+async def prefix_nodes(ctx: commands.Context):
+    conn=db_connect()
+    try: rows=conn.execute("SELECT * FROM nodes ORDER BY id").fetchall()
+    finally: conn.close()
+    embed=make_embed("🌍 RGNODES™ • Nodes",f"Configured nodes: `{len(rows)}`")
+    for r in rows[:25]: embed.add_field(name=f"#{r['id']} • {clean(r['name'])}",value=f"{location_label(r['location'])} • `{r['host']}:{r['port']}` • `{r['status']}`",inline=False)
+    await safe_ctx_send(ctx,embed)
+
+
+@bot.command(name="ssh-me")
+async def prefix_ssh_user(ctx: commands.Context,identifier: str=""):
+    v=ctx_vps(ctx,identifier)
+    if not v: await safe_ctx_send(ctx,make_embed("❌ VPS Not Found","No VPS found.")); return
+    network=await detect_public_network(force=True); ip=network.get('ip') if valid_public_ipv4(network.get('ip')) else None
+    port=next((int(r['host_port']) for r in db_list_ports(v['id']) if int(r['container_port'])==22),None)
+    await safe_dm(ctx.author,ssh_access_embed(v,ip,port)); await safe_ctx_send(ctx,make_embed("🔐 SSH Sent", "SSH credentials were sent to your DM."))
+
+
+@bot.command(name="share-vps-manage")
+async def prefix_share_manage(ctx: commands.Context,target: discord.User,identifier: str=""):
+    v=ctx_vps(ctx,identifier)
+    if not v or not db_is_owner_or_admin(ctx.author.id,v): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Only the owner/admin can share this VPS.")); return
+    ok,msg=db_share_vps(v['id'],target.id,ctx.author.id,'manage'); await safe_ctx_send(ctx,make_embed("✅ Access Granted" if ok else "⚠️ Share Failed",msg))
+
+
+@bot.command(name="share-vps-full")
+async def prefix_share_full(ctx: commands.Context,target: discord.User,identifier: str=""):
+    v=ctx_vps(ctx,identifier)
+    if not v or not db_is_owner_or_admin(ctx.author.id,v): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Only the owner/admin can share this VPS.")); return
+    ok,msg=db_share_vps(v['id'],target.id,ctx.author.id,'full'); await safe_ctx_send(ctx,make_embed("✅ Full Access Granted" if ok else "⚠️ Share Failed",msg))
+
+
+@bot.command(name="unshare")
+async def prefix_unshare(ctx: commands.Context,target: discord.User,identifier: str=""):
+    v=ctx_vps(ctx,identifier)
+    if not v or not db_is_owner_or_admin(ctx.author.id,v): await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Only the owner/admin can unshare this VPS.")); return
+    ok,msg=db_unshare_vps(v['id'],target.id); await safe_ctx_send(ctx,make_embed("✅ Access Removed" if ok else "⚠️ Nothing Changed",msg))
+
+
+
+@bot.command(name="re-boot")
+async def prefix_reboot_all(ctx: commands.Context):
+    if not admin_ok(ctx):
+        await safe_ctx_send(ctx, make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    scanned, suspicious, names = await security_sweep(delete_suspicious=True)
+    restarted = 0
+    for v in db_get_all_vps():
+        if str(v["status"]).lower() == "running" and not v["suspended"]:
+            ok, _ = await lifecycle_action(v, "restart")
+            restarted += int(ok)
+    await safe_ctx_send(ctx, make_embed("🔄 Re-Boot Complete", f"Scanned `{scanned}` • removed `{suspicious}` • restarted `{restarted}`." + (("\n" + "\n".join(names[:10])) if names else "")))
+
+
+@bot.command(name="re-install")
+async def prefix_reinstall_all(ctx: commands.Context):
+    if not admin_ok(ctx):
+        await safe_ctx_send(ctx, make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    success = failed = 0
+    for v in db_get_all_vps():
+        try:
+            ok, _ = await docker_reinstall_vps(v, str(v["os_type"]))
+            success += int(ok); failed += int(not ok)
+        except Exception as exc:
+            failed += 1; logger.warning("re-install VPS #%s failed: %s", v["id"], safe_log(exc))
+    await safe_ctx_send(ctx, make_embed("♻️ Re-Install Complete", f"Success: `{success}` • Failed: `{failed}`."))
+
+
+@bot.command(name="backup-vm")
+async def prefix_backup_vm(ctx: commands.Context):
+    if not admin_ok(ctx):
+        await safe_ctx_send(ctx, make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    archive = Path(tempfile.gettempdir()) / f"rgnodes-backup-{int(time.time())}.zip"
+    rows = [r for r in db_get_all_vps() if not int(r["critical"] or 0)]
+    try:
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("metadata.json", json.dumps([{k:("<redacted>" if k=="ssh_password" else r[k]) for k in r.keys()} for r in rows], indent=2, default=str))
+            for r in rows:
+                z.writestr(f"logs/vps-{r['id']}.txt", (await docker_logs(r["container_id"], 80))[:100000])
+        sent = await safe_dm_file(ctx.author, make_embed("💾 RGNODES™ • VPS Backup", "Critical VPS records are excluded and passwords are redacted."), str(archive))
+        await safe_ctx_send(ctx, make_embed("✅ Backup Complete" if sent else "⚠️ Backup Created", f"VPS included: `{len(rows)}` • DM: `{'sent' if sent else 'unavailable'}`."))
+    finally:
+        with contextlib.suppress(OSError): archive.unlink()
+
+
+@bot.command(name="vm-backup")
+async def prefix_vm_backup(ctx: commands.Context, target: discord.User):
+    if not admin_ok(ctx):
+        await safe_ctx_send(ctx, make_embed("❌ Permission Denied", "Administrator access is required.")); return
+    rows=[r for r in db_get_user_vps(target.id) if not int(r["critical"] or 0)]
+    embed=make_embed("💾 User VPS Backup",f"Target: <@{target.id}> • VPS: `{len(rows)}`")
+    for r in rows[:25]: embed.add_field(name=f"#{r['id']} • {clean(r['container_name'])}",value=f"{os_label(r['os_type'])} • {r['ram']} RAM • {r['cpu']} CPU • {r['disk']}",inline=False)
+    await safe_ctx_send(ctx,embed)
+
+
+@bot.command(name="add-reedim", aliases=["add-redeem"])
+async def prefix_add_redeem(ctx: commands.Context, code: str, reward_coins: int=0, reward_slots: int=0, max_uses: int=1):
+    if not admin_ok(ctx):
+        await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    conn=db_connect()
+    try:
+        cur=conn.execute("INSERT INTO redeem_codes(code,reward_coins,reward_slots,max_uses,uses,status,created_at) VALUES(?,?,?,?,?,?,?)",(code.upper(),max(0,reward_coins),max(0,reward_slots),max(1,max_uses),0,"active",utc_now()))
+    except sqlite3.IntegrityError:
+        await safe_ctx_send(ctx,make_embed("⚠️ Code Exists","That redeem code already exists.")); return
+    finally: conn.close()
+    await safe_ctx_send(ctx,make_embed("🎁 Redeem Added",f"ID `{cur.lastrowid}` • `{code.upper()}` • `{reward_coins:,}` coins • `{reward_slots}` slots."))
+
+
+@bot.command(name="rm-reedim", aliases=["rm-redeem"])
+async def prefix_rm_redeem(ctx: commands.Context, code_id: int):
+    if not admin_ok(ctx):
+        await safe_ctx_send(ctx,make_embed("❌ Permission Denied","Administrator access is required.")); return
+    conn=db_connect()
+    try: cur=conn.execute("DELETE FROM redeem_codes WHERE id=?",(int(code_id),))
+    finally: conn.close()
+    await safe_ctx_send(ctx,make_embed("🗑️ Redeem Removed" if cur.rowcount else "❌ Redeem Not Found",f"ID `{code_id}`"))
+
+
+@bot.command(name="trust")
+async def prefix_trust(ctx: commands.Context, target: discord.User):
+    conn=db_connect()
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS trusted_users(user_id INTEGER NOT NULL, trusted_user_id INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(user_id,trusted_user_id))")
+        conn.execute("INSERT OR IGNORE INTO trusted_users(user_id,trusted_user_id,created_at) VALUES(?,?,?)",(ctx.author.id,target.id,utc_now()))
+    finally: conn.close()
+    await safe_ctx_send(ctx,make_embed("🤝 Trusted User",f"<@{target.id}> is now trusted by <@{ctx.author.id}>."))
+
+
+@bot.command(name="untrust")
+async def prefix_untrust(ctx: commands.Context, target: discord.User):
+    conn=db_connect()
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS trusted_users(user_id INTEGER NOT NULL, trusted_user_id INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(user_id,trusted_user_id))")
+        conn.execute("DELETE FROM trusted_users WHERE user_id=? AND trusted_user_id=?",(ctx.author.id,target.id))
+    finally: conn.close()
+    await safe_ctx_send(ctx,make_embed("🚫 Trust Removed",f"<@{target.id}> is no longer trusted."))
+
+
+@bot.command(name="dice")
+async def prefix_dice(ctx: commands.Context):
+    await _claim_reward(ctx,"dice",300,10,35)
+
+
+@bot.command(name="quiz")
+async def prefix_quiz(ctx: commands.Context):
+    questions=(("What is the default SSH port?","22"),("What does HTTP stand for?","hypertext transfer protocol"),("What command lists Docker containers?","docker ps"))
+    question,answer=random.choice(questions)
+    await safe_ctx_send(ctx,make_embed("🧠 RGNODES™ • Mini Quiz",f"**Question:** {question}\nReply with the answer within 20 seconds to earn `50` coins."))
+    def check(m): return m.author.id==ctx.author.id and m.channel.id==ctx.channel.id
+    try: msg=await bot.wait_for("message",check=check,timeout=20)
+    except asyncio.TimeoutError: await safe_ctx_send(ctx,make_embed("⏳ Quiz Expired","Time's up.")); return
+    if msg.content.strip().lower()==answer: db_add_coins(ctx.author.id,50); await safe_ctx_send(ctx,make_embed("✅ Correct", "+50 coins"))
+    else: await safe_ctx_send(ctx,make_embed("❌ Incorrect",f"Correct answer: `{answer}`"))
+
 # ================================================================
 # Background sync / startup recovery
 # ================================================================
 
 STATUS_SEMAPHORE = asyncio.Semaphore(STATUS_CONCURRENCY)
-
-
-async def recover_qemu_vms() -> None:
-    """Recover database-marked running QEMU VMs after a bot/host restart.
-
-    Intentional stopped/deleted VMs are never started because recovery only
-    considers records whose durable database status was running before restart.
-    """
-    if active_backend() != "qemu":
-        return
-    rows = db_get_all_vps()
-    by_vm = {str(row["container_id"]): row for row in rows if str(row["backend"] or "").lower() == "qemu"}
-    if not QEMU_VM_ROOT.exists():
-        return
-    recovered = 0
-    for child in QEMU_VM_ROOT.iterdir():
-        if not child.is_dir():
-            continue
-        vm_id = child.name
-        meta = qemu_load_meta(vm_id)
-        row = by_vm.get(vm_id)
-        if not meta or not row:
-            continue
-        if str(row["status"] or "stopped").lower() not in {"running", "starting", "restarting"}:
-            continue
-        try:
-            if qemu_process_alive(meta.get("pid")):
-                continue
-            ok, detail = await qemu_launch(vm_id, qemu_running_forwards(int(row["id"])))
-            if ok:
-                ready, ready_detail = await _wait_qemu_ready(vm_id)
-                if ready:
-                    db_update_vps(vm_id, status="running")
-                    recovered += 1
-                    logger.info("Recovered QEMU VPS #%s (%s) after restart.", row["id"], vm_id)
-                else:
-                    db_update_vps(vm_id, status="stopped", sshx_url=None, sshx_pid=None)
-                    logger.warning("QEMU VPS #%s restarted but failed readiness: %s", row["id"], safe_log(ready_detail))
-            else:
-                db_update_vps(vm_id, status="stopped", sshx_url=None, sshx_pid=None)
-                logger.warning("QEMU VPS #%s could not be recovered: %s", row["id"], safe_log(detail))
-        except Exception as exc:
-            logger.warning("QEMU recovery failed for VPS #%s: %s", row["id"], safe_log(exc))
-    if recovered:
-        logger.info("Recovered %d QEMU VPS instance(s) after startup.", recovered)
 
 
 async def sync_one(row: sqlite3.Row) -> None:
@@ -7054,7 +7588,7 @@ async def sync_one(row: sqlite3.Row) -> None:
                 for p_row in db_list_ports(row["id"]):
                     await stop_port_forward(p_row)
             elif state is None:
-                logger.debug("Backend state unavailable for VPS #%s; retaining current database status.", row["id"])
+                logger.debug("Docker inspect unavailable for VPS #%s; retaining current database status.", row["id"])
         except Exception as exc:
             logger.warning("Status sync failed for #%s: %s", row["id"], safe_log(exc))
 
@@ -7116,6 +7650,37 @@ async def refresh_network_identity():
 async def before_refresh_network_identity(): await bot.wait_until_ready()
 
 
+
+INVITE_CACHE: dict[int, dict[str, tuple[int,int|None]]] = {}
+INVITE_LOCK = asyncio.Lock()
+
+async def refresh_invites(guild: discord.Guild) -> None:
+    try:
+        invites = await guild.invites()
+        INVITE_CACHE[guild.id] = {str(i.code):(int(i.uses or 0), int(i.inviter.id) if i.inviter else None) for i in invites}
+    except (discord.Forbidden, discord.HTTPException):
+        INVITE_CACHE.setdefault(guild.id,{})
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    async with INVITE_LOCK:
+        before = INVITE_CACHE.get(member.guild.id,{})
+        try:
+            invites = await member.guild.invites()
+        except (discord.Forbidden, discord.HTTPException):
+            return
+        after = {str(i.code):(int(i.uses or 0), int(i.inviter.id) if i.inviter else None) for i in invites}
+        INVITE_CACHE[member.guild.id]=after
+        inviter_id=None
+        for code,(uses,inviter) in after.items():
+            old_uses=before.get(code,(0,None))[0]
+            if uses>old_uses:
+                inviter_id=inviter; break
+        if inviter_id and inviter_id != member.id:
+            row=db_economy(inviter_id); db_set_invites(inviter_id,int(row['invites'])+1)
+
+
 @bot.event
 async def on_ready():
     logger.info("RGNODES™ online as %s", bot.user)
@@ -7129,9 +7694,9 @@ async def on_ready():
         if not refresh_network_identity.is_running():
             refresh_network_identity.start()
         bot.loops_started = True
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(recover_qemu_vms(), timeout=min(900, max(120, QEMU_HOST_PREP_TIMEOUT)))
         await detect_public_network()
+        for guild in bot.guilds:
+            await refresh_invites(guild)
 
     if not bot.synced:
         for attempt in range(3):
