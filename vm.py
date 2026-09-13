@@ -2309,15 +2309,14 @@ async def docker_run(*, image: str, hostname: str, ram: str, cpu: str, disk: str
             "home": "/home",
             "srv": "/srv",
             "www": "/var/www",
-            "nginx": "/etc/nginx",
-            "ssh": "/etc/ssh",
+            # Persist application/data directories, not package-managed system
+            # configuration. This prevents cross-image SSH/Docker conffile drift.
             "ptero": "/etc/pterodactyl",
             "ptero-data": "/var/lib/pterodactyl",
             "mysql": "/var/lib/mysql",
             "redis": "/var/lib/redis",
             "docker": "/var/lib/docker",
             "containerd": "/var/lib/containerd",
-            "docker-etc": "/etc/docker",
             "rgnodes": "/var/lib/rgnodes",
         }
         for suffix, target in persistent_mounts.items():
@@ -2432,9 +2431,6 @@ if [ "{nested}" = "1" ]; then
     docker info >/dev/null 2>&1 || exit 19
     docker compose version >/dev/null 2>&1 || exit 20
     systemctl is-active --quiet docker.service || exit 18
-fi
-else
-    exit 30
 fi
 if [ "{wings}" = "1" ]; then
     command -v wings >/dev/null 2>&1 || exit 31
@@ -2635,188 +2631,109 @@ SSHX_INSTALL_SCRIPT = r"""
 set +e
 export NO_COLOR=1
 
-D='/tmp/sshx-RGNODES™'
-LOG="$D/sshx-RGNODES™.log"
-PID="$D/sshx-RGNODES™.pid"
-URL="$D/sshx-RGNODES™.url"
+D='/tmp/sshx-rgnodes'
+LOG="$D/sshx.log"
+PID="$D/sshx.pid"
+URL="$D/sshx.url"
 STATE_DIR='/var/lib/rgnodes/sshx'
+REMOTE_SCRIPT="$D/custom-sshx.sh"
+CUSTOM_LOG="$D/custom-run.log"
 
-mkdir -p "$D" "$STATE_DIR" 2>/dev/null || true
+mkdir -p "$D" "$STATE_DIR" 2>/dev/null || exit 10
 chmod 700 "$D" "$STATE_DIR" 2>/dev/null || true
 
-clean_ansi() {
-    sed -E 's/\x1B\[[0-9;?]*[ -\/]*[@-~]//g'
-}
-
+clean_ansi() { sed -E 's/\x1B\[[0-9;?]*[ -\/]*[@-~]//g'; }
 extract_url() {
     [ -s "$1" ] || return 1
-    clean_ansi < "$1" \
-      | tr -d '\r' \
-      | grep -Eao 'https://sshx\.io/s/[^[:space:]]+' \
-      | tail -n1
+    clean_ansi <"$1" | tr -d '\r' | grep -Eao 'https://sshx\.io/s/[A-Za-z0-9_-]+#[^[:space:]<>\[\]"'"'"']+' | tail -n1
 }
-
-valid_pid() {
-    case "${1:-}" in
-        ''|*[!0-9]*) return 1 ;;
-    esac
-    kill -0 "$1" 2>/dev/null || return 1
-    [ -r "/proc/$1/cmdline" ] || return 1
-    tr '\000' ' ' < "/proc/$1/cmdline" 2>/dev/null \
-        | grep -qi 'sshx' || return 1
-    return 0
+find_sshx_pid() {
+    if command -v pgrep >/dev/null 2>&1; then pgrep -x sshx 2>/dev/null | tail -n1; return 0; fi
+    if command -v ps >/dev/null 2>&1; then ps -eo pid=,comm= 2>/dev/null | awk '$2 == "sshx" {p=$1} END {if (p) print p}'; fi
 }
-
+pid_alive() {
+    case "${1:-}" in ''|*[!0-9]*) return 1;; esac
+    kill -0 "$1" 2>/dev/null
+}
 save_state() {
+    [ -s "$URL" ] && cp -f "$URL" "$STATE_DIR/sshx.url" 2>/dev/null || true
     [ -s "$PID" ] && cp -f "$PID" "$STATE_DIR/sshx.pid" 2>/dev/null || true
     [ -s "$LOG" ] && cp -f "$LOG" "$STATE_DIR/sshx.log" 2>/dev/null || true
-    [ -s "$URL" ] && cp -f "$URL" "$STATE_DIR/sshx.url" 2>/dev/null || true
-    chmod 600 "$STATE_DIR/sshx.pid" "$STATE_DIR/sshx.url" 2>/dev/null || true
+    [ -s "$CUSTOM_LOG" ] && cp -f "$CUSTOM_LOG" "$STATE_DIR/custom-run.log" 2>/dev/null || true
+    chmod 600 "$STATE_DIR/sshx.url" "$STATE_DIR/sshx.pid" 2>/dev/null || true
 }
 
-OLD_PID=""
-if [ -s "$PID" ]; then
-    OLD_PID="$(cat "$PID" 2>/dev/null || true)"
+OLD_PID=''; [ -s "$PID" ] && OLD_PID="$(cat "$PID" 2>/dev/null || true)"
+if pid_alive "$OLD_PID"; then
+    [ -s "$URL" ] || extract_url "$LOG" >"$URL" 2>/dev/null || true
+    save_state
+    printf '%s\n' "[SSHX] Existing RGNODES session reused • PID $OLD_PID"
+    [ -s "$URL" ] && cat "$URL"
+    exit 0
 fi
 
-# Never destroy the URL of a healthy existing session.  A second Console
-# request must reuse the same SSHx process whenever possible.
-if valid_pid "$OLD_PID"; then
+FOUND_PID="$(find_sshx_pid | head -n1)"
+if pid_alive "$FOUND_PID"; then
+    printf '%s\n' "$FOUND_PID" >"$PID"
     if [ ! -s "$URL" ]; then
-        extract_url "$LOG" > "$URL" 2>/dev/null || true
+        CANDIDATE="$(extract_url "$LOG" 2>/dev/null | tail -n1)"; [ -n "$CANDIDATE" ] && printf '%s\n' "$CANDIDATE" >"$URL"
+        CANDIDATE="$(extract_url "$CUSTOM_LOG" 2>/dev/null | tail -n1)"; [ -n "$CANDIDATE" ] && printf '%s\n' "$CANDIDATE" >"$URL"
     fi
     save_state
-    printf '%s\n' "[SSHX] Existing session reused • PID $OLD_PID"
-    if [ -s "$URL" ]; then
-        cat "$URL"
-    fi
+    printf '%s\n' "[SSHX] Existing RGNODES process recovered • PID $FOUND_PID"
+    [ -s "$URL" ] && cat "$URL"
     exit 0
 fi
 
-# ---------------------------------------------------------------
-# 1) RGNODES custom SSHx launcher only.
-# ---------------------------------------------------------------
-if ! command -v curl >/dev/null 2>&1; then
-    if [ "$(id -u 2>/dev/null)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y >/dev/null 2>&1 || true
-        apt-get install -y curl ca-certificates bash coreutils procps \
-            -o Dpkg::Options::=--force-confdef \
-            -o Dpkg::Options::=--force-confold >/dev/null 2>&1 || true
-    fi
+if ! command -v curl >/dev/null 2>&1 && [ "$(id -u 2>/dev/null)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates >/dev/null 2>&1 || true
 fi
+command -v curl >/dev/null 2>&1 || { printf '%s\n' '[SSHX] ERROR: curl unavailable'; exit 20; }
 
-if ! command -v curl >/dev/null 2>&1; then
-    printf '%s\\n' '[SSHX] ERROR: curl is unavailable.'
-    exit 20
+rm -f "$REMOTE_SCRIPT" "$CUSTOM_LOG" "$LOG" "$URL" 2>/dev/null || true
+: >"$LOG"; : >"$CUSTOM_LOG"
+printf '%s\n' '[RGNODES™] Fetching custom RGNODES SSHx launcher...'
+if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 60 -o "$REMOTE_SCRIPT" '__SSHX_CUSTOM_SCRIPT_URL__' >"$D/download.log" 2>&1; then
+    printf '%s\n' '[SSHX] ERROR: RGNODES SSHx launcher download failed'
+    tail -n 80 "$D/download.log" 2>/dev/null || true
+    exit 21
 fi
+[ -s "$REMOTE_SCRIPT" ] || { printf '%s\n' '[SSHX] ERROR: empty RGNODES launcher'; exit 22; }
+chmod 700 "$REMOTE_SCRIPT"
+# Branding-only compatibility for an older copy of the user's script; do not
+# normalize or otherwise rewrite shell whitespace/commands.
+OLD_LABEL='IamGunpoint'; NEW_LABEL='RGNODES™'; sed -i "s/${OLD_LABEL}/${NEW_LABEL}/g" "$REMOTE_SCRIPT" 2>/dev/null || true
 
-cd "$D" 2>/dev/null || exit 21
-
-rm -f "$D/custom-sshx.sh" "$D/install.log" 2>/dev/null || true
-printf '%s\\n' '[RGNODES™ ;D] Fetching custom RGNODES SSHx launcher...'
-curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 \
-    -o "$D/custom-sshx.sh" '__SSHX_CUSTOM_SCRIPT_URL__' >"$D/install.log" 2>&1
-FETCH_RC=$?
-if [ "$FETCH_RC" -ne 0 ] || [ ! -s "$D/custom-sshx.sh" ]; then
-    printf '%s\\n' "[SSHX] ERROR: custom RGNODES SSHx script unavailable (rc=$FETCH_RC)"
-    tail -n 80 "$D/install.log" 2>/dev/null || true
-    exit 22
-fi
-chmod 700 "$D/custom-sshx.sh" 2>/dev/null || true
-
-# Execute the user-supplied RGNODES script in a bounded, detached shell.
-# The script owns its own sshx binary/session lifecycle and state.
-nohup bash "$D/custom-sshx.sh" >"$D/custom-run.log" 2>&1 </dev/null &
-CUSTOM_PID=$!
-printf '%s\\n' "$CUSTOM_PID" >"$PID"
+nohup bash "$REMOTE_SCRIPT" >"$CUSTOM_LOG" 2>&1 </dev/null &
+LAUNCHER_PID=$!
+printf '%s\n' "$LAUNCHER_PID" >"$PID"
 
 for i in $(seq 1 70); do
-    extract_url "$D/custom-run.log" > "$URL" 2>/dev/null || true
-    extract_url "$LOG" > "$URL" 2>/dev/null || true
+    CANDIDATE="$(extract_url "$CUSTOM_LOG" 2>/dev/null | tail -n1)"; [ -n "$CANDIDATE" ] && printf '%s\n' "$CANDIDATE" >"$URL"
+    CANDIDATE="$(extract_url "$LOG" 2>/dev/null | tail -n1)"; [ -n "$CANDIDATE" ] && printf '%s\n' "$CANDIDATE" >"$URL"
+    REAL_PID="$(find_sshx_pid | head -n1)"
+    if pid_alive "$REAL_PID"; then printf '%s\n' "$REAL_PID" >"$PID"; fi
     [ -s "$URL" ] && break
-    if ! kill -0 "$CUSTOM_PID" 2>/dev/null; then
-        break
-    fi
+    if ! pid_alive "$LAUNCHER_PID" && ! pid_alive "$REAL_PID"; then break; fi
     sleep 1
 done
 
 save_state
-
-printf '%s\\n' ''
-printf '%s\\n' '============== SSHX BY RGNODES™ ;D =============='
-printf '%s\\n' "Launcher PID: $CUSTOM_PID"
-printf '%s' 'URL: '
-cat "$URL" 2>/dev/null || true
-printf '%s\\n' ''
-printf '%s\\n' '==================================================='
-
-if [ -s "$URL" ]; then
-    printf '%s\\n' '[SSHX] ONLINE • custom RGNODES launcher READY'
-    exit 0
-fi
-
-if kill -0 "$CUSTOM_PID" 2>/dev/null; then
-    printf '%s\\n' '[SSHX] launcher still running • URL not emitted yet.'
-    tail -n 80 "$D/custom-run.log" 2>/dev/null || true
-    exit 24
-fi
-
-printf '%s\\n' '[SSHX] custom launcher exited'
-tail -n 100 "$D/custom-run.log" 2>/dev/null || true
-exit 23
-SSHX_BIN="$D/sshx"
-
-# A stale PID from a dead process must not survive into the new session.
-rm -f "$LOG" "$URL" 2>/dev/null || true
-: > "$LOG"
-
-printf '%s\n' '[RGNODES™ ;D] Starting sshx in background...'
-# Exact requested SSHx launch parameters.
-nohup "$SSHX_BIN" --quiet --name 'RGNODES™ ;D' --shell "${SHELL:-/bin/bash}" \
-    >"$LOG" 2>&1 </dev/null &
-SSHX_PID=$!
-printf '%s\n' "$SSHX_PID" > "$PID"
-
-# Wait only for the SSHx startup output, exactly as requested.  It is bounded
-# to 70 seconds and terminates immediately once a URL is present or the process
-# dies; it never keeps the Discord event handler waiting indefinitely.
-for i in $(seq 1 70); do
-    extract_url "$LOG" > "$URL" 2>/dev/null || true
-    [ -s "$URL" ] && break
-    if ! valid_pid "$SSHX_PID"; then
-        break
-    fi
-    sleep 1
-done
-
-save_state
-
+printf '%s\n' '================ SSHX BY RGNODES™ ================'
+printf '%s\n' "Launcher PID: $LAUNCHER_PID"
+printf '%s' 'SSHx PID: '; cat "$PID" 2>/dev/null || true
+printf '%s' 'URL: '; cat "$URL" 2>/dev/null || true
 printf '%s\n' ''
-printf '%s\n' '================ SSHX BY RGNODES™ ;D ================'
-printf '%s\n' "PID: $SSHX_PID"
-printf '%s' 'URL: '
-cat "$URL" 2>/dev/null || true
-printf '%s\n' ''
-printf '%s\n' "LOG: $LOG"
-printf '%s\n' '========================================================'
+printf '%s\n' '===================================================='
 
-if [ -s "$URL" ] && valid_pid "$SSHX_PID"; then
-    printf '%s\n' "[SSHX] ONLINE • encrypted URL READY • PID $SSHX_PID"
-    exit 0
-fi
-
-if valid_pid "$SSHX_PID"; then
-    printf '%s\n' '[SSHX] ONLINE • URL not emitted yet.'
-    tail -n 40 "$LOG" 2>/dev/null || true
-    exit 24
-fi
-
-printf '%s\n' '[SSHX] PROCESS EXITED'
-tail -n 80 "$LOG" 2>/dev/null || true
+if [ -s "$URL" ]; then printf '%s\n' '[SSHX] ONLINE • RGNODES session READY'; exit 0; fi
+REAL_PID="$(find_sshx_pid | head -n1)"
+if pid_alive "$REAL_PID"; then printf '%s\n' "$REAL_PID" >"$PID"; save_state; printf '%s\n' '[SSHX] process is running; URL not emitted yet.'; tail -n 80 "$CUSTOM_LOG" 2>/dev/null || true; exit 24; fi
+printf '%s\n' '[SSHX] RGNODES launcher failed to produce a live session.'
+tail -n 120 "$CUSTOM_LOG" 2>/dev/null || true
 exit 23
 """
-
-
 
 def normalize_sshx_url(raw: str | None) -> str | None:
     """Validate an SSHx share URL and preserve its browser key fragment exactly."""
@@ -2915,7 +2832,7 @@ async def install_and_start_sshx(container: str) -> dict[str, str] | None:
                 logger.info("Reusing SSHx session for %s (PID %s).", clean(container, 32), saved_pid)
                 return {"url": saved_url, "pid": saved_pid}
 
-        timeout = max(85.0, min(float(SSHX_TOTAL_TIMEOUT), 130.0))
+        timeout = max(90.0, min(float(SSHX_TOTAL_TIMEOUT), 140.0))
         try:
             rc, out, err = await docker_exec(
                 container,
@@ -2980,7 +2897,7 @@ rm -f /var/lib/rgnodes/sshx/sshx.pid /var/lib/rgnodes/sshx/sshx.url
 # ================================================================
 
 FOOTER = "⚡ RGNODES™ • VPS Management • Credit: MrZetrix & Zynox2"
-RGNODES_BUILD = "2026.09.13-rgnodes-vm-v1-pro-final"
+RGNODES_BUILD = "2026.09.14-rgnodes-vm-v1-pro-deepfix-sshx"
 
 
 def make_embed(title: str, description: str | None = None) -> discord.Embed:
@@ -3809,8 +3726,10 @@ async def create_vps(
             try:
                 console = await asyncio.wait_for(install_and_start_sshx(resource_id), timeout=max(20, SSHX_TOTAL_TIMEOUT + 5))
             except Exception as exc:
-                logger.warning("Optional SSHx setup failed for %s; VPS remains healthy: %s", clean(resource_id, 32), safe_log(exc))
+                logger.warning("SSHx setup failed for %s; VPS remains healthy and will be retried: %s", clean(resource_id, 32), safe_log(exc))
                 console = None
+            if not console:
+                asyncio.create_task(_retry_sshx_until_ready(resource_id), name=f"sshx-retry-{str(resource_id)[:12]}")
 
             if console and console.get("pid"):
                 db_update_vps(resource_id, sshx_url=normalize_sshx_url(console.get("url")) if console.get("url") else None, sshx_pid=console.get("pid"))
@@ -4055,6 +3974,10 @@ async def lifecycle_action(vps: sqlite3.Row, action: str) -> tuple[bool, str]:
                 await asyncio.sleep(0.5)
             else:
                 return False, "The VPS start command returned, but the container is not running."
+            if GUEST_SYSTEMD_ENABLED:
+                ready, detail = await wait_for_guest_ready(container)
+                if not ready:
+                    return False, f"VPS started but guest services are not ready: {safe_log(detail)}"
             console = await install_and_start_sshx(container)
             existing = db_get_vps(vps["id"]) or vps
             db_update_vps(container, status="running", sshx_url=console["url"] if console else existing["sshx_url"], sshx_pid=console.get("pid") if console else existing["sshx_pid"])
@@ -4088,6 +4011,10 @@ async def lifecycle_action(vps: sqlite3.Row, action: str) -> tuple[bool, str]:
                 await asyncio.sleep(0.5)
             else:
                 return False, "The VPS restart command returned, but the container is not running."
+            if GUEST_SYSTEMD_ENABLED:
+                ready, detail = await wait_for_guest_ready(container)
+                if not ready:
+                    return False, f"VPS restarted but guest services are not ready: {safe_log(detail)}"
             console = await install_and_start_sshx(container)
             existing = db_get_vps(vps["id"]) or vps
             db_update_vps(container, status="running", sshx_url=console["url"] if console else existing["sshx_url"], sshx_pid=console.get("pid") if console else existing["sshx_pid"])
